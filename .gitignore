@@ -1,0 +1,17 @@
+# Report output
+*.html
+*.json
+Remediate-*.ps1
+Reports/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Claude Code local settings
+.claude/
