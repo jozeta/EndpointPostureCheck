@@ -5,7 +5,7 @@
 This repository contains two independent tools sharing one design philosophy (fault-isolated checks, weighted compliance scoring, a self-contained HTML dashboard, optional JSON export and generated remediation script):
 
 - [`Invoke-EndpointPostureCheck.ps1`](#endpointposturecheck-for-windows) — Windows 11 Enterprise, 142 checks across 34 domains.
-- [`Invoke-MacPostureCheck.sh`](#endpointposturecheck-for-macos) — macOS 15 (Sequoia) / 26 (Tahoe), 98 checks across 30 domains.
+- [`Invoke-MacPostureCheck.sh`](#endpointposturecheck-for-macos) — macOS 15 (Sequoia) / 26 (Tahoe), 106 checks across 30 domains.
 
 ---
 
@@ -223,7 +223,7 @@ This tool includes deep-inspection checks — LSASS/credential exposure, ACL/pri
 
 **A comprehensive, standalone zsh security posture auditor for macOS 15 (Sequoia) and 26 (Tahoe) endpoints.**
 
-`Invoke-MacPostureCheck.sh` runs **98 read-only security controls** across 30 hardening domains — from Secure Enclave/T2 platform integrity and System Integrity Protection through Gatekeeper, TCC privacy controls, FileVault, credential exposure, and ransomware resilience — and renders the results as a single-file, interactive HTML dashboard, in the same visual language as the Windows edition. Every finding is mapped to CIS Controls v8, NIST SP 800-53 Rev.5, MITRE ATT&CK, ISO/IEC 27001:2022, the NIS2 Directive, NSA/CISA guidance, the CIS Apple macOS Benchmark, and the macOS Security Compliance Project (mSCP) — two mappings the Windows edition doesn't carry, since they're macOS-specific authoritative baselines.
+`Invoke-MacPostureCheck.sh` runs **106 read-only security controls** across 30 hardening domains — from Secure Enclave/T2 platform integrity and System Integrity Protection through Gatekeeper, TCC privacy controls, FileVault, credential exposure, and ransomware resilience — and renders the results as a single-file, interactive HTML dashboard, in the same visual language as the Windows edition. Every finding is mapped to CIS Controls v8, NIST SP 800-53 Rev.5, MITRE ATT&CK, ISO/IEC 27001:2022, the NIS2 Directive, NSA/CISA guidance, the CIS Apple macOS Benchmark, and the macOS Security Compliance Project (mSCP) — two mappings the Windows edition doesn't carry, since they're macOS-specific authoritative baselines. Findings backed by a real item list (installed apps, listening ports, admin group members, TCC grants, and more) show a hover tooltip in the HTML dashboard with the full list, one item per line, instead of cluttering the table with a long inline value.
 
 It runs standalone with zero external dependencies: no Homebrew packages, no Python, nothing beyond the zsh shell and command-line tools Apple ships on every Mac.
 
@@ -269,7 +269,7 @@ Identical `PASS`/`FAIL`/`WARN`/`INFO` status semantics, `Critical`/`High`/`Mediu
 
 ### Audit Domains
 
-98 checks organized across 30 domains:
+106 checks organized across 30 domains:
 
 | # | Domain |
 |---|---|
