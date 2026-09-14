@@ -2,7 +2,11 @@
 *.html
 *.json
 Remediate-*.ps1
+Remediate-EndpointPostureCheck.sh
 Reports/
+
+# Built artifact (regenerate with ./build.sh src Invoke-MacPostureCheck.sh)
+Invoke-MacPostureCheck.sh
 
 # OS
 .DS_Store
