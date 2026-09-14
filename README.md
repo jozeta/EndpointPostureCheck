@@ -1,5 +1,16 @@
 # EndpointPostureCheck
 
+**Comprehensive, standalone, zero-dependency security posture auditors for Windows 11 Enterprise and macOS 15/26 endpoints — one PowerShell, one zsh, no third-party dependencies for either.**
+
+This repository contains two independent tools sharing one design philosophy (fault-isolated checks, weighted compliance scoring, a self-contained HTML dashboard, optional JSON export and generated remediation script):
+
+- [`Invoke-EndpointPostureCheck.ps1`](#endpointposturecheck-for-windows) — Windows 11 Enterprise, 142 checks across 34 domains.
+- [`Invoke-MacPostureCheck.sh`](#endpointposturecheck-for-macos) — macOS 15 (Sequoia) / 26 (Tahoe), 98 checks across 30 domains.
+
+---
+
+## EndpointPostureCheck for Windows
+
 **A comprehensive, standalone PowerShell security posture auditor for Windows 11 Enterprise endpoints.**
 
 `EndpointPostureCheck` runs **142 read-only security controls** across 34 hardening domains — from firmware and virtualization-based security through privilege-escalation vectors, AppLocker bypass paths, ransomware resilience, and modern cloud-identity token security — and renders the results as a single-file, interactive HTML dashboard. Every finding is mapped to CIS Controls v8, NIST SP 800-53 Rev.5, MITRE ATT&CK, ISO/IEC 27001:2022, the NIS2 Directive, and NSA/CISA guidance, and the tool can generate a companion remediation script for everything it finds wrong.
@@ -205,6 +216,124 @@ This tool includes deep-inspection checks — LSASS/credential exposure, ACL/pri
 - Run this only against systems you own or are explicitly authorized to assess.
 - Findings in categories like *Credential Exposure & Secret Leaks* and *Privilege Escalation* can surface sensitive material (file paths, partial credential indicators, registry contents). Treat the generated HTML/JSON reports as sensitive documents and store/share them accordingly.
 - The tool performs no exploitation, no credential extraction, and no modification to the target system during an audit run — the only file it writes (besides its own reports) is the optional remediation script, which itself does not execute automatically.
+
+---
+
+## EndpointPostureCheck for macOS
+
+**A comprehensive, standalone zsh security posture auditor for macOS 15 (Sequoia) and 26 (Tahoe) endpoints.**
+
+`Invoke-MacPostureCheck.sh` runs **98 read-only security controls** across 30 hardening domains — from Secure Enclave/T2 platform integrity and System Integrity Protection through Gatekeeper, TCC privacy controls, FileVault, credential exposure, and ransomware resilience — and renders the results as a single-file, interactive HTML dashboard, in the same visual language as the Windows edition. Every finding is mapped to CIS Controls v8, NIST SP 800-53 Rev.5, MITRE ATT&CK, ISO/IEC 27001:2022, the NIS2 Directive, NSA/CISA guidance, the CIS Apple macOS Benchmark, and the macOS Security Compliance Project (mSCP) — two mappings the Windows edition doesn't carry, since they're macOS-specific authoritative baselines.
+
+It runs standalone with zero external dependencies: no Homebrew packages, no Python, nothing beyond the zsh shell and command-line tools Apple ships on every Mac.
+
+### Requirements
+
+| Requirement | Detail |
+|---|---|
+| OS | macOS 15 (Sequoia) or macOS 26 (Tahoe). Older versions still run, with one WARN finding noting results may be incomplete. |
+| Shell | zsh (the default interactive shell on macOS since Catalina; bash's stock macOS build is too old — 3.2 — for this tool's needs) |
+| Privileges | root (the script enforces this at startup and exits immediately if not run via `sudo`, matching the Windows edition's `#Requires -RunAsAdministrator`) |
+| Hardware | Apple Silicon and Intel both supported. Checks specific to one architecture (Secure Enclave boot-policy checks on Apple Silicon; T2/firmware-password checks on Intel) report `INFO` "not applicable" on the other rather than a false result. |
+| Dependencies | None — no `brew install` required |
+| Network | None required — every check is offline-capable, including patch-compliance checks (which read local `softwareupdate --history`, never trigger a live `-l` network scan) |
+
+### Quick Start
+
+```bash
+# Run a full audit, write the HTML dashboard to the current directory
+sudo ./Invoke-MacPostureCheck.sh
+
+# Full audit + JSON export + generated remediation script, written to a specific folder
+sudo ./Invoke-MacPostureCheck.sh --report-path ~/Reports --export-json --generate-remediation
+```
+
+The script must be run with `sudo`. If it isn't, it exits immediately with a clear message rather than continuing with a partial, misleading result — checks that need a specific console user's preferences (screen lock, Safari settings, iCloud/AirDrop state, etc.) are still read correctly under `sudo` by dropping to that user for just those reads, not by running the whole audit unprivileged.
+
+### Parameters
+
+| Parameter | Description |
+|---|---|
+| `--report-path <dir\|file>` | Optional output location for the HTML dashboard. Accepts a directory (default filename is used) or a full file path. Defaults to the current working directory. |
+| `--export-json` | Exports the complete structured finding set, plus posture/summary metadata, to a JSON file alongside the HTML report. |
+| `--generate-remediation` | Generates `Remediate-EndpointPostureCheck.sh`, containing a remediation block for every `FAIL` finding from the current run. |
+| `--help` | Show usage and exit. |
+
+### Output Files
+
+Same three-file pattern as the Windows edition: `EndpointPostureCheck_<hostname>_<timestamp>.html` (always generated), `EndpointPostureCheck_<hostname>_<timestamp>.json` (with `--export-json`), `Remediate-EndpointPostureCheck.sh` (with `--generate-remediation`, supports `--dry-run`/`--force`, defaults to preview-only).
+
+### Understanding the Report
+
+Identical `PASS`/`FAIL`/`WARN`/`INFO` status semantics, `Critical`/`High`/`Medium`/`Low`/`Informational` severity levels, weighted compliance scoring (severity weights `Critical=10, High=7, Medium=4, Low=2`; `PASS` full credit, `WARN` half credit, `FAIL` none; `INFO` excluded entirely), and `LOW`/`MEDIUM`/`HIGH`/`CRITICAL` risk badge thresholds as the Windows edition — see that section above for the full breakdown; the scoring engine is a direct, verified port.
+
+### Audit Domains
+
+98 checks organized across 30 domains:
+
+| # | Domain |
+|---|---|
+| 1 | Hardware, Firmware & Platform Integrity (Secure Enclave / T2) |
+| 2 | SIP & Kernel Security |
+| 3 | Volume Encryption & Data-at-Rest (FileVault) |
+| 4 | Gatekeeper, Notarization & Application Control |
+| 5 | Malware Defense (XProtect / MRT / EDR) |
+| 6 | TCC & Privacy Controls |
+| 7 | Identity, Accounts & Privilege Management |
+| 8 | Network Firewall & Packet Filtering |
+| 9 | Remote Access & Sharing Services |
+| 10 | SSH Server & Client Hardening |
+| 11 | Cryptography & Certificate Trust |
+| 12 | Audit, Logging & Telemetry |
+| 13 | Software Update & Patch Compliance |
+| 14 | MDM, Profiles & Supervision |
+| 15 | Persistence Mechanisms & Auto-Runs |
+| 16 | Privilege Escalation — File & Directory Permissions |
+| 17 | Dylib Hijacking & Code Injection |
+| 18 | Credential Exposure & Secret Leaks |
+| 19 | Screen Lock & Physical Access |
+| 20 | Removable Media & Peripheral Control |
+| 21 | Wireless & Network Interface Security |
+| 22 | iCloud & Cloud Sync Surface |
+| 23 | Browser & Application Hardening |
+| 24 | Ransomware Resilience & Recovery |
+| 25 | Third-Party Software & Package Inventory |
+| 26 | System Services & Daemon Exposure |
+| 27 | Kernel & Boot Security |
+| 28 | Virtualization & Container Escape Surface |
+| 29 | Data Loss Prevention & Sensitive Data |
+| 30 | System Inventory & Asset Information |
+
+### What Didn't Port, and What's New
+
+The two platforms don't share a threat surface one-for-one. Dropped
+entirely (no macOS equivalent): VBS/HVCI/Credential Guard/System Guard,
+BitLocker specifics (replaced wholesale by the FileVault domain), ASR
+rules, WDAC/AppLocker's 11-check module (replaced by the 6-check
+Gatekeeper/notarization domain), LAPS, UAC-specific checks (folded into
+`sudoers`/authorization-adjacent identity checks), Schannel registry
+policy, PowerShell subsystem security, Print Spooler, WPAD/LLMNR/NetBIOS,
+COM CLSID hijacking, IFEO, AppInit_DLLs, WSL/Hyper-V/Windows
+Sandbox/WDAG, Windows Recall/Copilot. Added, with no Windows counterpart:
+TCC & Privacy Controls (Domain 6), iCloud & Cloud Sync Surface (Domain
+22), Browser & Application Hardening (Domain 23), Data Loss Prevention &
+Sensitive Data (Domain 29), and Dylib Hijacking & Code Injection (Domain
+17, the closest macOS analogue to DLL hijacking but a genuinely different
+mechanism).
+
+### Framework Mappings
+
+The same six frameworks as the Windows edition (CIS Controls v8, NIST SP
+800-53 Rev.5, MITRE ATT&CK, ISO/IEC 27001:2022, NIS2 Article 21(2),
+NSA/CISA guidance), plus two macOS-specific mappings: **CIS Apple macOS
+Benchmark** section references and **macOS Security Compliance Project
+(mSCP)** rule IDs — the authoritative macOS hardening baselines,
+maintained by NIST/NASA/DoD for mSCP, that a macOS-focused auditor is
+most likely to be asked for directly.
+
+### Design Principles
+
+Same three principles as the Windows edition, carried over deliberately: **honesty over false precision** (several macOS checks — Time Machine backup encryption state, Handoff/Universal Clipboard exposure, FIPS crypto-module validation — say so explicitly rather than guessing, where macOS exposes no clean, documented CLI signal); **no duplicate/contradictory checks** (a few candidate checks were cut during design specifically to avoid two checks silently disagreeing about the same underlying setting); **performance-bounded scans** (shell-history and sensitive-filename sweeps are capped to recent/top-level content, never a full recursive disk walk).
 
 ---
 
