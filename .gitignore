@@ -5,8 +5,10 @@ Remediate-*.ps1
 Remediate-EndpointPostureCheck.sh
 Reports/
 
-# Built artifact (regenerate with ./build.sh src Invoke-MacPostureCheck.sh)
-Invoke-MacPostureCheck.sh
+# Development-only folders (source, tests, planning docs) — not published
+docs/
+src/
+tests/
 
 # OS
 .DS_Store
