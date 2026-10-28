@@ -5,7 +5,7 @@
 This repository contains two independent tools sharing one design philosophy (fault-isolated checks, weighted compliance scoring, a self-contained HTML dashboard, optional JSON export and generated remediation script):
 
 - [`Invoke-EndpointPostureCheck.ps1`](#endpointposturecheck-for-windows) — Windows 11 Enterprise, 142 checks across 34 domains.
-- [`Invoke-MacPostureCheck.sh`](#endpointposturecheck-for-macos) — macOS 15 (Sequoia) / 26 (Tahoe), 106 checks across 30 domains.
+- [`Invoke-MacPostureCheck.sh`](#endpointposturecheck-for-macos) — macOS 15 (Sequoia) / 26 (Tahoe), 183 checks across 32 domains.
 
 ---
 
@@ -223,7 +223,7 @@ This tool includes deep-inspection checks — LSASS/credential exposure, ACL/pri
 
 **A comprehensive, standalone zsh security posture auditor for macOS 15 (Sequoia) and 26 (Tahoe) endpoints.**
 
-`Invoke-MacPostureCheck.sh` runs **106 read-only security controls** across 30 hardening domains — from Secure Enclave/T2 platform integrity and System Integrity Protection through Gatekeeper, TCC privacy controls, FileVault, credential exposure, and ransomware resilience — and renders the results as a single-file, interactive HTML dashboard, in the same visual language as the Windows edition. Every finding is mapped to CIS Controls v8, NIST SP 800-53 Rev.5, MITRE ATT&CK, ISO/IEC 27001:2022, the NIS2 Directive, NSA/CISA guidance, the CIS Apple macOS Benchmark, and the macOS Security Compliance Project (mSCP) — two mappings the Windows edition doesn't carry, since they're macOS-specific authoritative baselines. Findings backed by a real item list (installed apps, listening ports, admin group members, TCC grants, and more) show a hover tooltip in the HTML dashboard with the full list, one item per line, instead of cluttering the table with a long inline value.
+`Invoke-MacPostureCheck.sh` runs **183 read-only security controls** across 32 hardening domains — from Secure Enclave/T2 platform integrity and System Integrity Protection through Gatekeeper, TCC privacy controls, FileVault, credential exposure, and ransomware resilience — and renders the results as a single-file, interactive HTML dashboard, in the same visual language as the Windows edition. Every finding is mapped to CIS Controls v8, NIST SP 800-53 Rev.5, MITRE ATT&CK, ISO/IEC 27001:2022, the NIS2 Directive, NSA/CISA guidance, the CIS Apple macOS Benchmark, and the macOS Security Compliance Project (mSCP) — two mappings the Windows edition doesn't carry, since they're macOS-specific authoritative baselines. Findings backed by a real item list (installed apps, listening ports, admin group members, TCC grants, and more) show a hover tooltip in the HTML dashboard with the full list, one item per line, instead of cluttering the table with a long inline value.
 
 It runs standalone with zero external dependencies: no Homebrew packages, no Python, nothing beyond the zsh shell and command-line tools Apple ships on every Mac.
 
@@ -269,7 +269,7 @@ Identical `PASS`/`FAIL`/`WARN`/`INFO` status semantics, `Critical`/`High`/`Mediu
 
 ### Audit Domains
 
-106 checks organized across 30 domains:
+183 checks organized across 32 domains:
 
 | # | Domain |
 |---|---|
@@ -303,6 +303,42 @@ Identical `PASS`/`FAIL`/`WARN`/`INFO` status semantics, `Critical`/`High`/`Mediu
 | 28 | Virtualization & Container Escape Surface |
 | 29 | Data Loss Prevention & Sensitive Data |
 | 30 | System Inventory & Asset Information |
+| 31 | Apple Intelligence, Siri & Analytics |
+| 32 | Power Management & Sleep |
+
+### CIS Apple macOS 26 Tahoe Benchmark v1.0.0 Coverage
+
+Every **Automated** recommendation in the CIS Apple macOS 26 Tahoe Benchmark v1.0.0 has a corresponding check, tagged with its Tahoe section number (e.g. `CIS-macOS 2.6.8`) and, where one exists, its mSCP rule ID. The benchmark's **Manual**/"Audit" recommendations (Find My Mac, Lockdown Mode, Touch ID, Internet Accounts, …) are not scored, since they need human judgement rather than a deterministic CLI signal.
+
+A few behaviors worth knowing:
+
+- **MDM-aware preference reads.** Most CIS settings are read through `NSUserDefaults` (via `osascript -l JavaScript`, as root) — the benchmark's own audit method — so values enforced by a configuration profile are seen. A plain `defaults read /Library/Preferences/...` cannot see profile-enforced keys.
+- **Unset profile keys score `WARN`, not `FAIL`.** About 25 CIS controls (Apple Intelligence, Siri, Safari privacy, AirPlay Receiver, Terminal Secure Keyboard Entry, …) can only pass when an MDM profile enforces them. When the key is simply unset, the finding is `WARN` ("not enforced by a configuration profile", half credit); an explicitly insecure value is still `FAIL`. Keys whose CIS audit itself passes when unset (software-update deferral, Time Machine `AutoBackup`) report `PASS`.
+- **Deliberate deviations from the CIS audit text**, each verified on a live Tahoe system:
+  - *2.10.1.2 Sleep* reads the `Battery Power:` section of `pmset -g custom`. The benchmark's `pmset -b -g` prints the *currently in use* profile, which is the AC profile whenever the laptop is plugged in.
+  - *2.11.1 Screen saver inactivity* requires `1 ≤ idleTime ≤ 900`. The benchmark's JavaScript audit also passes an unset or `0` ("never") value.
+  - *5.2.8 Password history* requires ≥ 24, per the recommendation title and mSCP. The benchmark's audit one-liner only tests ≥ 1.
+  - *4.3 NFS server*: `nfsd` reporting "enabled" with no `/etc/exports` and nothing running (the stock state) is a `WARN`; a running server or an exports file is a `FAIL`.
+- **Time Machine backup encryption** is now a real `PASS`/`FAIL` check, using each destination's `LastKnownEncryptionState` (the CIS 2.3.4.2 method), instead of an informational note.
+
+### Persistence & Autostart Coverage
+
+Domain 15 inspects everything that starts automatically. It covers all local accounts, not just the logged-in user.
+
+- **launchd items** (`/Library/LaunchDaemons`, `/Library/LaunchAgents`, every user's `~/Library/LaunchAgents`). The actual launch target is resolved: when an item runs `/bin/bash`, `python3`, `osascript`, `/usr/bin/env …` or `sh -c`, the *script or inline command* is analyzed, not the Apple-signed interpreter. Each item is checked for:
+  - unsigned or ad-hoc-signed targets
+  - targets missing from disk (orphaned items, reported as WARN rather than as signature failures)
+  - targets or scripts under `/tmp` or `/Users/Shared`
+  - hidden plists
+  - `DYLD_INSERT_LIBRARIES` set in the plist
+  - `com.apple.*` labels on non-Apple-signed targets (masquerading)
+  - LaunchDaemon plists, programs or scripts that a non-root account can modify (root privilege escalation)
+- **Login items and background tasks (BTM)**: enabled login items and SMAppService agents/daemons from `sfltool dumpbtm`. Paths stored relative to the parent app are resolved, and items the user has switched off are skipped. The dump is loaded once per run.
+- **Shell startup files**: `/etc/z*`, `/etc/profile`, `/etc/bashrc`, every user's zsh/bash dotfiles (including a relocated `ZDOTDIR`), and any file they `source` by literal path. This catches the XCSSET `~/.zshrc_aliases` technique and the BlueNoroff `~/.zshenv` technique. Both content and permissions are checked.
+- **Wider inventory**: authorization plugins, DirectoryServices plugins, privileged helper tools, cron and `at` jobs, `rc.local` / `launchd.conf` / StartupItems / periodic / emond, `~/.ssh/rc` / `sshrc`, SSH `authorized_keys`, and Python `.pth` / `sitecustomize` startup hooks.
+- **Autostart Inventory (Apps & Scripts)**: an INFO baseline listing every autostart item across all of the above, classified as program or script, with its signer.
+
+Script content is matched against two pattern tiers. **Strong** patterns produce FAIL: download-and-execute (`curl … | sh`), base64-decoded execution, reverse shells, fake password prompts (`osascript … with hidden answer`), keychain dumping, `dscl -authonly` password checks, and DYLD injection. **Weak** patterns produce WARN for review: `osascript`, `nohup` / backgrounding, `launchctl load`, `/tmp` and `/Users/Shared` paths, and quarantine stripping. Credential-looking values in matched lines are replaced with `[REDACTED]`, and SSH keys are identified by their comment, never by key material.
 
 ### What Didn't Port, and What's New
 
@@ -333,7 +369,7 @@ most likely to be asked for directly.
 
 ### Design Principles
 
-Same three principles as the Windows edition, carried over deliberately: **honesty over false precision** (several macOS checks — Time Machine backup encryption state, Handoff/Universal Clipboard exposure, FIPS crypto-module validation — say so explicitly rather than guessing, where macOS exposes no clean, documented CLI signal); **no duplicate/contradictory checks** (a few candidate checks were cut during design specifically to avoid two checks silently disagreeing about the same underlying setting); **performance-bounded scans** (shell-history and sensitive-filename sweeps are capped to recent/top-level content, never a full recursive disk walk).
+Same three principles as the Windows edition, carried over deliberately: **honesty over false precision** (several macOS checks — Handoff/Universal Clipboard exposure, FIPS crypto-module validation — say so explicitly rather than guessing, where macOS exposes no clean, documented CLI signal); **no duplicate/contradictory checks** (a few candidate checks were cut during design specifically to avoid two checks silently disagreeing about the same underlying setting); **performance-bounded scans** (shell-history and sensitive-filename sweeps are capped to recent/top-level content, never a full recursive disk walk).
 
 ---
 

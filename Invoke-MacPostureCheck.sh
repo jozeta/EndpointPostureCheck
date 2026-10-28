@@ -1,5 +1,5 @@
 #!/usr/bin/env zsh
-# EndpointPostureCheck for macOS — built 2026-09-14 23:20:43 from src/*.zsh. Do not edit directly.
+# EndpointPostureCheck for macOS — built 2026-10-28 11:03:32 from src/*.zsh. Do not edit directly.
 
 # ---- 00-header.zsh ----
 #
@@ -340,6 +340,199 @@ write_section_banner() {
     printf "\n%s\n" "$rule"
     printf " %s\n" "$title"
     printf "%s\n" "$rule"
+}
+
+# Reads a preference the way the CIS Apple macOS Benchmark audits it:
+# through NSUserDefaults (via JXA), as root. Unlike a plain
+# `defaults read /Library/Preferences/<domain>`, NSUserDefaults also
+# resolves keys forced by an MDM configuration profile (/Library/Managed
+# Preferences), which is where most CIS "Ensure ... Is Disabled" settings
+# live — reading only the on-disk plist would report a profile-enforced
+# setting as unset. Booleans are normalized to 1/0.
+# Returns 0 = key set (value printed), 1 = key not set anywhere,
+# 2 = the osascript query itself failed (never conflated with "unset").
+managed_pref_read() {
+    local suite="$1" key="$2" value
+    value=$(osascript -l JavaScript -e "var v = \$.NSUserDefaults.alloc.initWithSuiteName('$suite').objectForKey('$key'); v.isNil() ? '' : String(ObjC.deepUnwrap(v))" 2>/dev/null)
+    if [[ $? -ne 0 ]]; then
+        return 2
+    fi
+    case "$value" in
+        true) value=1 ;;
+        false) value=0 ;;
+    esac
+    if [[ -z "$value" ]]; then
+        return 1
+    fi
+    printf '%s' "$value"
+    return 0
+}
+
+# Shared evaluator for CIS recommendations that audit one managed
+# preference key. Comparison is --expect <value> (exact match) or
+# --min/--max <n> (integer range, either or both).
+#
+# Scoring policy for an UNSET key, agreed with the project owner: WARN
+# ("not enforced by a configuration profile"), never FAIL. An unmanaged
+# Mac hasn't chosen an insecure value, it just hasn't been hardened —
+# and ~25 profile-only CIS controls would otherwise swamp the score on
+# every personal Mac. An explicitly insecure value is still a FAIL.
+# --unset-ok is for keys whose CIS audit itself passes when unset (e.g.
+# software-update deferral: "no output ... will pass the audit").
+evaluate_managed_pref() {
+    local category="" control="" severity="" suite="" key=""
+    local expect="" min="" max="" unset_ok=0 recommendation=""
+    local -a fw
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --category) category="$2"; shift 2 ;;
+            --control) control="$2"; shift 2 ;;
+            --severity) severity="$2"; shift 2 ;;
+            --suite) suite="$2"; shift 2 ;;
+            --key) key="$2"; shift 2 ;;
+            --expect) expect="$2"; shift 2 ;;
+            --min) min="$2"; shift 2 ;;
+            --max) max="$2"; shift 2 ;;
+            --unset-ok) unset_ok=1; shift ;;
+            --recommendation) recommendation="$2"; shift 2 ;;
+            --cis|--nist|--mitre|--iso27001|--nis2|--nsa|--cis-macos|--mscp) fw+=("$1" "$2"); shift 2 ;;
+            *) echo "evaluate_managed_pref: unknown argument: $1" >&2; shift ;;
+        esac
+    done
+
+    local recommended
+    if [[ -n "$expect" ]]; then
+        recommended="$key = $expect"
+    elif [[ -n "$min" && -n "$max" ]]; then
+        recommended="$min <= $key <= $max"
+    elif [[ -n "$max" ]]; then
+        recommended="$key <= $max"
+    else
+        recommended="$key >= $min"
+    fi
+
+    local -a base
+    base=(--category "$category" --control "$control" --recommended "$recommended" "${fw[@]}")
+
+    local value rc
+    value=$(managed_pref_read "$suite" "$key")
+    rc=$?
+
+    if [[ $rc -eq 2 ]]; then
+        add_audit_result "${base[@]}" --status WARN --severity Low \
+            --current "Preference query failed for $suite / $key" \
+            --recommendation "Unable to read $suite / $key via NSUserDefaults; verify the setting manually."
+        return 0
+    fi
+
+    if [[ $rc -eq 1 ]]; then
+        if [[ $unset_ok -eq 1 ]]; then
+            add_audit_result "${base[@]}" --status PASS --severity "$severity" \
+                --current "$key not set (CIS treats unset as compliant)" \
+                --recommendation 'No action required.'
+        else
+            add_audit_result "${base[@]}" --status WARN --severity "$severity" \
+                --current "$key not set - not enforced by a configuration profile" \
+                --recommendation "$recommendation"
+        fi
+        return 0
+    fi
+
+    local ok=0
+    if [[ -n "$expect" ]]; then
+        [[ "$value" == "$expect" ]] && ok=1
+    elif [[ "$value" == <-> ]]; then
+        ok=1
+        [[ -n "$min" ]] && (( value < min )) && ok=0
+        [[ -n "$max" ]] && (( value > max )) && ok=0
+    fi
+
+    if [[ $ok -eq 1 ]]; then
+        add_audit_result "${base[@]}" --status PASS --severity "$severity" \
+            --current "$suite / $key = $value" --recommendation 'No action required.'
+    else
+        add_audit_result "${base[@]}" --status FAIL --severity "$severity" \
+            --current "$suite / $key = $value" --recommendation "$recommendation"
+    fi
+}
+
+# Installed-configuration-profile payload dump, cached for the run:
+# system_profiler takes ~1s and several CIS controls (Safari, hot
+# corners) read it. Must be primed by a direct call, not inside $(...),
+# or the cache assignment is lost with the subshell.
+typeset -g CONFIG_PROFILE_DUMP=""
+typeset -gi CONFIG_PROFILE_DUMP_STATUS=-1
+
+load_config_profile_dump() {
+    if [[ $CONFIG_PROFILE_DUMP_STATUS -lt 0 ]]; then
+        CONFIG_PROFILE_DUMP=$(system_profiler SPConfigurationProfileDataType 2>&1)
+        CONFIG_PROFILE_DUMP_STATUS=$?
+    fi
+    return $CONFIG_PROFILE_DUMP_STATUS
+}
+
+# Prints the value of a payload key from the cached profile dump
+# ('    "Key.Name" = 1;' -> '1'); returns 1 when no installed profile sets it.
+config_profile_value() {
+    local key="$1" line
+    line=$(print -r -- "$CONFIG_PROFILE_DUMP" | tr -d ' \t"' | grep -E "^${key//./\\.}=" | head -1)
+    [[ -z "$line" ]] && return 1
+    line="${line#*=}"
+    printf '%s' "${line%;}"
+    return 0
+}
+
+# Shared evaluator for profile-only CIS controls verified against the
+# installed-profile dump (the CIS audit method for Safari settings).
+# Every --pair Key=Value must be present and match to PASS; any present
+# with a different value is a FAIL; none present is a WARN (same unset
+# policy as evaluate_managed_pref).
+evaluate_profile_payload() {
+    local category="" control="" severity="" recommendation=""
+    local -a pairs fw
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --category) category="$2"; shift 2 ;;
+            --control) control="$2"; shift 2 ;;
+            --severity) severity="$2"; shift 2 ;;
+            --pair) pairs+=("$2"); shift 2 ;;
+            --recommendation) recommendation="$2"; shift 2 ;;
+            --cis|--nist|--mitre|--iso27001|--nis2|--nsa|--cis-macos|--mscp) fw+=("$1" "$2"); shift 2 ;;
+            *) echo "evaluate_profile_payload: unknown argument: $1" >&2; shift ;;
+        esac
+    done
+
+    local -a base
+    base=(--category "$category" --control "$control" --recommended "${(j:, :)pairs}" "${fw[@]}")
+
+    if ! load_config_profile_dump; then
+        add_audit_result "${base[@]}" --status WARN --severity Low \
+            --current "Configuration profile query failed: $CONFIG_PROFILE_DUMP" \
+            --recommendation 'Unable to list installed configuration profiles; verify manually in System Settings > General > Device Management.'
+        return 0
+    fi
+
+    local pair want got found=0 mismatch=0
+    local -a seen
+    for pair in "${pairs[@]}"; do
+        want="${pair#*=}"
+        got=$(config_profile_value "${pair%%=*}") || { seen+=("${pair%%=*} not set"); continue; }
+        found=$((found + 1))
+        seen+=("${pair%%=*}=$got")
+        [[ "$got" != "$want" ]] && mismatch=1
+    done
+
+    if [[ $mismatch -eq 1 ]]; then
+        add_audit_result "${base[@]}" --status FAIL --severity "$severity" \
+            --current "${(j:, :)seen}" --recommendation "$recommendation"
+    elif [[ $found -eq ${#pairs[@]} ]]; then
+        add_audit_result "${base[@]}" --status PASS --severity "$severity" \
+            --current "${(j:, :)seen}" --recommendation 'No action required.'
+    else
+        add_audit_result "${base[@]}" --status WARN --severity "$severity" \
+            --current "${(j:, :)seen} - not fully enforced by a configuration profile" \
+            --recommendation "$recommendation"
+    fi
 }
 
 # ---- 10-hardware.zsh ----
@@ -1162,6 +1355,42 @@ check_tcc_database_permissions() {
     fi
 }
 
+# --- CIS Apple macOS 26 Tahoe v1.0.0 sections 2.6.1.1-2.6.1.2 (Level 2) ---
+
+check_location_services_enabled() {
+    run_root launchctl list
+    local daemon_loaded=0
+    [[ $ROOT_CMD_STATUS -eq 0 && "$ROOT_CMD_OUTPUT" == *"com.apple.locationd"* ]] && daemon_loaded=1
+    # Read as the _locationd user, exactly as the CIS audit does: the
+    # setting lives in that account's ByHost preferences.
+    run_root sudo -u _locationd osascript -l JavaScript -e "var v = \$.NSUserDefaults.alloc.initWithSuiteName('com.apple.locationd').objectForKey('LocationServicesEnabled'); v.isNil() ? '' : String(ObjC.deepUnwrap(v))"
+    local enabled="$ROOT_CMD_OUTPUT" enabled_status=$ROOT_CMD_STATUS
+    local -a fw
+    fw=(--recommended 'locationd loaded, LocationServicesEnabled=true' --cis 'CIS 4.1, 4.8' --nist 'CM-7'
+        --iso27001 'A.8.9' --nis2 'Art.21(2)(d)' --cis-macos 'CIS-macOS 2.6.1.1' --mscp 'system_settings_location_services_enable')
+
+    if [[ $enabled_status -ne 0 ]]; then
+        add_audit_result --category 'TCC & Privacy Controls' --control 'Location Services Enabled' \
+            --status WARN --severity Low --current "Query failed: $enabled" "${fw[@]}" \
+            --recommendation 'Verify manually in System Settings > Privacy & Security > Location Services.'
+    elif [[ $daemon_loaded -eq 1 && ( "$enabled" == "true" || "$enabled" == "1" ) ]]; then
+        add_audit_result --category 'TCC & Privacy Controls' --control 'Location Services Enabled' \
+            --status PASS --severity Low --current 'Location Services enabled' "${fw[@]}" --recommendation 'No action required.'
+    else
+        add_audit_result --category 'TCC & Privacy Controls' --control 'Location Services Enabled' \
+            --status FAIL --severity Low --current "locationd loaded=$daemon_loaded, LocationServicesEnabled=${enabled:-not set}" "${fw[@]}" \
+            --recommendation 'Enable Location Services (CIS Level 2: needed for accurate time zone and Find My) in System Settings > Privacy & Security > Location Services; restrict per-app access instead.'
+    fi
+}
+
+check_location_services_menu_icon() {
+    evaluate_managed_pref --category 'TCC & Privacy Controls' --control 'Location Icon Shown for System Services' \
+        --severity Low --suite com.apple.locationmenu --key ShowSystemServices --expect 1 \
+        --cis 'CIS 4.1, 4.8' --nist 'CM-7' --iso27001 'A.8.9' --nis2 'Art.21(2)(d)' \
+        --cis-macos 'CIS-macOS 2.6.1.2' --mscp 'system_settings_location_services_menu_enforce' \
+        --recommendation 'Enable "Show location icon in Control Center when System Services request your location" (Location Services > System Services > Details), or enforce ShowSystemServices=true via profile.'
+}
+
 # ---- 16-identity-accounts.zsh ----
 #
 # Domain 7: Identity, Accounts & Privilege Management
@@ -1350,6 +1579,321 @@ check_sudoers_configuration() {
             --nis2 'Art.21(2)(i)' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'No action required.'
     fi
+}
+
+# --- CIS Apple macOS 26 Tahoe v1.0.0 sections 2.6.8, 2.12.1, 2.13.2, 5.2.x, 5.4-5.11 ---
+
+# Prints the integer that follows <key>$name</key> in pwpolicy XML output.
+_pwpolicy_param() {
+    local xml="$1" name="$2"
+    print -r -- "$xml" | awk -v k="<key>$name</key>" '
+        index($0, k) { want = 1; next }
+        want && match($0, /<integer>[0-9]+<\/integer>/) { v = substr($0, RSTART + 9, RLENGTH - 19); print v; exit }
+        want && /<key>/ { want = 0 }'
+}
+
+_pwpolicy_fw() {
+    # Shared framework flags for the password-policy controls; $1 = CIS-macOS
+    # section, $2 = mSCP rule, $3 = CIS Controls v8 safeguard.
+    reply=(--cis "CIS $3" --nist 'IA-5(1)' --mitre 'T1110 (Brute Force)' --iso27001 'A.5.17'
+           --nis2 'Art.21(2)(i)' --nsa 'NSA/CISA Password Guidance' --cis-macos "CIS-macOS $1" --mscp "$2")
+}
+
+_pwpolicy_query_failed() {
+    local control="$1"; shift
+    add_audit_result --category 'Identity, Accounts & Privilege Management' --control "$control" \
+        --status WARN --severity Low --current "pwpolicy query failed: $ROOT_CMD_OUTPUT" "$@" \
+        --recommendation 'Verify manually with "sudo pwpolicy -getaccountpolicies".'
+}
+
+check_password_lockout_threshold() {
+    write_section_banner 'Identity, Accounts & Privilege Management - Password Policy (CIS 5.2)'
+    run_root pwpolicy -getaccountpolicies
+    _pwpolicy_fw 5.2.1 pwpolicy_account_lockout_enforce 6.2
+    local -a fw=("${reply[@]}" --recommended 'policyAttributeMaximumFailedAuthentications <= 5')
+    if [[ $ROOT_CMD_STATUS -ne 0 ]]; then
+        _pwpolicy_query_failed 'Password Account Lockout Threshold' "${fw[@]}"; return 0
+    fi
+    local value
+    value=$(_pwpolicy_param "$ROOT_CMD_OUTPUT" policyAttributeMaximumFailedAuthentications)
+    if [[ "$value" == <-> ]] && (( value > 0 && value <= 5 )); then
+        add_audit_result --category 'Identity, Accounts & Privilege Management' --control 'Password Account Lockout Threshold' \
+            --status PASS --severity High --current "Lockout after $value failed attempts" "${fw[@]}" \
+            --recommendation 'No action required.'
+    else
+        add_audit_result --category 'Identity, Accounts & Privilege Management' --control 'Password Account Lockout Threshold' \
+            --status FAIL --severity High --current "$([[ -n "$value" ]] && print -r -- "Lockout after $value failed attempts" || print -r -- "No lockout threshold configured")" "${fw[@]}" \
+            --recommendation 'Set an account lockout threshold of 5 or fewer failed attempts: "sudo pwpolicy -setaccountpolicies" with policyAttributeMaximumFailedAuthentications, or an MDM Passcode payload (maxFailedAttempts).'
+    fi
+}
+
+check_password_minimum_length() {
+    run_root pwpolicy -getaccountpolicies
+    _pwpolicy_fw 5.2.2 pwpolicy_minimum_length_enforce 5.2
+    local -a fw=("${reply[@]}" --recommended 'Minimum password length >= 15')
+    if [[ $ROOT_CMD_STATUS -ne 0 ]]; then
+        _pwpolicy_query_failed 'Password Minimum Length' "${fw[@]}"; return 0
+    fi
+    # Only length rules have the shape ".{N," — complexity rules such as
+    # "(.*[0-9].*){1,}" have ")" before the brace and are excluded.
+    local value
+    value=$(print -r -- "$ROOT_CMD_OUTPUT" | grep -oE "policyAttributePassword matches '\^?\.\{[0-9]+," \
+        | grep -oE '[0-9]+' | sort -n | tail -1)
+    if [[ "$value" == <-> ]] && (( value >= 15 )); then
+        add_audit_result --category 'Identity, Accounts & Privilege Management' --control 'Password Minimum Length' \
+            --status PASS --severity High --current "Minimum length $value" "${fw[@]}" \
+            --recommendation 'No action required.'
+    else
+        add_audit_result --category 'Identity, Accounts & Privilege Management' --control 'Password Minimum Length' \
+            --status FAIL --severity High --current "$([[ -n "$value" ]] && print -r -- "Minimum length $value" || print -r -- "No minimum length policy configured")" "${fw[@]}" \
+            --recommendation 'Require passwords of at least 15 characters via "sudo pwpolicy -setaccountpolicies" or an MDM Passcode payload (minLength).'
+    fi
+}
+
+check_password_age() {
+    run_root pwpolicy -getaccountpolicies
+    _pwpolicy_fw 5.2.7 pwpolicy_max_lifetime_enforce 5.3
+    local -a fw=("${reply[@]}" --recommended 'Password expires within 365 days')
+    if [[ $ROOT_CMD_STATUS -ne 0 ]]; then
+        _pwpolicy_query_failed 'Password Age' "${fw[@]}"; return 0
+    fi
+    local every until
+    every=$(_pwpolicy_param "$ROOT_CMD_OUTPUT" policyAttributeExpiresEveryNDays)
+    until=$(_pwpolicy_param "$ROOT_CMD_OUTPUT" policyAttributeDaysUntilExpiration)
+    local current="ExpiresEveryNDays=${every:-not set}, DaysUntilExpiration=${until:-not set}"
+    if { [[ "$every" == <-> ]] && (( every > 0 && every <= 365 )); } || { [[ "$until" == <-> ]] && (( until > 0 && until <= 365 )); }; then
+        add_audit_result --category 'Identity, Accounts & Privilege Management' --control 'Password Age' \
+            --status PASS --severity Low --current "$current" "${fw[@]}" --recommendation 'No action required.'
+    else
+        add_audit_result --category 'Identity, Accounts & Privilege Management' --control 'Password Age' \
+            --status FAIL --severity Low --current "$current" "${fw[@]}" \
+            --recommendation 'Set a maximum password age of 365 days or less via "sudo pwpolicy -setaccountpolicies" or an MDM Passcode payload (maxPINAgeInDays).'
+    fi
+}
+
+check_password_history() {
+    run_root pwpolicy -getaccountpolicies
+    _pwpolicy_fw 5.2.8 pwpolicy_history_enforce 5.2
+    local -a fw=("${reply[@]}" --recommended 'policyAttributePasswordHistoryDepth >= 24')
+    if [[ $ROOT_CMD_STATUS -ne 0 ]]; then
+        _pwpolicy_query_failed 'Password History' "${fw[@]}"; return 0
+    fi
+    # Threshold follows the recommendation title (">= 24", also mSCP's
+    # value); the benchmark's own audit one-liner only tests ">= 1".
+    local value
+    value=$(_pwpolicy_param "$ROOT_CMD_OUTPUT" policyAttributePasswordHistoryDepth)
+    if [[ "$value" == <-> ]] && (( value >= 24 )); then
+        add_audit_result --category 'Identity, Accounts & Privilege Management' --control 'Password History' \
+            --status PASS --severity Medium --current "Last $value passwords remembered" "${fw[@]}" \
+            --recommendation 'No action required.'
+    else
+        add_audit_result --category 'Identity, Accounts & Privilege Management' --control 'Password History' \
+            --status FAIL --severity Medium --current "$([[ -n "$value" ]] && print -r -- "Last $value passwords remembered" || print -r -- "No password history policy configured")" "${fw[@]}" \
+            --recommendation 'Prevent reuse of the last 24 passwords via "sudo pwpolicy -setaccountpolicies" or an MDM Passcode payload (pinHistory).'
+    fi
+}
+
+# Evaluates one line of "sudo -V" (run as root, which prints the
+# effective sudoers defaults). Parameterized: control, expected
+# substring, CIS section, mSCP rule, recommendation.
+_sudo_default_check() {
+    local control="$1" needle="$2" cis_macos="$3" mscp_id="$4" recommendation="$5" current_label="$6"
+    run_root sudo -V
+    local -a fw
+    fw=(--recommended "$needle" --cis 'CIS 4.3' --nist 'AC-6, AU-12' --mitre 'T1548.003 (Sudo and Sudo Caching)'
+        --iso27001 'A.8.2' --nis2 'Art.21(2)(i)' --cis-macos "CIS-macOS $cis_macos" --mscp "$mscp_id")
+
+    if [[ $ROOT_CMD_STATUS -ne 0 || "$ROOT_CMD_OUTPUT" != *"Sudoers policy"* ]]; then
+        add_audit_result --category 'Identity, Accounts & Privilege Management' --control "$control" \
+            --status WARN --severity Low --current "sudo -V query failed or returned no policy details" "${fw[@]}" \
+            --recommendation 'Verify manually with "sudo sudo -V".'
+        return 0
+    fi
+
+    local line
+    line=$(print -r -- "$ROOT_CMD_OUTPUT" | grep -F "$current_label" | head -1 | sed 's/^[[:space:]]*//')
+    if [[ "$ROOT_CMD_OUTPUT" == *"$needle"* ]]; then
+        add_audit_result --category 'Identity, Accounts & Privilege Management' --control "$control" \
+            --status PASS --severity Medium --current "$needle" "${fw[@]}" --recommendation 'No action required.'
+    else
+        add_audit_result --category 'Identity, Accounts & Privilege Management' --control "$control" \
+            --status FAIL --severity Medium --current "${line:-Setting not present in sudo -V output}" "${fw[@]}" \
+            --recommendation "$recommendation"
+    fi
+}
+
+check_sudo_timeout_zero() {
+    _sudo_default_check 'Sudo Timeout Period' 'Authentication timestamp timeout: 0.0 minutes' 5.4 \
+        os_sudo_timeout_configure \
+        'Add "Defaults timestamp_timeout=0" in a file under /etc/sudoers.d/ (edit with "sudo visudo -f /etc/sudoers.d/10_cissudoconfiguration") so every sudo use re-authenticates.' \
+        'Authentication timestamp timeout'
+}
+
+check_sudo_timestamp_per_tty() {
+    _sudo_default_check 'Sudo Separate Timestamp per TTY' 'Type of authentication timestamp record: tty' 5.5 \
+        os_sudoers_timestamp_type_configure \
+        'Add "Defaults timestamp_type=tty" in a file under /etc/sudoers.d/ (via "sudo visudo -f") so a sudo ticket in one terminal is not reusable from another.' \
+        'Type of authentication timestamp record'
+}
+
+check_sudo_logging_enabled() {
+    _sudo_default_check 'Sudo Command Logging' 'Log when a command is allowed by sudoers' 5.11 \
+        os_sudo_log_enforce \
+        'Add "Defaults log_allowed" in a file under /etc/sudoers.d/ (via "sudo visudo -f") so successful sudo commands are logged.' \
+        'Log when a command is allowed'
+}
+
+_authdb_value() {
+    print -r -- "$1" | plutil -extract "$2" raw -o - - 2>/dev/null
+}
+
+check_admin_password_for_system_preferences() {
+    local -a rights
+    rights=(system.preferences system.preferences.energysaver system.preferences.network system.preferences.printing
+            system.preferences.sharing system.preferences.softwareupdate system.preferences.startupdisk
+            system.preferences.timemachine)
+    local -a fw
+    fw=(--recommended 'shared=false, group=admin, authenticate-user=true, session-owner=false for every system.preferences right'
+        --cis 'CIS 4.1' --nist 'AC-6, CM-5' --mitre 'T1548 (Abuse Elevation Control Mechanism)' --iso27001 'A.8.2'
+        --nis2 'Art.21(2)(i)' --cis-macos 'CIS-macOS 2.6.8' --mscp 'system_settings_system_wide_preferences_configure')
+
+    local right xml failed_queries=0
+    local -a noncompliant
+    for right in "${rights[@]}"; do
+        run_root security -q authorizationdb read "$right"
+        if [[ $ROOT_CMD_STATUS -ne 0 ]]; then
+            failed_queries=$((failed_queries + 1)); continue
+        fi
+        xml="$ROOT_CMD_OUTPUT"
+        if [[ "$(_authdb_value "$xml" shared)" != "false" || "$(_authdb_value "$xml" group)" != "admin" \
+              || "$(_authdb_value "$xml" authenticate-user)" != "true" || "$(_authdb_value "$xml" session-owner)" != "false" ]]; then
+            noncompliant+=("$right")
+        fi
+    done
+
+    if [[ $failed_queries -eq ${#rights[@]} ]]; then
+        add_audit_result --category 'Identity, Accounts & Privilege Management' --control 'Admin Password Required for System-Wide Preferences' \
+            --status WARN --severity Low --current 'authorizationdb queries failed' "${fw[@]}" \
+            --recommendation 'Verify manually with "security authorizationdb read system.preferences".'
+    elif [[ ${#noncompliant[@]} -eq 0 ]]; then
+        add_audit_result --category 'Identity, Accounts & Privilege Management' --control 'Admin Password Required for System-Wide Preferences' \
+            --status PASS --severity Medium --current 'All system.preferences rights require an admin password' "${fw[@]}" \
+            --recommendation 'No action required.'
+    else
+        add_audit_result --category 'Identity, Accounts & Privilege Management' --control 'Admin Password Required for System-Wide Preferences' \
+            --status FAIL --severity Medium --current "${#noncompliant[@]} of ${#rights[@]} rights not locked to admin authentication" \
+            --details "${(F)noncompliant}" "${fw[@]}" \
+            --recommendation 'For each listed right, set shared=false (and require admin auth) with "security authorizationdb read <right> > r.plist", edit, then "sudo security authorizationdb write <right> < r.plist" — or deploy via MDM.'
+    fi
+}
+
+check_admin_cannot_unlock_other_sessions() {
+    run_root security -q authorizationdb read system.login.screensaver
+    local xml="$ROOT_CMD_OUTPUT" xml_status=$ROOT_CMD_STATUS
+    local -a fw
+    fw=(--recommended 'system.login.screensaver rule = authenticate-session-owner' --cis 'CIS 4.3' --nist 'AC-11, AC-6'
+        --mitre 'T1078.003 (Local Accounts)' --iso27001 'A.8.5' --nis2 'Art.21(2)(i)'
+        --cis-macos 'CIS-macOS 5.7' --mscp 'os_unlock_active_user_session_disable')
+
+    if [[ $xml_status -ne 0 ]]; then
+        add_audit_result --category 'Identity, Accounts & Privilege Management' --control 'Admin Cannot Unlock Other User Sessions' \
+            --status WARN --severity Low --current "authorizationdb query failed: $xml" "${fw[@]}" \
+            --recommendation 'Verify manually with "security authorizationdb read system.login.screensaver".'
+        return 0
+    fi
+
+    local rule
+    rule=$(print -r -- "$xml" | plutil -extract rule json -o - - 2>/dev/null)
+    if [[ "$rule" == *'"authenticate-session-owner"'* ]]; then
+        add_audit_result --category 'Identity, Accounts & Privilege Management' --control 'Admin Cannot Unlock Other User Sessions' \
+            --status PASS --severity Medium --current "rule = $rule" "${fw[@]}" --recommendation 'No action required.'
+        return 0
+    fi
+
+    # CIS: when Platform SSO is configured this right is managed by the
+    # IdP integration and must not be remediated — report, don't score.
+    run_root app-sso platform -s
+    local device_config
+    device_config=$(print -r -- "$ROOT_CMD_OUTPUT" | awk '/^Device Configuration:/{getline; gsub(/^[ \t]+/, ""); print; exit}')
+    if [[ $ROOT_CMD_STATUS -eq 0 && -n "$device_config" && "$device_config" != "(null)" ]]; then
+        add_audit_result --category 'Identity, Accounts & Privilege Management' --control 'Admin Cannot Unlock Other User Sessions' \
+            --status INFO --severity Informational --current "rule = ${rule:-unknown}; Platform SSO is configured" "${fw[@]}" \
+            --recommendation 'Platform SSO manages this right; per CIS, do not apply the remediation on PSSO-enrolled Macs.'
+    else
+        add_audit_result --category 'Identity, Accounts & Privilege Management' --control 'Admin Cannot Unlock Other User Sessions' \
+            --status FAIL --severity Medium --current "rule = ${rule:-unknown}" "${fw[@]}" \
+            --recommendation 'Restrict screensaver unlock to the session owner: "sudo security authorizationdb write system.login.screensaver authenticate-session-owner".'
+    fi
+}
+
+check_user_password_hints_absent() {
+    run_root dscl . -list /Users hint
+    local -a fw
+    fw=(--recommended 'No local account has a password hint' --cis 'CIS 5.2' --nist 'IA-5, IA-6'
+        --mitre 'T1110 (Brute Force)' --iso27001 'A.5.17' --nis2 'Art.21(2)(i)'
+        --cis-macos 'CIS-macOS 2.12.1' --mscp 'os_password_hint_remove')
+
+    if [[ $ROOT_CMD_STATUS -ne 0 ]]; then
+        add_audit_result --category 'Identity, Accounts & Privilege Management' --control 'User Password Hints' \
+            --status WARN --severity Low --current "dscl query failed: $ROOT_CMD_OUTPUT" "${fw[@]}" \
+            --recommendation 'Verify manually with "sudo dscl . -list /Users hint".'
+        return 0
+    fi
+
+    # Only usernames are reported, never the hint text itself.
+    local -a with_hint
+    with_hint=(${(f)"$(print -r -- "$ROOT_CMD_OUTPUT" | awk 'NF >= 2 {print $1}')"})
+    if [[ ${#with_hint[@]} -eq 0 ]]; then
+        add_audit_result --category 'Identity, Accounts & Privilege Management' --control 'User Password Hints' \
+            --status PASS --severity Medium --current 'No account has a password hint' "${fw[@]}" \
+            --recommendation 'No action required.'
+    else
+        add_audit_result --category 'Identity, Accounts & Privilege Management' --control 'User Password Hints' \
+            --status FAIL --severity Medium --current "${#with_hint[@]} account(s) have a password hint" \
+            --details "${(F)with_hint}" "${fw[@]}" \
+            --recommendation 'Remove each hint: "sudo dscl . -delete /Users/<username> hint".'
+    fi
+}
+
+check_smb_guest_access_disabled() {
+    run_root sysadminctl -smbGuestAccess status
+    local -a fw
+    fw=(--recommended 'SMB guest access disabled' --cis 'CIS 3.3' --nist 'AC-14, AC-3'
+        --mitre 'T1021.002 (SMB/Windows Admin Shares)' --iso27001 'A.8.3' --nis2 'Art.21(2)(i)'
+        --cis-macos 'CIS-macOS 2.13.2' --mscp 'system_settings_guest_access_smb_disable')
+
+    if [[ "$ROOT_CMD_OUTPUT" == *"SMB guest access disabled"* ]]; then
+        add_audit_result --category 'Identity, Accounts & Privilege Management' --control 'Guest Access to Shared Folders' \
+            --status PASS --severity High --current 'SMB guest access disabled' "${fw[@]}" --recommendation 'No action required.'
+    elif [[ "$ROOT_CMD_OUTPUT" == *"SMB guest access enabled"* ]]; then
+        add_audit_result --category 'Identity, Accounts & Privilege Management' --control 'Guest Access to Shared Folders' \
+            --status FAIL --severity High --current 'SMB guest access enabled' "${fw[@]}" \
+            --recommendation 'Disable unauthenticated access to shared folders: "sudo sysadminctl -smbGuestAccess off".'
+    else
+        add_audit_result --category 'Identity, Accounts & Privilege Management' --control 'Guest Access to Shared Folders' \
+            --status WARN --severity Low --current "Query failed or unrecognized output: $ROOT_CMD_OUTPUT" "${fw[@]}" \
+            --recommendation 'Verify manually with "sudo sysadminctl -smbGuestAccess status".'
+    fi
+}
+
+# Parameterized on the folder path so it is testable against a scratch dir.
+_guest_home_folder_check() {
+    local guest_home="$1"
+    local -a fw
+    fw=(--recommended 'No Guest home folder' --cis 'CIS 4.1' --nist 'AC-2' --iso27001 'A.5.18'
+        --nis2 'Art.21(2)(i)' --cis-macos 'CIS-macOS 5.9' --mscp 'os_guest_folder_removed')
+    if [[ -d "$guest_home" ]]; then
+        add_audit_result --category 'Identity, Accounts & Privilege Management' --control 'Guest Home Folder Removed' \
+            --status FAIL --severity Low --current "$guest_home exists" "${fw[@]}" \
+            --recommendation "With the Guest account disabled, remove the leftover folder after reviewing its contents: sudo rm -R $guest_home"
+    else
+        add_audit_result --category 'Identity, Accounts & Privilege Management' --control 'Guest Home Folder Removed' \
+            --status PASS --severity Low --current 'No Guest home folder' "${fw[@]}" --recommendation 'No action required.'
+    fi
+}
+
+check_guest_home_folder_absent() {
+    _guest_home_folder_check /Users/Guest
 }
 
 # ---- 17-firewall.zsh ----
@@ -1624,6 +2168,167 @@ check_remote_login_toggle() {
             --recommended 'Remote Login: Off' \
             --cis 'CIS 4.9' --nist 'AC-17' --cis-macos 'CIS-macOS 2.5.3' --mscp 'os_ssh_server_disable' \
             --recommendation 'Unable to determine remote login state; verify manually with "systemsetup -getremotelogin".'
+    fi
+}
+
+# --- CIS Apple macOS 26 Tahoe v1.0.0 sections 2.3.1.2 and 2.3.3.x ---
+
+check_airplay_receiver_disabled() {
+    evaluate_managed_pref --category 'Remote Access & Sharing Services' --control 'AirPlay Receiver Disabled' \
+        --severity Medium --suite com.apple.applicationaccess --key allowAirPlayIncomingRequests --expect 0 \
+        --cis 'CIS 4.1, 4.8' --nist 'CM-7, SC-7' --mitre 'T1021 (Remote Services)' --iso27001 'A.8.20' \
+        --nis2 'Art.21(2)(d)' --cis-macos 'CIS-macOS 2.3.1.2' --mscp 'system_settings_airplay_receiver_disable' \
+        --recommendation 'Deploy a Restrictions profile with allowAirPlayIncomingRequests=false so the Mac does not listen for AirPlay connections.'
+}
+
+check_printer_sharing_disabled() {
+    run_root cupsctl
+    local -a fw
+    fw=(--recommended '_share_printers=0' --cis 'CIS 4.1, 4.8' --nist 'CM-7, SC-7' --iso27001 'A.8.20'
+        --nis2 'Art.21(2)(d)' --cis-macos 'CIS-macOS 2.3.3.3' --mscp 'system_settings_printer_sharing_disable')
+
+    if [[ $ROOT_CMD_STATUS -ne 0 ]]; then
+        add_audit_result --category 'Remote Access & Sharing Services' --control 'Printer Sharing' \
+            --status WARN --severity Low --current "cupsctl query failed: $ROOT_CMD_OUTPUT" "${fw[@]}" \
+            --recommendation 'Verify manually in System Settings > General > Sharing > Printer Sharing.'
+    elif [[ "$ROOT_CMD_OUTPUT" == *"_share_printers=0"* ]]; then
+        add_audit_result --category 'Remote Access & Sharing Services' --control 'Printer Sharing' \
+            --status PASS --severity Medium --current 'Printer Sharing is disabled' "${fw[@]}" \
+            --recommendation 'No action required.'
+    else
+        add_audit_result --category 'Remote Access & Sharing Services' --control 'Printer Sharing' \
+            --status FAIL --severity Medium --current 'Printer Sharing is enabled' "${fw[@]}" \
+            --recommendation 'Disable Printer Sharing: "sudo cupsctl --no-share-printers", or System Settings > General > Sharing.'
+    fi
+}
+
+check_remote_apple_events_disabled() {
+    run_root systemsetup -getremoteappleevents
+    local -a fw
+    fw=(--recommended 'Remote Apple Events: Off' --cis 'CIS 4.1, 4.8' --nist 'AC-17, CM-7'
+        --mitre 'T1021 (Remote Services)' --iso27001 'A.8.20' --nis2 'Art.21(2)(d)'
+        --cis-macos 'CIS-macOS 2.3.3.6' --mscp 'system_settings_rae_disable')
+
+    if [[ "$ROOT_CMD_OUTPUT" == *"Remote Apple Events: Off"* ]]; then
+        add_audit_result --category 'Remote Access & Sharing Services' --control 'Remote Apple Events' \
+            --status PASS --severity High --current 'Remote Apple Events: Off' "${fw[@]}" \
+            --recommendation 'No action required.'
+    elif [[ "$ROOT_CMD_OUTPUT" == *"Remote Apple Events: On"* ]]; then
+        add_audit_result --category 'Remote Access & Sharing Services' --control 'Remote Apple Events' \
+            --status FAIL --severity High --current 'Remote Apple Events: On' "${fw[@]}" \
+            --recommendation 'Disable Remote Apple Events (lets remote hosts send AppleScript events to this Mac): System Settings > General > Sharing, or "sudo systemsetup -setremoteappleevents off".'
+    else
+        add_audit_result --category 'Remote Access & Sharing Services' --control 'Remote Apple Events' \
+            --status WARN --severity Low --current "Query failed or unrecognized output: $ROOT_CMD_OUTPUT" "${fw[@]}" \
+            --recommendation 'Verify manually in System Settings > General > Sharing > Remote Application Scripting.'
+    fi
+}
+
+check_internet_sharing_disabled() {
+    local forced_off
+    forced_off=$(managed_pref_read com.apple.MCX forceInternetSharingOff)
+    run_root defaults read /Library/Preferences/SystemConfiguration/com.apple.nat
+    local -a fw
+    fw=(--recommended 'Internet Sharing not enabled (or forceInternetSharingOff=true)' --cis 'CIS 4.1, 4.8'
+        --nist 'SC-7, CM-7' --mitre 'T1090 (Proxy)' --iso27001 'A.8.20' --nis2 'Art.21(2)(d)'
+        --cis-macos 'CIS-macOS 2.3.3.7' --mscp 'system_settings_internet_sharing_disable')
+
+    # A missing com.apple.nat domain is the normal state when Internet
+    # Sharing has never been turned on — CIS counts that as compliant.
+    if [[ "$forced_off" == "1" ]]; then
+        add_audit_result --category 'Remote Access & Sharing Services' --control 'Internet Sharing' \
+            --status PASS --severity High --current 'Disabled by configuration profile (forceInternetSharingOff)' "${fw[@]}" \
+            --recommendation 'No action required.'
+    elif [[ $ROOT_CMD_STATUS -eq 0 && "$ROOT_CMD_OUTPUT" == *"Enabled = 1;"* ]]; then
+        add_audit_result --category 'Remote Access & Sharing Services' --control 'Internet Sharing' \
+            --status FAIL --severity High --current 'Internet Sharing is enabled (com.apple.nat Enabled = 1)' "${fw[@]}" \
+            --recommendation 'Disable Internet Sharing in System Settings > General > Sharing; it turns this Mac into a router bridging networks.'
+    elif [[ $ROOT_CMD_STATUS -eq 0 || "$ROOT_CMD_OUTPUT" == *"does not exist"* || "$ROOT_CMD_OUTPUT" == *"not found"* ]]; then
+        add_audit_result --category 'Remote Access & Sharing Services' --control 'Internet Sharing' \
+            --status PASS --severity High --current 'Internet Sharing is not enabled' "${fw[@]}" \
+            --recommendation 'No action required.'
+    else
+        add_audit_result --category 'Remote Access & Sharing Services' --control 'Internet Sharing' \
+            --status WARN --severity Low --current "com.apple.nat query failed: $ROOT_CMD_OUTPUT" "${fw[@]}" \
+            --recommendation 'Verify manually in System Settings > General > Sharing > Internet Sharing.'
+    fi
+}
+
+check_content_caching_disabled() {
+    local activated allowed
+    activated=$(managed_pref_read com.apple.AssetCache Activated)
+    allowed=$(managed_pref_read com.apple.applicationaccess allowContentCaching)
+    local current="AssetCache Activated=${activated:-not set}, allowContentCaching=${allowed:-not set}"
+    local -a fw
+    fw=(--recommended 'Activated=0 or allowContentCaching=false' --cis 'CIS 4.8' --nist 'CM-7'
+        --iso27001 'A.8.20' --nis2 'Art.21(2)(d)' --cis-macos 'CIS-macOS 2.3.3.8'
+        --mscp 'system_settings_content_caching_disable')
+
+    if [[ "$activated" == "0" || "$allowed" == "0" ]]; then
+        add_audit_result --category 'Remote Access & Sharing Services' --control 'Content Caching' \
+            --status PASS --severity Low --current "$current" "${fw[@]}" --recommendation 'No action required.'
+    elif [[ "$activated" == "1" ]]; then
+        add_audit_result --category 'Remote Access & Sharing Services' --control 'Content Caching' \
+            --status FAIL --severity Low --current "$current" "${fw[@]}" \
+            --recommendation 'Disable Content Caching in System Settings > General > Sharing, or deploy allowContentCaching=false.'
+    else
+        add_audit_result --category 'Remote Access & Sharing Services' --control 'Content Caching' \
+            --status WARN --severity Low --current "$current - not enforced by a configuration profile" "${fw[@]}" \
+            --recommendation 'Deploy a Restrictions profile with allowContentCaching=false.'
+    fi
+}
+
+check_media_sharing_disabled() {
+    local sharing modification
+    sharing=$(managed_pref_read com.apple.applicationaccess allowMediaSharing)
+    modification=$(managed_pref_read com.apple.applicationaccess allowMediaSharingModification)
+    local current="allowMediaSharing=${sharing:-not set}, allowMediaSharingModification=${modification:-not set}"
+    local -a fw
+    fw=(--recommended 'allowMediaSharing=false, allowMediaSharingModification=false' --cis 'CIS 4.1, 4.8'
+        --nist 'CM-7' --iso27001 'A.8.20' --nis2 'Art.21(2)(d)' --cis-macos 'CIS-macOS 2.3.3.9'
+        --mscp 'system_settings_media_sharing_disabled')
+
+    if [[ "$sharing" == "0" && "$modification" == "0" ]]; then
+        add_audit_result --category 'Remote Access & Sharing Services' --control 'Media Sharing' \
+            --status PASS --severity Low --current "$current" "${fw[@]}" --recommendation 'No action required.'
+    elif [[ "$sharing" == "1" || "$modification" == "1" ]]; then
+        add_audit_result --category 'Remote Access & Sharing Services' --control 'Media Sharing' \
+            --status FAIL --severity Low --current "$current" "${fw[@]}" \
+            --recommendation 'Deploy a Restrictions profile with allowMediaSharing=false and allowMediaSharingModification=false (turn Media Sharing off for each user first, or the profile locks it on).'
+    else
+        add_audit_result --category 'Remote Access & Sharing Services' --control 'Media Sharing' \
+            --status WARN --severity Low --current "$current - not enforced by a configuration profile" "${fw[@]}" \
+            --recommendation 'Deploy a Restrictions profile with allowMediaSharing=false and allowMediaSharingModification=false.'
+    fi
+}
+
+check_bluetooth_sharing_disabled() {
+    local -a fw
+    fw=(--recommended 'PrefKeyServicesEnabled=0' --cis 'CIS 3.3, 4.1' --nist 'AC-18, CM-7'
+        --mitre 'T1011.001 (Exfiltration Over Bluetooth)' --iso27001 'A.8.20' --nis2 'Art.21(2)(d)'
+        --cis-macos 'CIS-macOS 2.3.3.10' --mscp 'system_settings_bluetooth_sharing_disable')
+
+    if [[ -z "$CONSOLE_USER" ]]; then
+        add_audit_result --category 'Remote Access & Sharing Services' --control 'Bluetooth Sharing' \
+            --status WARN --severity Low --current 'No console user detected; per-user setting not readable' "${fw[@]}" \
+            --recommendation 'Re-run while a user is logged in, or verify in System Settings > General > Sharing.'
+        return 0
+    fi
+
+    run_as_user defaults -currentHost read com.apple.Bluetooth PrefKeyServicesEnabled
+    if [[ $RUN_AS_USER_STATUS -eq 0 && "$RUN_AS_USER_OUTPUT" == "1" ]]; then
+        add_audit_result --category 'Remote Access & Sharing Services' --control 'Bluetooth Sharing' \
+            --status FAIL --severity Medium --current "Bluetooth Sharing enabled for $CONSOLE_USER" "${fw[@]}" \
+            --recommendation 'Disable Bluetooth Sharing in System Settings > General > Sharing.'
+    elif [[ $RUN_AS_USER_STATUS -eq 0 || "$RUN_AS_USER_OUTPUT" == *"does not exist"* || "$RUN_AS_USER_OUTPUT" == *"not found"* ]]; then
+        # Key absent = never enabled (the default), same as an explicit 0.
+        add_audit_result --category 'Remote Access & Sharing Services' --control 'Bluetooth Sharing' \
+            --status PASS --severity Medium --current "Bluetooth Sharing disabled for $CONSOLE_USER" "${fw[@]}" \
+            --recommendation 'No action required.'
+    else
+        add_audit_result --category 'Remote Access & Sharing Services' --control 'Bluetooth Sharing' \
+            --status WARN --severity Low --current "Query failed: $RUN_AS_USER_OUTPUT" "${fw[@]}" \
+            --recommendation 'Verify manually in System Settings > General > Sharing > Bluetooth Sharing.'
     fi
 }
 
@@ -2010,6 +2715,189 @@ check_unified_log_security_events() {
         --recommendation 'Informational only. For incident investigation, query the unified log directly with a predicate targeted at the timeframe and subsystem of interest.'
 }
 
+# --- CIS Apple macOS 26 Tahoe v1.0.0 sections 2.3.2.x and 3.3-3.5 ---
+
+check_network_time_enabled() {
+    run_root systemsetup -getusingnetworktime
+    local -a fw
+    fw=(--recommended 'Network Time: On' --cis 'CIS 8.4' --nist 'AU-8' --mitre 'T1070.006 (Timestomp)'
+        --iso27001 'A.8.17' --nis2 'Art.21(2)(f)' --cis-macos 'CIS-macOS 2.3.2.1' --mscp 'system_settings_time_server_enforce')
+
+    if [[ "$ROOT_CMD_OUTPUT" == *"Network Time: On"* ]]; then
+        add_audit_result --category 'Audit, Logging & Telemetry' --control 'Set Time and Date Automatically' \
+            --status PASS --severity Medium --current 'Network Time: On' "${fw[@]}" --recommendation 'No action required.'
+    elif [[ "$ROOT_CMD_OUTPUT" == *"Network Time: Off"* ]]; then
+        add_audit_result --category 'Audit, Logging & Telemetry' --control 'Set Time and Date Automatically' \
+            --status FAIL --severity Medium --current 'Network Time: Off' "${fw[@]}" \
+            --recommendation 'Enable network time so log timestamps stay correlatable: "sudo systemsetup -setusingnetworktime on".'
+    else
+        add_audit_result --category 'Audit, Logging & Telemetry' --control 'Set Time and Date Automatically' \
+            --status WARN --severity Low --current "Query failed or unrecognized output: $ROOT_CMD_OUTPUT" "${fw[@]}" \
+            --recommendation 'Verify manually in System Settings > General > Date & Time.'
+    fi
+}
+
+check_time_service_running() {
+    run_root launchctl list
+    local -a fw
+    fw=(--recommended 'com.apple.timed loaded' --cis 'CIS 8.4' --nist 'AU-8' --iso27001 'A.8.17'
+        --nis2 'Art.21(2)(f)' --cis-macos 'CIS-macOS 2.3.2.2' --mscp 'os_time_server_enabled')
+
+    if [[ $ROOT_CMD_STATUS -ne 0 ]]; then
+        add_audit_result --category 'Audit, Logging & Telemetry' --control 'Time Service (timed) Running' \
+            --status WARN --severity Low --current "launchctl query failed: $ROOT_CMD_OUTPUT" "${fw[@]}" \
+            --recommendation 'Verify manually with "sudo launchctl list | grep com.apple.timed".'
+    elif [[ "$ROOT_CMD_OUTPUT" == *"com.apple.timed"* ]]; then
+        add_audit_result --category 'Audit, Logging & Telemetry' --control 'Time Service (timed) Running' \
+            --status PASS --severity Medium --current 'com.apple.timed is loaded' "${fw[@]}" --recommendation 'No action required.'
+    else
+        add_audit_result --category 'Audit, Logging & Telemetry' --control 'Time Service (timed) Running' \
+            --status FAIL --severity Medium --current 'com.apple.timed is not loaded' "${fw[@]}" \
+            --recommendation 'Re-enable the time daemon: "sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.timed.plist".'
+    fi
+}
+
+_install_log_retention_check() {
+    local asl_path="$1"
+    local -a fw
+    fw=(--recommended 'ttl >= 365 and no all_max limit' --cis 'CIS 8.1, 8.3' --nist 'AU-4, AU-11'
+        --mitre 'T1070 (Indicator Removal)' --iso27001 'A.8.15' --nis2 'Art.21(2)(f)'
+        --cis-macos 'CIS-macOS 3.3' --mscp 'os_install_log_retention_configure')
+
+    if [[ ! -f "$asl_path" ]]; then
+        add_audit_result --category 'Audit, Logging & Telemetry' --control 'install.log Retention' \
+            --status WARN --severity Low --current "$asl_path not found" "${fw[@]}" \
+            --recommendation 'Restore /etc/asl/com.apple.install from a known-good source.'
+        return 0
+    fi
+
+    local content ttl
+    content=$(< "$asl_path")
+    ttl=$(print -r -- "$content" | grep -oiE 'ttl=[0-9]+' | head -1 | cut -d= -f2)
+    local current="ttl=${ttl:-not set}$( [[ "$content" == *all_max=* ]] && print -r -- ', all_max limit present')"
+
+    if [[ "$ttl" == <-> ]] && (( ttl >= 365 )) && [[ "$content" != *all_max=* ]]; then
+        add_audit_result --category 'Audit, Logging & Telemetry' --control 'install.log Retention' \
+            --status PASS --severity Low --current "$current" "${fw[@]}" --recommendation 'No action required.'
+    else
+        add_audit_result --category 'Audit, Logging & Telemetry' --control 'install.log Retention' \
+            --status FAIL --severity Low --current "$current" "${fw[@]}" \
+            --recommendation 'In /etc/asl/com.apple.install, add ttl=365 to the install.log line and remove any all_max= size cap.'
+    fi
+}
+
+check_install_log_retention() {
+    _install_log_retention_check /etc/asl/com.apple.install
+}
+
+# Converts an audit_control expire-after token ("60d", "5G", "1y") to
+# days (unit d/h/s/y) or gigabytes (unit B/K/M/G). Prints "<kind> <n>".
+_expire_after_token() {
+    local tok="$1" n unit
+    n="${tok%%[A-Za-z]*}"; unit="${tok#$n}"
+    [[ "$n" == <-> ]] || return 1
+    case "$unit" in
+        d|D) print -r -- "days $n" ;;
+        y|Y) print -r -- "days $(( n * 365 ))" ;;
+        h|H) print -r -- "days $(( n / 24 ))" ;;
+        s|S) print -r -- "days $(( n / 86400 ))" ;;
+        G|g) print -r -- "gb $n" ;;
+        M|m) print -r -- "gb $(( n / 1024 ))" ;;
+        K|k|B|b|'') print -r -- "gb 0" ;;
+        *) return 1 ;;
+    esac
+}
+
+_audit_retention_check() {
+    local ac_path="$1"
+    local -a fw
+    fw=(--recommended 'expire-after >= 60d OR >= 5G' --cis 'CIS 8.1, 8.3' --nist 'AU-4, AU-11'
+        --mitre 'T1070 (Indicator Removal)' --iso27001 'A.8.15' --nis2 'Art.21(2)(f)'
+        --cis-macos 'CIS-macOS 3.4' --mscp 'audit_retention_configure')
+
+    if [[ ! -f "$ac_path" ]]; then
+        add_audit_result --category 'Audit, Logging & Telemetry' --control 'Security Auditing Retention' \
+            --status WARN --severity Medium --current 'audit_control not found (BSM auditing not configured)' "${fw[@]}" \
+            --recommendation 'Configure BSM auditing (/etc/security/audit_control) with expire-after:60d OR 5G, or document the alternative log pipeline.'
+        return 0
+    fi
+
+    local line value tok parsed ok=0
+    line=$(grep '^expire-after:' "$ac_path" | head -1)
+    value="${line#expire-after:}"
+    for tok in ${(s: :)${value//[^0-9A-Za-z ]/ }}; do
+        parsed=$(_expire_after_token "$tok") || continue
+        case "$parsed" in
+            days\ *) (( ${parsed#days } >= 60 )) && ok=1 ;;
+            gb\ *) (( ${parsed#gb } >= 5 )) && ok=1 ;;
+        esac
+    done
+
+    if [[ $ok -eq 1 ]]; then
+        add_audit_result --category 'Audit, Logging & Telemetry' --control 'Security Auditing Retention' \
+            --status PASS --severity Medium --current "expire-after:$value" "${fw[@]}" --recommendation 'No action required.'
+    else
+        add_audit_result --category 'Audit, Logging & Telemetry' --control 'Security Auditing Retention' \
+            --status FAIL --severity Medium --current "${line:-No expire-after line}" "${fw[@]}" \
+            --recommendation 'Set "expire-after:60d OR 5G" in /etc/security/audit_control, then "sudo audit -s".'
+    fi
+}
+
+check_audit_retention() {
+    _audit_retention_check /etc/security/audit_control
+}
+
+# "uid gid permissions" for one path; separate so tests can stub it
+# (scratch files can't be made root-owned without privileges).
+_file_owner_mode() {
+    stat -f '%u %g %Sp' "$1" 2>/dev/null
+}
+
+_audit_records_access_check() {
+    local ac_path="$1"
+    local -a fw
+    fw=(--recommended 'audit_control and audit trail files owned root:wheel, mode -r--r-----' --cis 'CIS 3.3'
+        --nist 'AU-9' --mitre 'T1070.002 (Clear Linux or Mac System Logs)' --iso27001 'A.8.15'
+        --nis2 'Art.21(2)(f)' --cis-macos 'CIS-macOS 3.5'
+        --mscp 'audit_control_owner_configure, audit_control_group_configure, audit_control_mode_configure, audit_files_owner_configure, audit_files_group_configure, audit_files_mode_configure')
+
+    if [[ ! -f "$ac_path" ]]; then
+        add_audit_result --category 'Audit, Logging & Telemetry' --control 'Access to Audit Records Controlled' \
+            --status WARN --severity Medium --current 'audit_control not found (BSM auditing not configured)' "${fw[@]}" \
+            --recommendation 'Configure BSM auditing before audit-record permissions can be assessed.'
+        return 0
+    fi
+
+    local audit_dir
+    audit_dir=$(grep '^dir:' "$ac_path" | head -1 | cut -d: -f2)
+    local -a targets bad
+    targets=("$ac_path")
+    [[ -n "$audit_dir" && -d "$audit_dir" ]] && targets+=("$audit_dir"/*(N))
+
+    local f info
+    for f in "${targets[@]}"; do
+        # "current" is a symlink to the active trail; CIS excludes it.
+        [[ "${f:t}" == current ]] && continue
+        info=$(_file_owner_mode "$f")
+        [[ "$info" == "0 0 -r--r-----" ]] || bad+=("$f ($info)")
+    done
+
+    if [[ ${#bad[@]} -eq 0 ]]; then
+        add_audit_result --category 'Audit, Logging & Telemetry' --control 'Access to Audit Records Controlled' \
+            --status PASS --severity Medium --current "${#targets[@]} audit file(s) correctly owned and read-only" "${fw[@]}" \
+            --recommendation 'No action required.'
+    else
+        add_audit_result --category 'Audit, Logging & Telemetry' --control 'Access to Audit Records Controlled' \
+            --status FAIL --severity Medium --current "${#bad[@]} audit file(s) with incorrect owner, group or mode" \
+            --details "${(F)bad}" "${fw[@]}" \
+            --recommendation "Fix ownership and mode: sudo chown -R root:wheel $ac_path ${audit_dir:-/var/audit} && sudo chmod 0440 $ac_path && sudo chmod -R o-rw,g-w ${audit_dir:-/var/audit}"
+    fi
+}
+
+check_audit_records_access() {
+    _audit_records_access_check /etc/security/audit_control
+}
+
 # ---- 22-software-update.zsh ----
 #
 # Domain 13: Software Update & Patch Compliance
@@ -2077,26 +2965,93 @@ check_recent_update_history() {
 }
 
 check_auto_update_configuration() {
-    local auto_check auto_download critical_install
-    auto_check=$(defaults_read_safe '/Library/Preferences/com.apple.SoftwareUpdate' 'AutomaticCheckEnabled' '0')
-    auto_download=$(defaults_read_safe '/Library/Preferences/com.apple.SoftwareUpdate' 'AutomaticDownload' '0')
-    critical_install=$(defaults_read_safe '/Library/Preferences/com.apple.SoftwareUpdate' 'CriticalUpdateInstall' '0')
+    # CIS 1.2 (automatic check + download). Read through NSUserDefaults so
+    # MDM-enforced values count; CriticalUpdateInstall is owned by
+    # check_security_responses_install_enabled (CIS 1.5) so the same key
+    # is never scored twice. Unset keys read as "0", matching the GUI
+    # default of these settings being off until chosen during setup.
+    local auto_check auto_download
+    auto_check=$(managed_pref_read com.apple.SoftwareUpdate AutomaticCheckEnabled) || auto_check=0
+    auto_download=$(managed_pref_read com.apple.SoftwareUpdate AutomaticDownload) || auto_download=0
 
-    local current="AutomaticCheckEnabled=$auto_check, AutomaticDownload=$auto_download, CriticalUpdateInstall=$critical_install"
+    local current="AutomaticCheckEnabled=$auto_check, AutomaticDownload=$auto_download"
 
-    if [[ "$auto_check" == "1" && "$auto_download" == "1" && "$critical_install" == "1" ]]; then
+    if [[ "$auto_check" == "1" && "$auto_download" == "1" ]]; then
         add_audit_result --category 'Software Update & Patch Compliance' --control 'Automatic Update Configuration' \
             --status PASS --severity Medium --current "$current" \
-            --recommended 'AutomaticCheckEnabled=1, AutomaticDownload=1, CriticalUpdateInstall=1' \
-            --cis 'CIS 7.3' --nist 'SI-2' --iso27001 'A.8.8' --nis2 'Art.21(2)(e)' --cis-macos 'CIS-macOS 1.1' --mscp 'os_softwareupdate_enforce' \
+            --recommended 'AutomaticCheckEnabled=1, AutomaticDownload=1' \
+            --cis 'CIS 7.3, 7.4' --nist 'SI-2' --iso27001 'A.8.8' --nis2 'Art.21(2)(e)' --cis-macos 'CIS-macOS 1.2' --mscp 'system_settings_download_software_update_enforce' \
             --recommendation 'No action required.'
     else
         add_audit_result --category 'Software Update & Patch Compliance' --control 'Automatic Update Configuration' \
             --status WARN --severity Medium --current "$current" \
-            --recommended 'AutomaticCheckEnabled=1, AutomaticDownload=1, CriticalUpdateInstall=1' \
-            --cis 'CIS 7.3' --nist 'SI-2' --iso27001 'A.8.8' --nis2 'Art.21(2)(e)' --cis-macos 'CIS-macOS 1.1' --mscp 'os_softwareupdate_enforce' \
-            --recommendation 'Enable all three in System Settings > General > Software Update > Automatic Updates.'
+            --recommended 'AutomaticCheckEnabled=1, AutomaticDownload=1' \
+            --cis 'CIS 7.3, 7.4' --nist 'SI-2' --iso27001 'A.8.8' --nis2 'Art.21(2)(e)' --cis-macos 'CIS-macOS 1.2' --mscp 'system_settings_download_software_update_enforce' \
+            --recommendation 'Enable "Check for updates" and "Download new updates when available" in System Settings > General > Software Update > Automatic Updates.'
     fi
+}
+
+check_macos_updates_auto_install() {
+    evaluate_managed_pref --category 'Software Update & Patch Compliance' --control 'Install macOS Updates Automatically' \
+        --severity Medium --suite com.apple.SoftwareUpdate --key AutomaticallyInstallMacOSUpdates --expect 1 \
+        --cis 'CIS 7.3, 7.4' --nist 'SI-2' --mitre 'T1210 (Exploitation of Remote Services)' --iso27001 'A.8.8' \
+        --nis2 'Art.21(2)(e)' --cis-macos 'CIS-macOS 1.3' --mscp 'system_settings_install_macos_updates_enforce' \
+        --recommendation 'Enable "Install macOS updates" in System Settings > General > Software Update > Automatic Updates, or enforce AutomaticallyInstallMacOSUpdates via profile. (CIS: if enabled during Setup Assistant, toggle it off and on to leave an auditable value.)'
+}
+
+check_app_store_updates_auto_install() {
+    local commerce su
+    commerce=$(managed_pref_read com.apple.commerce AutoUpdate)
+    su=$(managed_pref_read com.apple.SoftwareUpdate AutomaticallyInstallAppUpdates)
+    local current="com.apple.commerce AutoUpdate=${commerce:-not set}, AutomaticallyInstallAppUpdates=${su:-not set}"
+    local -a fw
+    fw=(--recommended 'AutoUpdate=1 or AutomaticallyInstallAppUpdates=1' --cis 'CIS 7.3, 7.4' --nist 'SI-2'
+        --iso27001 'A.8.8' --nis2 'Art.21(2)(e)' --cis-macos 'CIS-macOS 1.4' --mscp 'os_software_update_app_update_enforce')
+
+    if [[ "$commerce" == "1" || "$su" == "1" ]]; then
+        add_audit_result --category 'Software Update & Patch Compliance' --control 'Install App Store Updates Automatically' \
+            --status PASS --severity Low --current "$current" "${fw[@]}" --recommendation 'No action required.'
+    elif [[ "$commerce" == "0" || "$su" == "0" ]]; then
+        add_audit_result --category 'Software Update & Patch Compliance' --control 'Install App Store Updates Automatically' \
+            --status FAIL --severity Low --current "$current" "${fw[@]}" \
+            --recommendation 'Enable "Install application updates from the App Store" in System Settings > General > Software Update > Automatic Updates.'
+    else
+        add_audit_result --category 'Software Update & Patch Compliance' --control 'Install App Store Updates Automatically' \
+            --status WARN --severity Low --current "$current" "${fw[@]}" \
+            --recommendation 'Enable "Install application updates from the App Store", or enforce AutomaticallyInstallAppUpdates via profile.'
+    fi
+}
+
+check_security_responses_install_enabled() {
+    local config_data critical
+    config_data=$(managed_pref_read com.apple.SoftwareUpdate ConfigDataInstall)
+    critical=$(managed_pref_read com.apple.SoftwareUpdate CriticalUpdateInstall)
+    local current="ConfigDataInstall=${config_data:-not set}, CriticalUpdateInstall=${critical:-not set}"
+    local -a fw
+    fw=(--recommended 'ConfigDataInstall=1, CriticalUpdateInstall=1' --cis 'CIS 7.3, 7.4, 7.7' --nist 'SI-2, SI-3'
+        --mitre 'T1204.002 (Malicious File)' --iso27001 'A.8.8' --nis2 'Art.21(2)(e)'
+        --cis-macos 'CIS-macOS 1.5' --mscp 'system_settings_critical_update_install_enforce')
+
+    if [[ "$config_data" == "1" && "$critical" == "1" ]]; then
+        add_audit_result --category 'Software Update & Patch Compliance' --control 'Install Security Responses & System Files' \
+            --status PASS --severity High --current "$current" "${fw[@]}" --recommendation 'No action required.'
+    elif [[ "$config_data" == "0" || "$critical" == "0" ]]; then
+        add_audit_result --category 'Software Update & Patch Compliance' --control 'Install Security Responses & System Files' \
+            --status FAIL --severity High --current "$current" "${fw[@]}" \
+            --recommendation 'Enable "Install Security Responses and system files" in System Settings > General > Software Update > Automatic Updates — this delivers XProtect/MRT definitions and Background Security Improvements.'
+    else
+        add_audit_result --category 'Software Update & Patch Compliance' --control 'Install Security Responses & System Files' \
+            --status WARN --severity High --current "$current" "${fw[@]}" \
+            --recommendation 'Enable "Install Security Responses and system files" (or toggle it off and on so the setting is auditable), or enforce both keys via profile.'
+    fi
+}
+
+check_software_update_deferral() {
+    evaluate_managed_pref --category 'Software Update & Patch Compliance' --control 'Software Update Deferral <= 30 Days' \
+        --severity Medium --suite com.apple.applicationaccess --key enforcedSoftwareUpdateDelay --max 30 --unset-ok \
+        --cis 'CIS 7.3, 7.4' --nist 'SI-2' --iso27001 'A.8.8' --nis2 'Art.21(2)(e)' \
+        --cis-macos 'CIS-macOS 1.6' --mscp 'os_software_update_deferral' \
+        --recommendation 'Reduce the Restrictions-profile enforcedSoftwareUpdateDelay to 30 days or fewer.'
 }
 
 check_rapid_security_response_state() {
@@ -2153,73 +3108,301 @@ check_installed_profiles_inventory() {
 #
 # Domain 15: Persistence Mechanisms & Auto-Runs
 
-_persistence_scan_dir() {
-    local dir="$1" control_label="$2"
+typeset -g PERSIST_CATEGORY='Persistence Mechanisms & Auto-Runs'
+
+# Interpreters whose real launch target is the script they're handed,
+# not themselves: an Apple-signed /bin/bash says nothing about the
+# script it runs, so these targets are analyzed as scripts.
+typeset -ga SCRIPT_INTERPRETERS
+SCRIPT_INTERPRETERS=(sh bash zsh dash ksh csh tcsh python python2 python3 perl ruby osascript node php pwsh)
+
+# "user<TAB>home" for every local human account (UID >= 501, not a
+# _service account, home directory present). Separate so tests can stub it.
+_local_user_homes() {
+    local name="" uid="" home=""
+    dscl . -list /Users UniqueID 2>/dev/null | while read -r name uid; do
+        [[ "$uid" == <-> ]] && (( uid >= 501 )) || continue
+        [[ "$name" == _* ]] && continue
+        home=$(dscl . -read "/Users/$name" NFSHomeDirectory 2>/dev/null | awk '{print $2}')
+        [[ -n "$home" && -d "$home" ]] && print -r -- "$name"$'\t'"$home"
+    done
+}
+
+# Masks credential-looking values (token=..., Bearer ..., password: ...)
+# before a matched line is copied into the report.
+_redact_secrets() {
+    setopt localoptions extendedglob
+    local line="$1"
+    print -r -- "${line//(#ib)(token|secret|password|passwd|bearer|api[_-]#key)([\"' ]#[=: ][\"' ]#)[^\"' &|;]##/${match[1]}${match[2]}[REDACTED]}"
+}
+
+# Risk patterns for script content, matched against the lower-cased line.
+# STRONG: download-and-execute, reverse shells, code injection, keychain
+# or password theft (the AMOS / ClickFix playbook). WEAK: legitimate in
+# places, but worth a look when it runs automatically.
+typeset -ga SCRIPT_RISK_STRONG SCRIPT_RISK_WEAK
+SCRIPT_RISK_STRONG=(
+    '(curl|wget)[^|]*\|[[:space:]]*(sudo[[:space:]]+)?(ba|z|da|k)?sh([[:space:];]|$)'
+    '(curl|wget)[^|]*\|[[:space:]]*(sudo[[:space:]]+)?(python[0-9.]*|perl|ruby|osascript|node)([[:space:]]|$)'
+    'base64[[:space:]]+(-d|--decode)[^|]*\|[[:space:]]*(ba|z|da)?sh'
+    'eval[^#]*base64'
+    '/dev/tcp/'
+    '(^|[^a-z])nc[[:space:]][^|]*-e[[:space:]]'
+    'bash[[:space:]]+-i[[:space:]]*>&'
+    'osascript[^#]*hidden answer'
+    'dyld_insert_libraries'
+    'security[[:space:]]+(find-generic-password|find-internet-password|dump-keychain)'
+    'dscl[^#]*-authonly'
+    'python[0-9.]*[[:space:]]+-c[^#]*(base64|exec\(|socket)'
+)
+SCRIPT_RISK_WEAK=(
+    'osascript'
+    '(^|[[:space:];])nohup[[:space:]]'
+    '[^&]&[[:space:]]*(disown)?[[:space:]]*$'
+    'launchctl[[:space:]]+(load|bootstrap|submit|setenv)'
+    '(^|[^a-z0-9_])((/private)?/tmp/|(/private)?/var/tmp/|/users/shared/)'
+    'xattr[^#]*com\.apple\.quarantine'
+)
+
+# Prints "STRONG|<n>: <line>" or "WEAK|<n>: <line>" for each non-comment
+# line of the given text that matches a risk pattern.
+_script_risk_scan_text() {
+    local text="$1" line="" lower="" pat="" tier="" n=0
+    for line in "${(@f)text}"; do
+        n=$((n + 1))
+        [[ "$line" =~ '^[[:space:]]*#' || -z "${line//[[:space:]]/}" ]] && continue
+        lower="${(L)line}"
+        tier=""
+        for pat in "${SCRIPT_RISK_STRONG[@]}"; do
+            [[ "$lower" =~ $pat ]] && { tier=STRONG; break; }
+        done
+        if [[ -z "$tier" ]]; then
+            for pat in "${SCRIPT_RISK_WEAK[@]}"; do
+                [[ "$lower" =~ $pat ]] && { tier=WEAK; break; }
+            done
+        fi
+        [[ -n "$tier" ]] && print -r -- "$tier|$n: $(_redact_secrets "${${line##[[:space:]]#}[1,160]}")"
+    done
+}
+
+_script_risk_scan_file() {
+    [[ -f "$1" && -r "$1" ]] || return 0
+    _script_risk_scan_text "$(< "$1")"
+}
+
+# Prints why a path could be tampered with by someone other than root /
+# the expected owner (group/other-writable, or foreign owner); returns 1
+# when it is fine. Checked for the file and its parent directory, since a
+# writable directory lets anyone swap the file out.
+_tamper_reason() {
+    local f="$1" expected_owner="${2:-root}" target="" info="" owner="" mode=""
+    for target in "$f" "${f:h}"; do
+        info=$(stat -f '%Su %Lp' "$target" 2>/dev/null) || continue
+        owner="${info% *}"; mode="${info#* }"
+        if (( 8#$mode & 8#022 )); then
+            print -r -- "$target writable by group/other (mode $mode)"; return 0
+        fi
+        if [[ "$owner" != root && "$owner" != "$expected_owner" ]]; then
+            print -r -- "$target owned by $owner"; return 0
+        fi
+    done
+    return 1
+}
+
+# Location-based risk: STRONG for world-writable staging areas, WEAK for
+# hidden path components (common for dev tools, but also for stealers).
+_risky_path_tier() {
+    local path_="$1"
+    case "$path_" in
+        /tmp/*|/private/tmp/*|/var/tmp/*|/private/var/tmp/*|/Users/Shared/*) print STRONG ;;
+        */.*) print WEAK ;;
+        *) return 1 ;;
+    esac
+}
+
+# "team <ID>", "apple", "ad-hoc", "unsigned" or "signed".
+_code_signer() {
+    local out=""
+    out=$(codesign -dv "$1" 2>&1) || { print unsigned; return 0; }
+    if [[ "$out" == *"Signature=adhoc"* ]]; then
+        print ad-hoc
+    elif [[ "$out" =~ 'TeamIdentifier=([A-Z0-9]+)' ]]; then
+        print "team ${match[1]}"
+    elif [[ "$out" == *"Platform identifier="* || "$out" == *"Authority=Software Signing"* ]]; then
+        print apple
+    else
+        print signed
+    fi
+}
+
+# Resolves what a launchd item actually runs. Sets REPLY_KIND (binary,
+# script, inline), REPLY_PROGRAM, REPLY_SCRIPT (script path or inline
+# command text). Handles Program vs ProgramArguments, /usr/bin/env, and
+# interpreter flags (-c / -e mean the next argument is inline code).
+_launchd_resolve_target() {
+    local plist="$1" program="" arg="" base="" i=0 start=2
+    local -a args
+    program=$(plist_value_safe "$plist" Program '')
+    for i in {0..31}; do
+        arg=$(plist_value_safe "$plist" "ProgramArguments:$i") || break
+        args+=("$arg")
+    done
+    [[ -z "$program" && ${#args[@]} -gt 0 ]] && program="${args[1]}"
+    REPLY_PROGRAM="$program"; REPLY_KIND=binary; REPLY_SCRIPT=""
+
+    base="${program:t}"
+    if [[ "$base" == env && ${#args[@]} -ge 2 ]]; then
+        base="${args[2]:t}"; start=3
+    fi
+    (( ${SCRIPT_INTERPRETERS[(Ie)$base]} )) || return 0
+
+    for (( i = start; i <= ${#args[@]}; i++ )); do
+        arg="${args[$i]}"
+        if [[ "$arg" == -c || "$arg" == -e ]]; then
+            REPLY_KIND=inline; REPLY_SCRIPT="${args[$((i + 1))]:-}"; return 0
+        fi
+        [[ "$arg" == -* ]] && continue
+        REPLY_KIND=script; REPLY_SCRIPT="$arg"; return 0
+    done
+    REPLY_KIND=inline   # interpreter with no script: reads stdin/StandardInPath
+}
+
+# Per-scan accumulators, filled by _persistence_scan_collect and turned
+# into one finding by _persistence_scan_report.
+typeset -ga PERSIST_STRONG PERSIST_WEAK
+typeset -gi PERSIST_TOTAL=0
+
+_persistence_scan_reset() {
+    PERSIST_STRONG=() PERSIST_WEAK=() PERSIST_TOTAL=0
+}
+
+# Assesses every launchd plist in one directory. root_run=1 for
+# LaunchDaemons (anything able to modify the plist, program or script
+# then gets root code execution). expected_owner is the account allowed
+# to own the files (root for system dirs, the user for ~/Library).
+_persistence_scan_collect() {
+    local dir="$1" root_run="${2:-0}" expected_owner="${3:-root}"
     local -a plists
-    plists=(${dir}/*.plist(N))
-    local total=0 suspicious=0
-    local -a suspicious_items
-    local p
-
+    plists=("$dir"/*.plist(ND))
+    local p="" label="" item="" reason="" tier="" hit="" signer=""
+    local -a strong weak
     for p in "${plists[@]}"; do
-        # Named with ="" (not bare "local label program"): zsh's `local`/
-        # `typeset`, when re-run on a name that already has a value from
-        # a previous loop iteration, PRINTS "name=value" to stdout instead
-        # of just declaring it (confirmed live with `zsh -c`) — this
-        # corrupted this exact check's output in a real run on real
-        # multi-item LaunchAgent/LaunchDaemon data.
-        local label="" program=""
-        label=$(plist_value_safe "$p" 'Label' 'Unknown')
+        strong=() weak=()
+        label=$(plist_value_safe "$p" Label "${p:t:r}")
+        _launchd_resolve_target "$p"
+
+        # com.apple.* labels are skipped only when the target really is
+        # Apple-signed; a com.apple.* label on anything else is classic
+        # masquerading.
         if [[ "$label" == com.apple.* ]]; then
-            continue
+            if [[ "$REPLY_KIND" == binary && -e "$REPLY_PROGRAM" ]] && codesign -v -R='anchor apple' "$REPLY_PROGRAM" >/dev/null 2>&1; then
+                continue
+            fi
+            strong+=("com.apple.* label but target is not Apple-signed")
         fi
-        total=$((total + 1))
+        PERSIST_TOTAL=$((PERSIST_TOTAL + 1))
 
-        program=$(plist_value_safe "$p" 'Program' '')
-        if [[ -z "$program" ]]; then
-            program=$(plist_value_safe "$p" 'ProgramArguments:0' '')
-        fi
+        [[ "${p:t}" == .* ]] && strong+=("hidden plist file")
+        plist_value_safe "$p" 'EnvironmentVariables:DYLD_INSERT_LIBRARIES' >/dev/null \
+            && strong+=("injects DYLD_INSERT_LIBRARIES")
 
-        local flagged=0 reason=""
-        if [[ -n "$program" && ( "$program" == /tmp/* || "$program" == /private/tmp/* ) ]]; then
-            flagged=1
-            reason="target path under /tmp"
-        elif [[ -n "$program" ]]; then
-            run_root codesign -v "$program"
-            if [[ "$ROOT_CMD_STATUS" -ne 0 ]]; then
-                flagged=1
-                reason="target binary fails code signature verification"
+        if [[ -n "$REPLY_PROGRAM" && "$REPLY_PROGRAM" == /* ]]; then
+            if [[ ! -e "$REPLY_PROGRAM" ]]; then
+                weak+=("target missing (orphaned item)")
+            else
+                tier=$(_risky_path_tier "$REPLY_PROGRAM") && {
+                    [[ "$tier" == STRONG ]] && strong+=("target path under ${REPLY_PROGRAM:h}") || weak+=("target in hidden path")
+                }
+                if [[ "$REPLY_KIND" == binary ]]; then
+                    if ! codesign -v "$REPLY_PROGRAM" >/dev/null 2>&1; then
+                        strong+=("target binary fails code signature verification")
+                    elif [[ "$(_code_signer "$REPLY_PROGRAM")" == ad-hoc && "$REPLY_PROGRAM" != /opt/homebrew/* && "$REPLY_PROGRAM" != /usr/local/Cellar/* ]]; then
+                        weak+=("target is ad-hoc signed (no developer identity)")
+                    fi
+                    # A script run directly (shebang) still gets its content read.
+                    if [[ "$(head -c 2 "$REPLY_PROGRAM" 2>/dev/null)" == '#!' ]]; then
+                        REPLY_KIND=script; REPLY_SCRIPT="$REPLY_PROGRAM"
+                    fi
+                fi
             fi
         fi
 
-        if [[ $flagged -eq 1 ]]; then
-            suspicious=$((suspicious + 1))
-            suspicious_items+=("$label ($program): $reason")
+        if [[ "$REPLY_KIND" == script && -n "$REPLY_SCRIPT" ]]; then
+            if [[ "$REPLY_SCRIPT" == /* && ! -e "$REPLY_SCRIPT" ]]; then
+                weak+=("script $REPLY_SCRIPT missing")
+            else
+                tier=$(_risky_path_tier "$REPLY_SCRIPT") && {
+                    [[ "$tier" == STRONG ]] && strong+=("script under ${REPLY_SCRIPT:h}") || weak+=("script in hidden path $REPLY_SCRIPT")
+                }
+                for hit in "${(@f)$(_script_risk_scan_file "$REPLY_SCRIPT")}"; do
+                    [[ -z "$hit" ]] && continue
+                    [[ "$hit" == STRONG\|* ]] && strong+=("script ${hit#*|}") || weak+=("script ${hit#*|}")
+                done
+            fi
+        elif [[ "$REPLY_KIND" == inline && -n "$REPLY_SCRIPT" ]]; then
+            for hit in "${(@f)$(_script_risk_scan_text "$REPLY_SCRIPT")}"; do
+                [[ -z "$hit" ]] && continue
+                [[ "$hit" == STRONG\|* ]] && strong+=("inline command: ${hit#*|: }") || weak+=("inline command: ${hit#*|: }")
+            done
+        fi
+
+        if [[ "$root_run" -eq 1 ]]; then
+            for item in "$p" "$REPLY_PROGRAM" "$REPLY_SCRIPT"; do
+                [[ "$item" == /* && -e "$item" ]] || continue
+                # System binaries live on the sealed volume; skip them.
+                [[ "$item" == /System/* || "$item" == /bin/* || "$item" == /usr/bin/* || "$item" == /usr/sbin/* || "$item" == /sbin/* ]] && continue
+                reason=$(_tamper_reason "$item" root) && strong+=("root-run item modifiable: $reason")
+            done
+        elif [[ "$expected_owner" != root ]]; then
+            # Another account able to edit this user's agent can run code
+            # in that user's session.
+            reason=$(_tamper_reason "$p" "$expected_owner") && strong+=("agent plist modifiable by another account: $reason")
+        fi
+
+        item="$label (${REPLY_SCRIPT:-$REPLY_PROGRAM})"
+        if [[ ${#strong[@]} -gt 0 ]]; then
+            PERSIST_STRONG+=("$item: ${(j:; :)strong}${weak:+; ${(j:; :)weak}}")
+        elif [[ ${#weak[@]} -gt 0 ]]; then
+            PERSIST_WEAK+=("$item: ${(j:; :)weak}")
         fi
     done
+}
 
-    if [[ $suspicious -gt 0 ]]; then
-        local joined
-        joined=$(printf '%s | ' "${suspicious_items[@]}")
-        joined="${joined%' | '}"
-        add_audit_result --category 'Persistence Mechanisms & Auto-Runs' --control "$control_label" \
-            --status FAIL --severity High --current "$joined" \
-            --recommended 'Every persistent third-party launch item targets a code-signed binary outside /tmp' \
-            --cis 'CIS 2.5' --nist 'CM-7, SI-4' --mitre 'T1543.001 (Launch Daemon), T1547.011 (Plist Modification)' \
-            --iso27001 'A.8.19' --nis2 'Art.21(2)(d)' --cis-macos 'CIS-macOS 5.6' --mscp 'os_launch_items_review' \
-            --recommendation 'Investigate and remove the listed launch items unless independently verified as legitimate. An unsigned or /tmp-hosted persistent launch target is a strong persistence-malware indicator.'
+_persistence_scan_report() {
+    local control_label="$1"
+    local -a fw
+    fw=(--recommended 'Every third-party launch item runs a signed program or a reviewed script from a protected location'
+        --cis 'CIS 2.5, 2.7' --nist 'CM-7(5), SI-4, SI-7'
+        --mitre 'T1543.001 (Launch Agent), T1543.004 (Launch Daemon), T1647 (Plist File Modification)'
+        --iso27001 'A.8.19' --nis2 'Art.21(2)(d)' --cis-macos 'CIS-macOS 5.6' --mscp 'os_launch_items_review')
+
+    if [[ ${#PERSIST_STRONG[@]} -gt 0 ]]; then
+        add_audit_result --category "$PERSIST_CATEGORY" --control "$control_label" \
+            --status FAIL --severity High --current "${(j: | :)PERSIST_STRONG}" \
+            --details "${(F)PERSIST_STRONG}${PERSIST_WEAK:+$'\n'${(F)PERSIST_WEAK}}" "${fw[@]}" \
+            --recommendation 'Investigate and remove the listed launch items unless independently verified as legitimate. An unsigned, /tmp-hosted, masquerading or tamperable persistent launch target, or a script with download-and-execute / credential-theft patterns, is a strong persistence-malware indicator. Capture the plist and target for forensics before removing.'
+    elif [[ ${#PERSIST_WEAK[@]} -gt 0 ]]; then
+        add_audit_result --category "$PERSIST_CATEGORY" --control "$control_label" \
+            --status WARN --severity Medium --current "$PERSIST_TOTAL third-party launch item(s) scanned, ${#PERSIST_WEAK[@]} need review" \
+            --details "${(F)PERSIST_WEAK}" "${fw[@]}" \
+            --recommendation 'Review the listed items: orphaned registrations, ad-hoc-signed targets, hidden paths and scripts that background processes or call osascript/launchctl are common in both legitimate tools and malware.'
     else
-        add_audit_result --category 'Persistence Mechanisms & Auto-Runs' --control "$control_label" \
-            --status PASS --severity High --current "$total third-party launch item(s) scanned, none suspicious" \
-            --recommended 'Every persistent third-party launch item targets a code-signed binary outside /tmp' \
-            --cis 'CIS 2.5' --nist 'CM-7, SI-4' --cis-macos 'CIS-macOS 5.6' --mscp 'os_launch_items_review' \
-            --recommendation 'No action required.'
+        add_audit_result --category "$PERSIST_CATEGORY" --control "$control_label" \
+            --status PASS --severity High --current "$PERSIST_TOTAL third-party launch item(s) scanned, none suspicious" \
+            "${fw[@]}" --recommendation 'No action required.'
     fi
+}
+
+_persistence_scan_dir() {
+    local dir="$1" control_label="$2" root_run="${3:-0}"
+    _persistence_scan_reset
+    _persistence_scan_collect "$dir" "$root_run" root
+    _persistence_scan_report "$control_label"
 }
 
 check_system_launch_daemons_integrity() {
     write_section_banner 'Persistence Mechanisms & Auto-Runs - System LaunchDaemons'
-    _persistence_scan_dir '/Library/LaunchDaemons' 'System LaunchDaemon Integrity'
+    _persistence_scan_dir '/Library/LaunchDaemons' 'System LaunchDaemon Integrity' 1
 }
 
 check_system_launch_agents_integrity() {
@@ -2227,21 +3410,44 @@ check_system_launch_agents_integrity() {
 }
 
 check_user_launch_agents_integrity() {
-    if [[ -z "$CONSOLE_USER" ]]; then
-        add_audit_result --category 'Persistence Mechanisms & Auto-Runs' --control 'User LaunchAgent Integrity' \
-            --status WARN --severity Low --current 'No console user detected' \
-            --recommended 'Scan completes against the active console user' \
+    # Every local account, not just the console user: a stealer that
+    # infected another account persists there too.
+    local entry="" user="" home=""
+    local -a homes
+    homes=("${(@f)$(_local_user_homes)}")
+    homes=(${homes:#})
+    if [[ ${#homes[@]} -eq 0 ]]; then
+        add_audit_result --category "$PERSIST_CATEGORY" --control 'User LaunchAgent Integrity' \
+            --status WARN --severity Low --current 'No local user home directories found' \
+            --recommended 'Scan completes against every local user account' \
             --cis-macos 'CIS-macOS 5.6' --mscp 'os_launch_items_review' \
-            --recommendation 'Re-run interactively at a console login session to scan per-user LaunchAgents.'
+            --recommendation 'Unable to enumerate local accounts with dscl; verify ~/Library/LaunchAgents manually for each user.'
         return
     fi
-    local user_home
-    user_home=$(eval echo "~$CONSOLE_USER")
-    _persistence_scan_dir "$user_home/Library/LaunchAgents" 'User LaunchAgent Integrity'
+    _persistence_scan_reset
+    for entry in "${homes[@]}"; do
+        user="${entry%%$'\t'*}"; home="${entry#*$'\t'}"
+        _persistence_scan_collect "$home/Library/LaunchAgents" 0 "$user"
+    done
+    _persistence_scan_report 'User LaunchAgent Integrity'
+}
+
+# `sfltool dumpbtm` takes ~20s; three checks read it, so it is loaded
+# once per run. Prime with a direct call (not inside $(...)).
+typeset -g BTM_DUMP=""
+typeset -gi BTM_DUMP_STATUS=-1
+
+load_btm_dump() {
+    if [[ $BTM_DUMP_STATUS -lt 0 ]]; then
+        BTM_DUMP=$(sfltool dumpbtm 2>&1)
+        BTM_DUMP_STATUS=$?
+    fi
+    return $BTM_DUMP_STATUS
 }
 
 check_login_items_inventory() {
-    run_root sfltool dumpbtm
+    load_btm_dump
+    local ROOT_CMD_OUTPUT="$BTM_DUMP" ROOT_CMD_STATUS=$BTM_DUMP_STATUS
 
     if [[ "$ROOT_CMD_STATUS" -ne 0 ]]; then
         add_audit_result --category 'Persistence Mechanisms & Auto-Runs' --control 'Login Items & Background Task Inventory' \
@@ -2319,6 +3525,607 @@ check_login_logout_hooks() {
             --nis2 'Art.21(2)(d)' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'No action required.'
     fi
+}
+
+# ---- 24b-persistence-extended.zsh ----
+#
+# Domain 15 (continued): Persistence Mechanisms & Auto-Runs — shell
+# startup files, the wider persistence inventory, and a full autostart
+# app/script audit. Shares helpers with 24-persistence.zsh
+# (_local_user_homes, _script_risk_scan_*, _tamper_reason, _code_signer,
+# _launchd_resolve_target, load_btm_dump).
+#
+# Status convention for every check here: a STRONG indicator (download-
+# and-execute, credential theft, unsigned code, tamperable root-run item)
+# is FAIL/High; presence of a rarely-legitimate mechanism or a WEAK
+# indicator is WARN for review; nothing found is PASS.
+
+# Reports a three-tier persistence finding from strong/weak item lists.
+_persistence_tiered_result() {
+    # $5/$6 name the caller's strong/weak arrays. Copied into
+    # differently-named locals: declaring "local strong" here first would
+    # shadow the caller's array before (P) could dereference it.
+    local control="$1" pass_current="$2" warn_severity="$3" recommendation="$4"; shift 4
+    local -a hi lo fw
+    hi=("${(@P)1}"); lo=("${(@P)2}"); shift 2
+    fw=("$@")
+    hi=(${hi:#}); lo=(${lo:#})
+    if [[ ${#hi[@]} -gt 0 ]]; then
+        add_audit_result --category "$PERSIST_CATEGORY" --control "$control" \
+            --status FAIL --severity High --current "${#hi[@]} high-risk item(s)${lo:+, ${#lo[@]} to review}" \
+            --details "${(F)hi}${lo:+$'\n'${(F)lo}}" "${fw[@]}" --recommendation "$recommendation"
+    elif [[ ${#lo[@]} -gt 0 ]]; then
+        add_audit_result --category "$PERSIST_CATEGORY" --control "$control" \
+            --status WARN --severity "$warn_severity" --current "${#lo[@]} item(s) to review" \
+            --details "${(F)lo}" "${fw[@]}" --recommendation "$recommendation"
+    else
+        add_audit_result --category "$PERSIST_CATEGORY" --control "$control" \
+            --status PASS --severity High --current "$pass_current" "${fw[@]}" --recommendation 'No action required.'
+    fi
+}
+
+# Splits _script_risk_scan_* output for one source into the caller's
+# `strong` / `weak` arrays, prefixed with a location label.
+_collect_risk_hits() {
+    local label="$1" hits="$2" hit=""
+    for hit in "${(@f)hits}"; do
+        [[ -z "$hit" ]] && continue
+        if [[ "$hit" == STRONG\|* ]]; then strong+=("$label:${hit#*|}"); else weak+=("$label:${hit#*|}"); fi
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Shell startup files (MITRE T1546.004). BlueNoroff used ~/.zshenv; the
+# XCSSET variant makes ~/.zshrc source a hidden ~/.zshrc_aliases — so
+# literal paths the startup files `source` are followed one level deep.
+# ---------------------------------------------------------------------------
+
+typeset -ga SHELL_STARTUP_USER_FILES SHELL_STARTUP_SYSTEM_FILES
+SHELL_STARTUP_USER_FILES=(.zshenv .zprofile .zshrc .zlogin .zlogout .bash_profile .bash_login .bashrc .bash_logout .profile)
+SHELL_STARTUP_SYSTEM_FILES=(zshenv zprofile zshrc zlogin zlogout profile bashrc)
+
+# Resolves a `source`/`.` argument to an absolute path, or returns 1 when
+# it depends on anything other than ~ / $HOME (not statically knowable).
+_resolve_sourced_path() {
+    local arg="$1" home="$2"
+    arg="${${arg#[\"\']}%[\"\']}"
+    if [[ -n "$home" ]]; then
+        arg="${arg/#\~/$home}"; arg="${arg//\$\{HOME\}/$home}"; arg="${arg//\$HOME/$home}"
+    fi
+    [[ "$arg" == /* && "$arg" != *'$'* ]] || return 1
+    print -r -- "$arg"
+}
+
+# Prints "owner<TAB>path" for every existing startup file: system files in
+# etc_root, each local user's dotfiles (plus their ZDOTDIR's, if set), and
+# any file those source by literal path.
+_shell_startup_files() {
+    local etc_root="$1" entry="" user="" home="" f="" d="" zdotdir="" line="" src=""
+    local -a found dirs
+    local -A seen home_of
+    for f in "${SHELL_STARTUP_SYSTEM_FILES[@]}"; do
+        [[ -f "$etc_root/$f" ]] && found+=("root"$'\t'"$etc_root/$f")
+    done
+    for entry in "${(@f)$(_local_user_homes)}"; do
+        [[ -z "$entry" ]] && continue
+        user="${entry%%$'\t'*}"; home="${entry#*$'\t'}"
+        home_of[$user]="$home"
+        dirs=("$home")
+        zdotdir=$(grep -hE '^[[:space:]]*(export[[:space:]]+)?ZDOTDIR=' "$etc_root/zshenv" "$home/.zshenv" 2>/dev/null | tail -1)
+        zdotdir="${${zdotdir#*ZDOTDIR=}%%[[:space:];]*}"
+        zdotdir=$(_resolve_sourced_path "$zdotdir" "$home") && [[ -d "$zdotdir" && "$zdotdir" != "$home" ]] && dirs+=("$zdotdir")
+        for d in "${dirs[@]}"; do
+            for f in "${SHELL_STARTUP_USER_FILES[@]}"; do
+                [[ -f "$d/$f" ]] && found+=("$user"$'\t'"$d/$f")
+            done
+        done
+    done
+
+    local -a with_sourced
+    local owner="" file="" owner_home=""
+    for entry in "${found[@]}"; do
+        owner="${entry%%$'\t'*}"; file="${entry#*$'\t'}"
+        [[ -n "${seen[$file]:-}" ]] && continue
+        seen[$file]=1; with_sourced+=("$entry")
+        owner_home="${home_of[$owner]:-}"
+        # `source X` / `. X` anywhere on a line, including the XCSSET form
+        # `[ -f ~/.zshrc_aliases ] && source ~/.zshrc_aliases`.
+        for line in "${(@f)$(grep -v '^[[:space:]]*#' "$file" 2>/dev/null \
+                | grep -oE '(^|[;&|[:space:]])(source|\.)[[:space:]]+[^[:space:];&|]+')}"; do
+            [[ -z "$line" ]] && continue
+            src="${line##*[[:space:]]}"
+            src=$(_resolve_sourced_path "$src" "$owner_home") || continue
+            [[ -f "$src" && -z "${seen[$src]:-}" ]] || continue
+            seen[$src]=1; with_sourced+=("$owner"$'\t'"$src")
+        done
+    done
+    print -rl -- "${with_sourced[@]}"
+}
+
+_shell_startup_content_check() {
+    setopt localoptions extendedglob
+    local etc_root="$1" entry="" file="" accounts=0
+    local -a files strong weak
+    files=("${(@f)$(_shell_startup_files "$etc_root")}"); files=(${files:#})
+    for entry in "${files[@]}"; do
+        file="${entry#*$'\t'}"
+        _collect_risk_hits "$file" "$(_script_risk_scan_file "$file")"
+    done
+    [[ -f "$etc_root/zshenv" ]] && weak+=("$etc_root/zshenv: non-default system-wide file, read by every zsh including root scripts")
+    accounts=${#${(u)${files[@]%%$'\t'*}}}
+
+    _persistence_tiered_result 'Shell Startup File Content' \
+        "${#files[@]} startup file(s) scanned across $accounts account(s), no suspicious commands" Medium \
+        'Review each listed line. Download-and-execute, base64-decoded execution, reverse shells, keychain or password access and DYLD injection in a shell startup file run on every new terminal and are a known persistence technique (BlueNoroff ~/.zshenv, XCSSET .zshrc). Capture the file for forensics, then remove the line.' \
+        strong weak \
+        --recommended 'Shell startup files contain no download-and-execute, injection or credential-access commands' \
+        --cis 'CIS 2.7' --nist 'SI-4, SI-7, CM-7(5)' --mitre 'T1546.004 (Unix Shell Configuration Modification)' \
+        --iso27001 'A.8.7' --nis2 'Art.21(2)(d)' --cis-macos 'N/A' --mscp 'N/A'
+}
+
+check_shell_startup_file_content() {
+    write_section_banner 'Persistence Mechanisms & Auto-Runs - Shell Startup Files & Extended Inventory'
+    _shell_startup_content_check /private/etc
+}
+
+_shell_startup_permissions_check() {
+    local etc_root="$1" entry="" owner="" file="" reason=""
+    local -a files strong weak
+    files=("${(@f)$(_shell_startup_files "$etc_root")}"); files=(${files:#})
+    for entry in "${files[@]}"; do
+        owner="${entry%%$'\t'*}"; file="${entry#*$'\t'}"
+        reason=$(_tamper_reason "$file" "$owner") && strong+=("$file: $reason")
+    done
+    _persistence_tiered_result 'Shell Startup File Permissions' \
+        "${#files[@]} startup file(s) writable only by their owner" Medium \
+        'Restrict each listed file (and its directory) to its owner: "chmod go-w <file>"; system files under /etc must be owned by root. Anyone able to edit a startup file runs code as that user (or as root, for /etc files) on the next shell.' \
+        strong weak \
+        --recommended 'Startup files owned by their account (root for /etc) and not group/other-writable' \
+        --cis 'CIS 3.3' --nist 'AC-3, CM-5' --mitre 'T1546.004 (Unix Shell Configuration Modification)' \
+        --iso27001 'A.8.3' --nis2 'Art.21(2)(i)' --cis-macos 'N/A' --mscp 'N/A'
+}
+
+check_shell_startup_file_permissions() {
+    _shell_startup_permissions_check /private/etc
+}
+
+# ---------------------------------------------------------------------------
+# Wider persistence inventory
+# ---------------------------------------------------------------------------
+
+# Code bundles loaded into a privileged host process (SecurityAgent /
+# opendirectoryd). A stock Mac has none in /Library; any entry runs in the
+# login path, so unsigned is FAIL and signed third-party is WARN for review.
+_plugin_bundle_dir_check() {
+    local dir="$1" control="$2" mitre="$3" purpose="$4" e="" signer=""
+    local -a entries strong weak
+    entries=("$dir"/*(ND))
+    for e in "${entries[@]}"; do
+        signer=$(_code_signer "$e")
+        if [[ "$signer" == unsigned ]] || ! codesign -v "$e" >/dev/null 2>&1; then
+            strong+=("${e:t}: fails code signature verification ($signer)")
+        else
+            weak+=("${e:t}: $signer")
+        fi
+    done
+    _persistence_tiered_result "$control" "No third-party plugins in $dir" Medium \
+        "Confirm each listed plugin belongs to a sanctioned product ($purpose). Unknown plugins in this location run inside the login/authentication path and can capture credentials; remove them and restore the default authorization rights." \
+        strong weak \
+        --recommended "No unexpected plugins in $dir" --cis 'CIS 2.5' --nist 'IA-2, SI-7, CM-7(5)' \
+        --mitre "$mitre" --iso27001 'A.8.5' --nis2 'Art.21(2)(i)' --cis-macos 'N/A' --mscp 'N/A'
+}
+
+check_authorization_plugins() {
+    _plugin_bundle_dir_check /Library/Security/SecurityAgentPlugins 'Authorization Plugins' \
+        'T1556 (Modify Authentication Process)' 'typically Platform SSO, Jamf Connect, NoMAD or smart-card middleware'
+}
+
+check_directory_services_plugins() {
+    _plugin_bundle_dir_check /Library/DirectoryServices/PlugIns 'Directory Services Plugins' \
+        'T1556 (Modify Authentication Process)' 'typically a legacy directory-binding product'
+}
+
+_privileged_helper_tools_check() {
+    local helpers_dir="$1" daemons_dir="$2" h="" signer="" reason=""
+    local -a helpers strong weak inventory daemon_plists
+    helpers=("$helpers_dir"/*(ND))
+    daemon_plists=("$daemons_dir"/*.plist(ND))
+    for h in "${helpers[@]}"; do
+        signer=$(_code_signer "$h")
+        inventory+=("${h:t}: $signer")
+        if ! codesign -v "$h" >/dev/null 2>&1; then
+            strong+=("${h:t}: fails code signature verification ($signer)")
+        fi
+        reason=$(_tamper_reason "$h" root) && strong+=("${h:t}: runs as root but $reason")
+        if [[ ${#daemon_plists[@]} -eq 0 ]] || ! grep -qF -- "$h" "${daemon_plists[@]}" 2>/dev/null; then
+            weak+=("${h:t}: orphaned (no LaunchDaemon references it; leftover from an uninstalled app)")
+        fi
+    done
+    if [[ ${#strong[@]} -eq 0 && ${#weak[@]} -eq 0 ]]; then
+        add_audit_result --category "$PERSIST_CATEGORY" --control 'Privileged Helper Tools' \
+            --status PASS --severity High --current "${#helpers[@]} privileged helper(s), all signed and in use" \
+            --details "${(F)inventory}" --recommended 'Every privileged helper signed, root-owned and referenced by a LaunchDaemon' \
+            --cis 'CIS 2.5' --nist 'AC-6, SI-7' --mitre 'T1543.004 (Launch Daemon)' --iso27001 'A.8.19' \
+            --nis2 'Art.21(2)(d)' --cis-macos 'N/A' --mscp 'N/A' --recommendation 'No action required.'
+        return 0
+    fi
+    _persistence_tiered_result 'Privileged Helper Tools' '' Low \
+        'Privileged helpers run as root on behalf of apps. Remove unsigned or tamperable helpers immediately; remove orphaned ones (and any matching LaunchDaemon plist) left behind by uninstalled apps.' \
+        strong weak \
+        --recommended 'Every privileged helper signed, root-owned and referenced by a LaunchDaemon' \
+        --cis 'CIS 2.5' --nist 'AC-6, SI-7' --mitre 'T1543.004 (Launch Daemon)' --iso27001 'A.8.19' \
+        --nis2 'Art.21(2)(d)' --cis-macos 'N/A' --mscp 'N/A'
+}
+
+check_privileged_helper_tools() {
+    _privileged_helper_tools_check /Library/PrivilegedHelperTools /Library/LaunchDaemons
+}
+
+# Cron is still honored by macOS (cron daemon starts on demand) and at(1)
+# jobs run if atrun is enabled; neither is used by a stock install.
+_cron_at_jobs_check() {
+    local tabs_dir="$1" system_crontab="$2" at_dir="$3" t="" line="" job="" hits=""
+    local -a strong weak
+    if [[ -d "$tabs_dir" && ! -r "$tabs_dir" ]]; then
+        add_audit_result --category "$PERSIST_CATEGORY" --control 'Cron & at Jobs' \
+            --status WARN --severity Low --current "Cannot read $tabs_dir (run as root)" \
+            --recommended 'No unexpected cron or at jobs' --cis-macos 'N/A' --mscp 'N/A' \
+            --recommendation 'Re-run with sudo, or check with "sudo crontab -l -u <user>" for each account.'
+        return 0
+    fi
+    for t in "$tabs_dir"/*(N.) "$system_crontab"(N.); do
+        for line in "${(@f)$(< "$t")}"; do
+            [[ "$line" =~ '^[[:space:]]*(#|$)' || "$line" =~ '^[A-Za-z_]+=' ]] && continue
+            hits=$(_script_risk_scan_text "$line")
+            if [[ -n "$hits" ]]; then
+                _collect_risk_hits "${t:t}" "$hits"
+            else
+                weak+=("${t:t}: $(_redact_secrets "${line[1,160]}")")
+            fi
+        done
+    done
+    for job in "$at_dir"/*(N.); do
+        [[ "${job:t}" == .* ]] && continue
+        weak+=("at job ${job:t}")
+        _collect_risk_hits "at job ${job:t}" "$(_script_risk_scan_file "$job")"
+    done
+    _persistence_tiered_result 'Cron & at Jobs' 'No cron or at jobs scheduled' Medium \
+        'Confirm each scheduled job is expected; "crontab -r -u <user>" removes a user'"'"'s table. Stock macOS schedules nothing via cron/at — launchd is the supported scheduler — so these are frequently overlooked persistence.' \
+        strong weak \
+        --recommended 'No unexpected cron or at jobs' --cis 'CIS 2.7' --nist 'CM-7, SI-4' \
+        --mitre 'T1053.003 (Cron), T1053.002 (At)' --iso27001 'A.8.19' --nis2 'Art.21(2)(d)' --cis-macos 'N/A' --mscp 'N/A'
+}
+
+check_cron_and_at_jobs() {
+    _cron_at_jobs_check /usr/lib/cron/tabs /etc/crontab /usr/lib/cron/jobs
+}
+
+# Periodic scripts shipped by macOS (when /etc/periodic exists at all — it
+# is absent on Tahoe, verified live).
+typeset -ga STOCK_PERIODIC_SCRIPTS
+STOCK_PERIODIC_SCRIPTS=(110.clean-tmps 130.clean-msgs 140.clean-rwho 199.rotate-fax 310.accounting 400.status-disks
+    420.status-network 430.status-rwho 999.local 310.locate 320.whatis 200.accounting)
+
+_legacy_boot_scripts_check() {
+    local etc_root="$1" startup_dir="$2" emond_clients_dir="$3" f="" period=""
+    local -a candidates strong weak
+    for period in daily weekly monthly; do
+        for f in "$etc_root/periodic/$period"/*(N.); do
+            (( ${STOCK_PERIODIC_SCRIPTS[(Ie)${f:t}]} )) || candidates+=("$f")
+        done
+        [[ -f "$etc_root/$period.local" ]] && candidates+=("$etc_root/$period.local")
+    done
+    for f in "$etc_root/periodic.conf" "$etc_root/rc.local" "$etc_root/launchd.conf"; do
+        [[ -f "$f" ]] && candidates+=("$f")
+    done
+    candidates+=("$startup_dir"/*(ND))
+    for f in "$etc_root/emond.d/rules"/*(N.); do
+        [[ "${f:t}" == SampleRules.plist ]] || candidates+=("$f")
+    done
+    candidates+=("$emond_clients_dir"/*(ND))
+
+    for f in "${candidates[@]}"; do
+        weak+=("$f (modified $(stat -f '%Sm' -t '%Y-%m-%d' "$f" 2>/dev/null))")
+        [[ -f "$f" ]] && _collect_risk_hits "$f" "$(_script_risk_scan_file "$f")"
+    done
+    _persistence_tiered_result 'Legacy Boot, Periodic & emond Scripts' \
+        'No rc.local, StartupItems, non-stock periodic scripts or emond rules present' Medium \
+        'These legacy mechanisms (rc.local, launchd.conf, StartupItems, periodic, emond) are unused on modern macOS, so any entry deserves scrutiny. Remove items you cannot attribute to a known product.' \
+        strong weak \
+        --recommended 'No legacy boot-time or periodic scripts beyond the macOS defaults' --cis 'CIS 2.7' \
+        --nist 'CM-7, SI-4' --mitre 'T1037.004 (RC Scripts), T1037.005 (Startup Items), T1546.014 (Emond)' \
+        --iso27001 'A.8.19' --nis2 'Art.21(2)(d)' --cis-macos 'N/A' --mscp 'N/A'
+}
+
+check_legacy_boot_and_periodic_scripts() {
+    _legacy_boot_scripts_check /private/etc /Library/StartupItems /private/var/db/emondClients
+}
+
+# sshd runs ~/.ssh/rc (or /etc/ssh/sshrc) on every SSH login — rarely used
+# legitimately, and invisible to Login Items / BTM.
+_ssh_login_scripts_check() {
+    local etc_ssh_dir="$1" root_home="$2" entry="" home="" f=""
+    local -a files strong weak
+    [[ -f "$etc_ssh_dir/sshrc" ]] && files+=("$etc_ssh_dir/sshrc")
+    [[ -f "$root_home/.ssh/rc" ]] && files+=("$root_home/.ssh/rc")
+    for entry in "${(@f)$(_local_user_homes)}"; do
+        [[ -z "$entry" ]] && continue
+        home="${entry#*$'\t'}"
+        [[ -f "$home/.ssh/rc" ]] && files+=("$home/.ssh/rc")
+    done
+    for f in "${files[@]}"; do
+        weak+=("$f: runs on every SSH login")
+        _collect_risk_hits "$f" "$(_script_risk_scan_file "$f")"
+    done
+    _persistence_tiered_result 'SSH Login Scripts (sshrc)' 'No ~/.ssh/rc or /etc/ssh/sshrc present' Medium \
+        'Review and remove unexpected SSH login scripts; they execute for every SSH session and do not appear in Login Items.' \
+        strong weak \
+        --recommended 'No SSH login scripts' --cis 'CIS 2.7' --nist 'CM-7, AC-17' \
+        --mitre 'T1546 (Event Triggered Execution)' --iso27001 'A.8.19' --nis2 'Art.21(2)(d)' --cis-macos 'N/A' --mscp 'N/A'
+}
+
+check_ssh_login_scripts() {
+    _ssh_login_scripts_check /private/etc/ssh /var/root
+}
+
+_ssh_authorized_keys_check() {
+    local root_home="$1" entry="" user="" home="" f="" n=0
+    local -a keys root_keys
+    for entry in "root"$'\t'"$root_home" "${(@f)$(_local_user_homes)}"; do
+        [[ -z "$entry" ]] && continue
+        user="${entry%%$'\t'*}"; home="${entry#*$'\t'}"
+        for f in "$home/.ssh/authorized_keys" "$home/.ssh/authorized_keys2"; do
+            [[ -f "$f" ]] || continue
+            n=$(grep -cvE '^[[:space:]]*(#|$)' "$f" 2>/dev/null)
+            (( n > 0 )) || continue
+            # Key comments (usually user@host) identify keys without
+            # copying key material into the report.
+            keys+=("$user: $n key(s) in ${f:t} — $(grep -vE '^[[:space:]]*(#|$)' "$f" | awk '{print $NF}' | head -5 | paste -sd ', ' -)")
+            [[ "$user" == root ]] && root_keys+=("$f")
+        done
+    done
+    local -a fw
+    fw=(--recommended 'Only expected public keys authorized; none for root' --cis 'CIS 5.4, 6.3' --nist 'AC-2, IA-2'
+        --mitre 'T1098.004 (SSH Authorized Keys)' --iso27001 'A.5.18' --nis2 'Art.21(2)(i)' --cis-macos 'N/A' --mscp 'N/A')
+    if [[ ${#root_keys[@]} -gt 0 ]]; then
+        add_audit_result --category "$PERSIST_CATEGORY" --control 'SSH Authorized Keys Inventory' \
+            --status WARN --severity Medium --current 'root account accepts SSH public-key logins' \
+            --details "${(F)keys}" "${fw[@]}" \
+            --recommendation 'Remove root'"'"'s authorized_keys unless a documented automation needs it, and verify every other listed key belongs to its account owner. An added key is silent, password-less persistence.'
+    elif [[ ${#keys[@]} -gt 0 ]]; then
+        add_audit_result --category "$PERSIST_CATEGORY" --control 'SSH Authorized Keys Inventory' \
+            --status INFO --severity Informational --current "${#keys[@]} account(s) authorize SSH public keys" \
+            --details "${(F)keys}" "${fw[@]}" \
+            --recommendation 'Verify every listed key belongs to its account owner; remove stale keys.'
+    else
+        add_audit_result --category "$PERSIST_CATEGORY" --control 'SSH Authorized Keys Inventory' \
+            --status PASS --severity Medium --current 'No authorized_keys entries' "${fw[@]}" --recommendation 'No action required.'
+    fi
+}
+
+check_ssh_authorized_keys_inventory() {
+    _ssh_authorized_keys_check /var/root
+}
+
+# Python executes "import ..." lines in any .pth file in site-packages at
+# every interpreter start, plus sitecustomize/usercustomize modules
+# (MITRE T1546.018). Many packages ship benign import-.pth files, so only
+# code-execution patterns are escalated.
+typeset -ga PYTHON_PTH_RISK
+PYTHON_PTH_RISK=('base64' 'exec\(' 'eval\(' 'urllib' 'socket' 'subprocess' 'os\.system' 'os\.popen' 'compile\(' 'marshal')
+
+_python_site_dirs() {
+    local entry="" home=""
+    local -a dirs
+    dirs=(/Library/Python/*/site-packages(N/) /Library/Frameworks/Python.framework/Versions/*/lib/python*/site-packages(N/)
+          /opt/homebrew/lib/python*/site-packages(N/) /usr/local/lib/python*/site-packages(N/))
+    for entry in "${(@f)$(_local_user_homes)}"; do
+        [[ -z "$entry" ]] && continue
+        home="${entry#*$'\t'}"
+        dirs+=("$home"/Library/Python/*/lib/python/site-packages(N/) "$home"/.local/lib/python*/site-packages(N/))
+    done
+    print -rl -- "${dirs[@]}"
+}
+
+_python_startup_hooks_check() {
+    local d="" f="" line="" pat="" import_pth=0
+    local -a dirs strong weak
+    dirs=("${(@f)$(_python_site_dirs)}"); dirs=(${dirs:#})
+    for d in "${dirs[@]}"; do
+        for f in "$d"/(sitecustomize|usercustomize).py(N.); do
+            weak+=("$f: runs at every Python start")
+            _collect_risk_hits "$f" "$(_script_risk_scan_file "$f")"
+        done
+        for f in "$d"/*.pth(N.); do
+            for line in "${(@f)$(grep -E '^[[:space:]]*import[[:space:]]' "$f" 2>/dev/null)}"; do
+                [[ -z "$line" ]] && continue
+                import_pth=$((import_pth + 1))
+                for pat in "${PYTHON_PTH_RISK[@]}"; do
+                    if [[ "$line" =~ $pat ]]; then
+                        strong+=("$f: $(_redact_secrets "${line[1,160]}")"); break
+                    fi
+                done
+            done
+        done
+    done
+    _persistence_tiered_result 'Python Startup Hooks' \
+        "${#dirs[@]} site-packages dir(s) scanned; $import_pth .pth import line(s), none executing code" Medium \
+        'Inspect each listed file. A .pth import line that decodes, downloads or spawns processes runs on every Python start; remove the file (and the package that dropped it) if it is not expected.' \
+        strong weak \
+        --recommended 'No code-executing .pth files or unexpected sitecustomize/usercustomize modules' --cis 'CIS 2.7' \
+        --nist 'SI-7, CM-7(5)' --mitre 'T1546.018 (Python Startup Hooks)' --iso27001 'A.8.19' \
+        --nis2 'Art.21(2)(d)' --cis-macos 'N/A' --mscp 'N/A'
+}
+
+check_python_startup_hooks() {
+    _python_startup_hooks_check
+}
+
+# ---------------------------------------------------------------------------
+# Autostart apps & scripts audit
+# ---------------------------------------------------------------------------
+
+# One "uid|type|disposition|name|path|team" line per top-level BTM item.
+# Legacy items are the /Library/Launch* plists (already assessed by the
+# launchd checks) and are emitted too; callers filter by type.
+# SMAppService agents/daemons record "Executable Path" relative to their
+# parent app (e.g. "Contents/MacOS/Helper", verified live), so a second
+# pass resolves it through "Parent Identifier" -> the parent's URL.
+_btm_records() {
+    local line="" uid="" key="" value="" i=0 path_="" parent=""
+    local -a r_uid r_type r_disp r_name r_path r_team r_parent
+    local -A rec app_path
+    _btm_store() {
+        [[ -n "${rec[Type]:-}" ]] || return 0
+        local url_path=""
+        # URL is a plain path on Tahoe (absolute for apps, relative to the
+        # parent for embedded items); older releases used file:// URLs.
+        url_path="${rec[URL]:-}"
+        [[ "$url_path" == '(null)' ]] && url_path=""
+        if [[ "$url_path" == file://* ]]; then
+            url_path="${url_path#file://}"; url_path=$(printf '%b' "${url_path//\%/\\x}")
+        fi
+        url_path="${url_path%/}"
+        [[ "$url_path" == /* && -n "${rec[Identifier]:-}" ]] && app_path[${rec[Identifier]}]="$url_path"
+        r_uid+=("$uid"); r_type+=("${rec[Type]% \(*}"); r_disp+=("${rec[Disposition]:-}")
+        r_name+=("${rec[Name]:-}"); r_team+=("${rec[Team Identifier]:-}")
+        r_path+=("${rec[Executable Path]:-$url_path}"); r_parent+=("${rec[Parent Identifier]:-}")
+    }
+    for line in "${(@f)BTM_DUMP}"; do
+        if [[ "$line" =~ '^ Records for UID (-?[0-9]+)' ]]; then
+            _btm_store; rec=(); uid="${match[1]}"
+        elif [[ "$line" =~ '^ #[0-9]+:$' ]]; then
+            _btm_store; rec=()
+        elif [[ "$line" =~ '^ {1,20}([A-Z][A-Za-z. ]+): (.*)$' ]]; then
+            key="${match[1]}"; value="${match[2]}"
+            [[ -z "${rec[$key]:-}" ]] && rec[$key]="$value"
+        fi
+    done
+    _btm_store
+    unfunction _btm_store
+
+    for (( i = 1; i <= ${#r_type[@]}; i++ )); do
+        path_="${r_path[$i]}"; parent="${r_parent[$i]}"
+        if [[ -n "$path_" && "$path_" != /* ]]; then
+            if [[ -n "${app_path[$parent]:-}" ]]; then
+                path_="${app_path[$parent]}/$path_"
+            else
+                path_="?/$path_"    # parent app not recorded: unresolvable, never "missing"
+            fi
+        fi
+        print -r -- "${r_uid[$i]}|${r_type[$i]}|${r_disp[$i]}|${r_name[$i]}|$path_|${r_team[$i]}"
+    done
+}
+
+# Enabled and allowed: "[enabled, disallowed, ...]" is an item the user
+# switched off in Login Items & Extensions.
+_btm_active() {
+    [[ "$1" == 'login item' || "$1" == agent || "$1" == daemon ]] && [[ "$2" == *'[enabled, allowed'* ]]
+}
+
+check_btm_item_integrity() {
+    local rec="" uid="" type="" disposition="" name="" target="" team="" tier=""
+    local -a strong weak
+    if ! load_btm_dump; then
+        add_audit_result --category "$PERSIST_CATEGORY" --control 'Login Item & Background Task Integrity' \
+            --status WARN --severity Low --current "sfltool query failed: $BTM_DUMP" \
+            --recommended 'Every enabled login item and background task is signed and present' --cis-macos 'N/A' --mscp 'N/A' \
+            --recommendation 'Unable to read Background Task Management records; verify with "sudo sfltool dumpbtm".'
+        return 0
+    fi
+    for rec in "${(@f)$(_btm_records)}"; do
+        IFS='|' read -r uid type disposition name target team <<< "$rec"
+        _btm_active "$type" "$disposition" || continue
+        local -a reasons_s=() reasons_w=()
+        [[ -z "$team" ]] && reasons_w+=("no Team ID (unsigned or ad-hoc)")
+        if [[ "$target" == '?/'* ]]; then
+            :   # relative to an unrecorded parent app; cannot be located
+        elif [[ -n "$target" && ! -e "$target" ]]; then
+            reasons_w+=("target missing (orphaned registration)")
+        elif [[ -n "$target" ]]; then
+            tier=$(_risky_path_tier "$target") && {
+                [[ "$tier" == STRONG ]] && reasons_s+=("runs from ${target:h}") || reasons_w+=("runs from a hidden path")
+            }
+            codesign -v "$target" >/dev/null 2>&1 || reasons_s+=("fails code signature verification")
+        fi
+        if [[ ${#reasons_s[@]} -gt 0 ]]; then
+            strong+=("$name [$type, uid $uid] ($target): ${(j:; :)reasons_s}${reasons_w:+; ${(j:; :)reasons_w}}")
+        elif [[ ${#reasons_w[@]} -gt 0 ]]; then
+            weak+=("$name [$type, uid $uid] ($target): ${(j:; :)reasons_w}")
+        fi
+    done
+    _persistence_tiered_result 'Login Item & Background Task Integrity' \
+        'Every enabled login item and SMAppService agent/daemon is signed and present' Medium \
+        'Disable unknown items in System Settings > General > Login Items & Extensions and remove the owning app. Unsigned or /tmp- and /Users/Shared-hosted background items are a common infostealer persistence pattern.' \
+        strong weak \
+        --recommended 'Every enabled login item and background task signed, present and outside staging directories' \
+        --cis 'CIS 2.5' --nist 'CM-7(5), SI-7' --mitre 'T1547.015 (Login Items)' --iso27001 'A.8.19' \
+        --nis2 'Art.21(2)(d)' --cis-macos 'CIS-macOS 5.6' --mscp 'N/A'
+}
+
+# Full cross-source inventory of what starts automatically, classified as
+# program (signed binary/app) or script, with its signer. Recomputed
+# rather than shared with the integrity checks so it stands alone.
+check_autostart_inventory() {
+    local dir="" scope="" p="" label="" entry="" user="" home="" rec="" uid="" type="" disposition="" name="" target="" team="" t="" line=""
+    local -a lines scopes
+    local programs=0 scripts=0
+    scopes=("/Library/LaunchDaemons|LaunchDaemon" "/Library/LaunchAgents|LaunchAgent (all users)")
+    for entry in "${(@f)$(_local_user_homes)}"; do
+        [[ -z "$entry" ]] && continue
+        user="${entry%%$'\t'*}"; home="${entry#*$'\t'}"
+        scopes+=("$home/Library/LaunchAgents|LaunchAgent ($user)")
+    done
+    for entry in "${scopes[@]}"; do
+        dir="${entry%%|*}"; scope="${entry#*|}"
+        for p in "$dir"/*.plist(ND); do
+            label=$(plist_value_safe "$p" Label "${p:t:r}")
+            _launchd_resolve_target "$p"
+            if [[ "$label" == com.apple.* && "$REPLY_KIND" == binary ]] && codesign -v -R='anchor apple' "$REPLY_PROGRAM" >/dev/null 2>&1; then
+                continue
+            fi
+            case "$REPLY_KIND" in
+                binary)
+                    lines+=("[$scope] $label -> $REPLY_PROGRAM (program, $( [[ -e "$REPLY_PROGRAM" ]] && _code_signer "$REPLY_PROGRAM" || print missing))")
+                    programs=$((programs + 1)) ;;
+                script)
+                    lines+=("[$scope] $label -> ${REPLY_PROGRAM:t} $REPLY_SCRIPT (script)"); scripts=$((scripts + 1)) ;;
+                inline)
+                    lines+=("[$scope] $label -> ${REPLY_PROGRAM:t} inline command: $(_redact_secrets "${REPLY_SCRIPT[1,100]}")"); scripts=$((scripts + 1)) ;;
+            esac
+        done
+    done
+
+    if load_btm_dump; then
+        for rec in "${(@f)$(_btm_records)}"; do
+            IFS='|' read -r uid type disposition name target team <<< "$rec"
+            _btm_active "$type" "$disposition" || continue
+            lines+=("[${(C)type}, uid $uid] $name -> ${target:-?} (program, $( [[ -n "$team" ]] && print -r -- "team $team" || print -r -- 'no Team ID'))")
+            programs=$((programs + 1))
+        done
+    fi
+
+    if [[ -d /usr/lib/cron/tabs && -r /usr/lib/cron/tabs ]]; then
+        for t in /usr/lib/cron/tabs/*(N.); do
+            for line in "${(@f)$(grep -vE '^[[:space:]]*(#|$)|^[A-Za-z_]+=' "$t" 2>/dev/null)}"; do
+                [[ -z "$line" ]] && continue
+                lines+=("[cron, ${t:t}] $(_redact_secrets "${line[1,120]}") (script)"); scripts=$((scripts + 1))
+            done
+        done
+    fi
+
+    for entry in "${(@f)$(_shell_startup_files /private/etc)}"; do
+        [[ -z "$entry" ]] && continue
+        lines+=("[Shell startup, ${entry%%$'\t'*}] ${entry#*$'\t'} (script, runs with every new shell)")
+        scripts=$((scripts + 1))
+    done
+
+    add_audit_result --category "$PERSIST_CATEGORY" --control 'Autostart Inventory (Apps & Scripts)' \
+        --status INFO --severity Informational \
+        --current "$(( programs + scripts )) autostart item(s): $programs program(s), $scripts script(s)" \
+        --details "${(F)${(@o)lines}}" \
+        --recommended 'N/A' --cis 'CIS 2.1, 2.7' --nist 'CM-8' --iso27001 'A.5.9' --cis-macos 'CIS-macOS 5.6' --mscp 'N/A' \
+        --recommendation 'Informational baseline of everything that starts automatically (launchd, login items, background tasks, cron, shell startup). Compare against a known-good machine; integrity problems are reported by the dedicated persistence checks.'
 }
 
 # ---- 25-priv-esc-fs.zsh ----
@@ -2474,6 +4281,104 @@ _suid_sgid_scan() {
 
 check_suid_sgid_binary_audit() {
     _suid_sgid_scan /usr /bin /sbin /Applications
+}
+
+# --- CIS Apple macOS 26 Tahoe v1.0.0 section 5.1 (5.1.1, 5.1.5-5.1.7) ---
+# Each takes its root path as a parameter so tests can point it at a
+# scratch tree. Full-depth scans match the CIS audit commands exactly;
+# measured live at ~1s each, within the performance-bounded-scans budget.
+
+_world_writable_dirs_result() {
+    local control="$1" severity="$2" cis_macos="$3" mscp_id="$4" recommendation="$5" scanned="$6"; shift 6
+    local -a found
+    found=("$@")
+    local -a fw
+    fw=(--recommended "No world-writable directories under $scanned" --cis 'CIS 3.3' --nist 'AC-3, AC-6'
+        --mitre 'T1574 (Hijack Execution Flow)' --iso27001 'A.8.3' --nis2 'Art.21(2)(i)'
+        --cis-macos "CIS-macOS $cis_macos" --mscp "$mscp_id")
+    if [[ ${#found[@]} -eq 0 ]]; then
+        add_audit_result --category 'Privilege Escalation - File & Directory Permissions' --control "$control" \
+            --status PASS --severity "$severity" --current "No world-writable directories under $scanned" "${fw[@]}" \
+            --recommendation 'No action required.'
+    else
+        add_audit_result --category 'Privilege Escalation - File & Directory Permissions' --control "$control" \
+            --status FAIL --severity "$severity" --current "${#found[@]} world-writable director(ies) under $scanned" \
+            --details "${(F)found}" "${fw[@]}" --recommendation "$recommendation"
+    fi
+}
+
+_home_folders_secure_check() {
+    local users_root="$1"
+    local -a insecure
+    insecure=(${(f)"$(find "$users_root" -mindepth 1 -maxdepth 1 -type d ! -perm 700 ! -perm 710 ! -perm 711 2>/dev/null \
+        | grep -v '/Shared$' | grep -v '/Guest$')"})
+    local -a fw
+    fw=(--recommended 'Every home folder mode 700 (710/711 tolerated)' --cis 'CIS 3.3' --nist 'AC-3, AC-6'
+        --mitre 'T1005 (Data from Local System)' --iso27001 'A.8.3' --nis2 'Art.21(2)(i)'
+        --cis-macos 'CIS-macOS 5.1.1' --mscp 'os_home_folders_secure')
+
+    if [[ ${#insecure[@]} -eq 0 ]]; then
+        add_audit_result --category 'Privilege Escalation - File & Directory Permissions' --control 'Home Folders Secure' \
+            --status PASS --severity Medium --current 'All home folders restrict other users' "${fw[@]}" \
+            --recommendation 'No action required.'
+    else
+        local -a described
+        local d
+        for d in "${insecure[@]}"; do
+            described+=("$d ($(stat -f '%Sp' "$d" 2>/dev/null))")
+        done
+        add_audit_result --category 'Privilege Escalation - File & Directory Permissions' --control 'Home Folders Secure' \
+            --status FAIL --severity Medium --current "${#insecure[@]} home folder(s) readable by other users" \
+            --details "${(F)described}" "${fw[@]}" \
+            --recommendation 'Restrict each listed home folder: "sudo chmod -R og-rwx /Users/<username>" (use og-rw to keep traverse access if a service requires it).'
+    fi
+}
+
+check_home_folders_secure() {
+    _home_folders_secure_check /System/Volumes/Data/Users
+}
+
+_world_writable_applications_check() {
+    local apps_root="$1"
+    local -a found
+    found=(${(f)"$(find "$apps_root" -iname '*.app' -type d -perm -2 2>/dev/null | grep -v 'Xcode.app')"})
+    _world_writable_dirs_result 'System-Wide Applications Not World-Writable' High 5.1.5 \
+        os_system_wide_applications_configure \
+        'Remove world-write from each listed app bundle: "sudo chmod -R o-w /Applications/<name>.app" — any local user could otherwise replace its code.' \
+        "$apps_root" "${found[@]}"
+}
+
+check_world_writable_applications() {
+    _world_writable_applications_check /System/Volumes/Data/Applications
+}
+
+_world_writable_system_folder_check() {
+    local system_root="$1"
+    local -a found
+    found=(${(f)"$(find "$system_root" -type d -perm -2 2>/dev/null | grep -vE 'downloadDir|locks')"})
+    _world_writable_dirs_result 'No World-Writable Folders in /System' High 5.1.6 \
+        os_world_writable_system_folder_configure \
+        'Remove world-write from each listed folder: "sudo chmod -R o-w <folder>".' \
+        "$system_root" "${found[@]}"
+}
+
+check_world_writable_system_folder() {
+    _world_writable_system_folder_check /System/Volumes/Data/System
+}
+
+_world_writable_library_folder_check() {
+    local library_root="$1"
+    # Sticky-bit dirs (! -perm -1000) and SIP-protected ones are excluded, per CIS.
+    local -a found
+    found=(${(f)"$(find "$library_root" -type d -perm -002 ! -perm -1000 ! -xattrname com.apple.rootless 2>/dev/null)"})
+    _world_writable_dirs_result 'No World-Writable Folders in /Library' Medium 5.1.7 \
+        os_world_writable_library_folder_configure \
+        'Remove world-write from each listed folder: "sudo chmod -R o-w <folder>" (some third-party installers create these deliberately; confirm with the vendor first).' \
+        "$library_root" "${found[@]}"
+}
+
+check_world_writable_library_folder() {
+    _world_writable_library_folder_check /Library
 }
 
 # ---- 26-dylib-hijack.zsh ----
@@ -2893,6 +4798,117 @@ check_login_window_hardening() {
     fi
 }
 
+# --- CIS Apple macOS 26 Tahoe v1.0.0 sections 2.7.1, 2.11.1, 2.11.3, 2.11.5, 5.8 ---
+
+check_screen_saver_corners_secure() {
+    # Hot-corner action 6 = "Disable Screen Saver". CIS audits the
+    # profile payload; the console user's own Dock prefs are checked
+    # too, since a user-set corner defeats the lock just the same.
+    local corner value
+    local -a offending
+    if load_config_profile_dump; then
+        for corner in tl tr bl br; do
+            value=$(config_profile_value "wvous-$corner-corner") && [[ "$value" == "6" ]] \
+                && offending+=("wvous-$corner-corner = 6 (configuration profile)")
+        done
+    fi
+    for corner in tl tr bl br; do
+        value=$(defaults_read_as_user_safe com.apple.dock "wvous-$corner-corner" '')
+        [[ "$value" == "6" ]] && offending+=("wvous-$corner-corner = 6 (${CONSOLE_USER:-console user} Dock prefs)")
+    done
+
+    local -a fw
+    fw=(--recommended 'No hot corner set to Disable Screen Saver (action 6)' --cis 'CIS 4.3' --nist 'AC-11'
+        --mitre 'T1200 (Hardware Additions)' --iso27001 'A.8.1' --nis2 'Art.21(2)(i)'
+        --cis-macos 'CIS-macOS 2.7.1' --mscp 'system_settings_hot_corners_secure')
+    if [[ ${#offending[@]} -eq 0 ]]; then
+        add_audit_result --category 'Screen Lock & Physical Access' --control 'Screen Saver Hot Corners Secure' \
+            --status PASS --severity Low --current 'No hot corner disables the screen saver' "${fw[@]}" \
+            --recommendation 'No action required.'
+    else
+        add_audit_result --category 'Screen Lock & Physical Access' --control 'Screen Saver Hot Corners Secure' \
+            --status FAIL --severity Low --current "${#offending[@]} hot corner(s) disable the screen saver" \
+            --details "${(F)offending}" "${fw[@]}" \
+            --recommendation 'Change the listed corner(s) in System Settings > Desktop & Dock > Hot Corners to any action other than "Disable Screen Saver".'
+    fi
+}
+
+check_screensaver_idle_time() {
+    evaluate_managed_pref --category 'Screen Lock & Physical Access' --control 'Screen Saver Inactivity <= 15 Minutes' \
+        --severity Medium --suite com.apple.screensaver --key idleTime --min 1 --max 900 \
+        --cis 'CIS 4.3' --nist 'AC-11' --mitre 'T1200 (Hardware Additions)' --iso27001 'A.8.1' --nis2 'Art.21(2)(i)' \
+        --cis-macos 'CIS-macOS 2.11.1' --mscp 'system_settings_screensaver_timeout_enforce' \
+        --recommendation 'Enforce a screen saver idle time of 900 seconds or less (and not 0 = never) via a Screensaver profile payload.'
+}
+
+check_login_window_custom_message() {
+    local text rc
+    text=$(managed_pref_read com.apple.loginwindow LoginwindowText)
+    rc=$?
+    local -a fw
+    fw=(--recommended 'LoginwindowText set to the organization'"'"'s message' --cis 'CIS 4.1' --nist 'AC-8'
+        --iso27001 'A.5.10' --nis2 'Art.21(2)(g)' --cis-macos 'CIS-macOS 2.11.3'
+        --mscp 'system_settings_loginwindow_loginwindowtext_enable')
+    if [[ $rc -eq 0 ]]; then
+        add_audit_result --category 'Screen Lock & Physical Access' --control 'Login Window Custom Message' \
+            --status PASS --severity Low --current "LoginwindowText: $text" "${fw[@]}" --recommendation 'No action required.'
+    elif [[ $rc -eq 1 ]]; then
+        add_audit_result --category 'Screen Lock & Physical Access' --control 'Login Window Custom Message' \
+            --status WARN --severity Low --current 'No login window message configured' "${fw[@]}" \
+            --recommendation 'Set a login window message: System Settings > Lock Screen > "Show message when locked", or "sudo defaults write /Library/Preferences/com.apple.loginwindow LoginwindowText '"'"'<text>'"'"'".'
+    else
+        add_audit_result --category 'Screen Lock & Physical Access' --control 'Login Window Custom Message' \
+            --status WARN --severity Low --current 'Preference query failed' "${fw[@]}" \
+            --recommendation 'Verify manually in System Settings > Lock Screen.'
+    fi
+}
+
+check_login_window_password_hints_disabled() {
+    evaluate_managed_pref --category 'Screen Lock & Physical Access' --control 'Show Password Hints Disabled' \
+        --severity Medium --suite com.apple.loginwindow --key RetriesUntilHint --expect 0 \
+        --cis 'CIS 4.1' --nist 'IA-6' --mitre 'T1110 (Brute Force)' --iso27001 'A.5.17' --nis2 'Art.21(2)(i)' \
+        --cis-macos 'CIS-macOS 2.11.5' --mscp 'system_settings_password_hints_disable' \
+        --recommendation 'Set RetriesUntilHint to 0: "sudo defaults write /Library/Preferences/com.apple.loginwindow RetriesUntilHint -int 0" (on Tahoe, 0 is the only value that hides the hint icon).'
+}
+
+_policy_banner_check() {
+    local security_dir="$1"
+    local -a banners
+    banners=("$security_dir"/PolicyBanner.(txt|rtf|rtfd)(N))
+    local -a fw
+    fw=(--recommended 'PolicyBanner.txt/.rtf/.rtfd present and world-readable' --cis 'CIS 4.1' --nist 'AC-8'
+        --iso27001 'A.5.10' --nis2 'Art.21(2)(g)' --cis-macos 'CIS-macOS 5.8' --mscp 'os_policy_banner_loginwindow_enforce')
+
+    if [[ ${#banners[@]} -eq 0 ]]; then
+        add_audit_result --category 'Screen Lock & Physical Access' --control 'Login Window Policy Banner' \
+            --status FAIL --severity Low --current "No PolicyBanner file in $security_dir" "${fw[@]}" \
+            --recommendation "Create $security_dir/PolicyBanner.txt (or .rtf) with the organization's acceptable-use notice, mode 644."
+        return 0
+    fi
+
+    local f mode
+    local -a unreadable
+    for f in "${banners[@]}"; do
+        mode=$(stat -f '%A' "$f" 2>/dev/null)
+        # Last octal digit = "other" permissions; the login window can't
+        # display a banner that isn't world-readable.
+        (( ${mode: -1} & 4 )) || unreadable+=("$f ($mode)")
+    done
+    if [[ ${#unreadable[@]} -eq 0 ]]; then
+        add_audit_result --category 'Screen Lock & Physical Access' --control 'Login Window Policy Banner' \
+            --status PASS --severity Low --current "${banners[*]:t}" "${fw[@]}" --recommendation 'No action required.'
+    else
+        add_audit_result --category 'Screen Lock & Physical Access' --control 'Login Window Policy Banner' \
+            --status FAIL --severity Low --current 'Policy banner exists but is not world-readable, so it will not display' \
+            --details "${(F)unreadable}" "${fw[@]}" \
+            --recommendation 'Make the banner readable: "sudo chmod o+r /Library/Security/PolicyBanner.*".'
+    fi
+}
+
+check_login_window_policy_banner() {
+    _policy_banner_check /Library/Security
+}
+
 # ---- 29-removable-media.zsh ----
 #
 # Domain 20: Removable Media & Peripheral Control
@@ -3160,6 +5176,16 @@ check_icloud_drive_sync_indicator() {
     _icloud_drive_present "$(eval echo ~$CONSOLE_USER)"
 }
 
+# --- CIS Apple macOS 26 Tahoe v1.0.0 section 2.1.1.3 ---
+
+check_icloud_desktop_documents_sync_disabled() {
+    evaluate_managed_pref --category 'iCloud & Cloud Sync Surface' --control 'iCloud Desktop & Documents Sync Disabled' \
+        --severity Low --suite com.apple.applicationaccess --key allowCloudDesktopAndDocuments --expect 0 \
+        --cis 'CIS 4.1, 4.8, 15.3' --nist 'AC-20, SC-7' --mitre 'T1567.002 (Exfiltration to Cloud Storage)' \
+        --iso27001 'A.5.14' --nis2 'Art.21(2)(d)' --cis-macos 'CIS-macOS 2.1.1.3' --mscp 'N/A' \
+        --recommendation 'Deploy a Restrictions profile with allowCloudDesktopAndDocuments=false so Desktop and Documents are not synced to a personal iCloud account.'
+}
+
 # ---- 32-browser-hardening.zsh ----
 #
 # Domain 23: Browser & Application Hardening
@@ -3226,6 +5252,51 @@ check_safari_fraudulent_site_warning() {
     fi
 }
 
+# --- CIS Apple macOS 26 Tahoe v1.0.0 sections 6.3.4, 6.3.6, 6.3.7, 6.3.10, 6.4.1 ---
+# CIS audits these Safari settings only via an installed configuration
+# profile (system_profiler SPConfigurationProfileDataType).
+
+check_safari_cross_site_tracking_prevention() {
+    evaluate_profile_payload --category 'Browser & Application Hardening' --control 'Safari Prevent Cross-Site Tracking' \
+        --severity Low --pair 'BlockStoragePolicy=2' --pair 'WebKitPreferences.storageBlockingPolicy=1' \
+        --pair 'WebKitStorageBlockingPolicy=1' \
+        --cis 'CIS 9.1' --nist 'SC-7, SI-12' --iso27001 'A.8.23' --nis2 'Art.21(2)(d)' \
+        --cis-macos 'CIS-macOS 6.3.4' --mscp 'os_safari_prevent_cross-site_tracking_enable' \
+        --recommendation 'Deploy a com.apple.Safari profile payload with BlockStoragePolicy=2, WebKitPreferences.storageBlockingPolicy=1 and WebKitStorageBlockingPolicy=1.'
+}
+
+check_safari_advertising_privacy_protection() {
+    evaluate_profile_payload --category 'Browser & Application Hardening' --control 'Safari Advertising Privacy Protection' \
+        --severity Low --pair 'WebKitPreferences.privateClickMeasurementEnabled=1' \
+        --cis 'CIS 9.1' --nist 'SI-12' --iso27001 'A.8.23' --nis2 'Art.21(2)(d)' \
+        --cis-macos 'CIS-macOS 6.3.6' --mscp 'os_safari_advertising_privacy_protection_enable' \
+        --recommendation 'Deploy a com.apple.Safari profile payload with WebKitPreferences.privateClickMeasurementEnabled=true.'
+}
+
+check_safari_show_full_website_address() {
+    evaluate_profile_payload --category 'Browser & Application Hardening' --control 'Safari Show Full Website Address' \
+        --severity Low --pair 'ShowFullURLInSmartSearchField=1' \
+        --cis 'CIS 9.1' --nist 'SI-3' --mitre 'T1566.002 (Spearphishing Link)' --iso27001 'A.8.23' --nis2 'Art.21(2)(d)' \
+        --cis-macos 'CIS-macOS 6.3.7' --mscp 'os_safari_show_full_website_address_enable' \
+        --recommendation 'Deploy a com.apple.Safari profile payload with ShowFullURLInSmartSearchField=true so users see the real domain they are on.'
+}
+
+check_safari_show_status_bar() {
+    evaluate_profile_payload --category 'Browser & Application Hardening' --control 'Safari Show Status Bar' \
+        --severity Low --pair 'ShowOverlayStatusBar=1' \
+        --cis 'CIS 9.1' --nist 'SI-3' --mitre 'T1566.002 (Spearphishing Link)' --iso27001 'A.8.23' --nis2 'Art.21(2)(d)' \
+        --cis-macos 'CIS-macOS 6.3.10' --mscp 'os_safari_show_status_bar_enabled' \
+        --recommendation 'Deploy a com.apple.Safari profile payload with ShowOverlayStatusBar=true so link targets are visible on hover.'
+}
+
+check_terminal_secure_keyboard_entry() {
+    evaluate_managed_pref --category 'Browser & Application Hardening' --control 'Terminal Secure Keyboard Entry' \
+        --severity Medium --suite com.apple.Terminal --key SecureKeyboardEntry --expect 1 \
+        --cis 'CIS 4.8' --nist 'SC-3' --mitre 'T1056.001 (Keylogging)' --iso27001 'A.8.7' --nis2 'Art.21(2)(d)' \
+        --cis-macos 'CIS-macOS 6.4.1' --mscp 'os_terminal_secure_keyboard_enable' \
+        --recommendation 'Enforce Terminal Secure Keyboard Entry (com.apple.Terminal SecureKeyboardEntry=true) via profile so other processes cannot read keystrokes typed into Terminal, including sudo passwords.'
+}
+
 # ---- 33-ransomware-resilience.zsh ----
 #
 # Domain 24: Ransomware Resilience & Recovery
@@ -3285,14 +5356,55 @@ check_time_machine_configured_and_recent() {
     fi
 }
 
-check_time_machine_encryption_note() {
-    # No reliable CLI signal for destination encryption state; always
-    # INFO, per honesty-over-false-precision.
-    add_audit_result --category 'Ransomware Resilience & Recovery' --control 'Time Machine Encryption Note' \
-        --status INFO --severity Informational \
-        --current 'Time Machine backup encryption cannot be verified from the command line and must be confirmed in System Settings > General > Time Machine > destination > "Encrypted" indicator' \
-        --recommended 'N/A' --cis-macos 'CIS-macOS 1.5' --mscp 'N/A' \
-        --recommendation 'Informational only.'
+# CIS 2.3.4.2. Replaces the former always-INFO "encryption note": CIS
+# documents a CLI signal — each destination's LastKnownEncryptionState in
+# /Library/Preferences/com.apple.TimeMachine.plist — so this now reports
+# a real result. Parameterized on the plist path for tests.
+_time_machine_encryption_check() {
+    local tm_plist="$1"
+    local -a fw
+    fw=(--recommended 'Every Time Machine destination Encrypted' --cis 'CIS 3.6, 3.11, 11.3' --nist 'SC-28, CP-9(8)'
+        --mitre 'T1005 (Data from Local System)' --iso27001 'A.8.24' --nis2 'Art.21(2)(h)'
+        --cis-macos 'CIS-macOS 2.3.4.2' --mscp 'system_settings_time_machine_encrypted_configure')
+
+    run_root defaults read "$tm_plist" Destinations
+    if [[ $ROOT_CMD_STATUS -ne 0 || "$ROOT_CMD_OUTPUT" != *DestinationID* ]]; then
+        add_audit_result --category 'Ransomware Resilience & Recovery' --control 'Time Machine Backup Encryption' \
+            --status INFO --severity Informational --current 'No Time Machine destination configured' "${fw[@]}" \
+            --recommendation 'Not applicable until a Time Machine destination is configured; see "Time Machine Configured & Recent".'
+        return 0
+    fi
+
+    local total encrypted not_encrypted
+    total=$(print -r -- "$ROOT_CMD_OUTPUT" | grep -c 'DestinationID')
+    not_encrypted=$(print -r -- "$ROOT_CMD_OUTPUT" | grep -c 'LastKnownEncryptionState = NotEncrypted')
+    encrypted=$(print -r -- "$ROOT_CMD_OUTPUT" | grep -c 'LastKnownEncryptionState = Encrypted')
+
+    if (( not_encrypted > 0 )); then
+        add_audit_result --category 'Ransomware Resilience & Recovery' --control 'Time Machine Backup Encryption' \
+            --status FAIL --severity High --current "$not_encrypted of $total destination(s) NotEncrypted" "${fw[@]}" \
+            --recommendation 'Re-add each unencrypted destination with "Encrypt Backups" selected (System Settings > General > Time Machine); an unencrypted backup disk holds a readable copy of the whole FileVault-protected volume.'
+    elif (( encrypted == total )); then
+        add_audit_result --category 'Ransomware Resilience & Recovery' --control 'Time Machine Backup Encryption' \
+            --status PASS --severity High --current "All $total destination(s) Encrypted" "${fw[@]}" \
+            --recommendation 'No action required.'
+    else
+        add_audit_result --category 'Ransomware Resilience & Recovery' --control 'Time Machine Backup Encryption' \
+            --status WARN --severity Medium --current "Encryption state unknown for $(( total - encrypted )) of $total destination(s)" "${fw[@]}" \
+            --recommendation 'Confirm each destination shows "Encrypted" in System Settings > General > Time Machine (state is recorded after the first backup).'
+    fi
+}
+
+check_time_machine_encryption() {
+    _time_machine_encryption_check /Library/Preferences/com.apple.TimeMachine.plist
+}
+
+check_time_machine_auto_backup() {
+    evaluate_managed_pref --category 'Ransomware Resilience & Recovery' --control 'Time Machine Automatic Backup' \
+        --severity Low --suite com.apple.TimeMachine --key AutoBackup --expect 1 --unset-ok \
+        --cis 'CIS 11.2' --nist 'CP-9' --mitre 'T1490 (Inhibit System Recovery)' --iso27001 'A.8.13' \
+        --nis2 'Art.21(2)(c)' --cis-macos 'CIS-macOS 2.3.4.1' --mscp 'system_settings_time_machine_auto_backup_enable' \
+        --recommendation 'Set Time Machine to back up automatically (System Settings > General > Time Machine > Options > Back up frequency), or enforce AutoBackup=true via profile.'
 }
 
 check_local_apfs_snapshots() {
@@ -3515,6 +5627,75 @@ check_nonapple_running_launchd_services() {
         --status INFO --severity Informational --current "$count non-Apple running service(s)" --details "$joined" \
         --recommended 'N/A' --cis-macos 'CIS-macOS 5.7' --mscp 'N/A' \
         --recommendation 'Informational only.'
+}
+
+# --- CIS Apple macOS 26 Tahoe v1.0.0 sections 4.1-4.3 ---
+
+check_bonjour_advertising_disabled() {
+    evaluate_managed_pref --category 'System Services & Daemon Exposure' --control 'Bonjour Advertising Disabled' \
+        --severity Low --suite com.apple.mDNSResponder --key NoMulticastAdvertisements --expect 1 \
+        --cis 'CIS 4.1, 4.8' --nist 'CM-7' --mitre 'T1046 (Network Service Discovery)' --iso27001 'A.8.20' \
+        --nis2 'Art.21(2)(d)' --cis-macos 'CIS-macOS 4.1' --mscp 'os_bonjour_disable' \
+        --recommendation 'Disable Bonjour service advertising: "sudo defaults write /Library/Preferences/com.apple.mDNSResponder.plist NoMulticastAdvertisements -bool true", or via profile.'
+}
+
+check_http_server_disabled() {
+    run_root launchctl list
+    local -a fw
+    fw=(--recommended 'org.apache.httpd not loaded' --cis 'CIS 4.1, 4.8' --nist 'CM-7'
+        --mitre 'T1190 (Exploit Public-Facing Application)' --iso27001 'A.8.20' --nis2 'Art.21(2)(d)'
+        --cis-macos 'CIS-macOS 4.2' --mscp 'os_httpd_disable')
+    if [[ $ROOT_CMD_STATUS -ne 0 ]]; then
+        add_audit_result --category 'System Services & Daemon Exposure' --control 'Built-in HTTP Server Disabled' \
+            --status WARN --severity Low --current "launchctl query failed: $ROOT_CMD_OUTPUT" "${fw[@]}" \
+            --recommendation 'Verify manually with "sudo launchctl list | grep org.apache.httpd".'
+    elif [[ "$ROOT_CMD_OUTPUT" == *"org.apache.httpd"* ]]; then
+        add_audit_result --category 'System Services & Daemon Exposure' --control 'Built-in HTTP Server Disabled' \
+            --status FAIL --severity Medium --current 'org.apache.httpd is loaded' "${fw[@]}" \
+            --recommendation 'Stop and disable the built-in Apache server: "sudo launchctl disable system/org.apache.httpd && sudo launchctl bootout system/org.apache.httpd".'
+    else
+        add_audit_result --category 'System Services & Daemon Exposure' --control 'Built-in HTTP Server Disabled' \
+            --status PASS --severity Medium --current 'org.apache.httpd is not loaded' "${fw[@]}" \
+            --recommendation 'No action required.'
+    fi
+}
+
+_nfs_server_check() {
+    local exports_path="$1"
+    run_root nfsd status
+    local -a fw
+    fw=(--recommended 'nfsd service disabled and no /etc/exports' --cis 'CIS 4.1, 4.8' --nist 'CM-7, AC-3'
+        --mitre 'T1039 (Data from Network Shared Drive)' --iso27001 'A.8.20' --nis2 'Art.21(2)(d)'
+        --cis-macos 'CIS-macOS 4.3' --mscp 'os_nfsd_disable')
+
+    local service_state running=0
+    service_state=$(print -r -- "$ROOT_CMD_OUTPUT" | awk '/nfsd service/ {print $NF; exit}')
+    [[ "$ROOT_CMD_OUTPUT" == *"nfsd is running"* ]] && running=1
+
+    if [[ -z "$service_state" ]]; then
+        add_audit_result --category 'System Services & Daemon Exposure' --control 'NFS Server Disabled' \
+            --status WARN --severity Low --current "nfsd status query failed: $ROOT_CMD_OUTPUT" "${fw[@]}" \
+            --recommendation 'Verify manually with "sudo nfsd status".'
+    elif [[ $running -eq 1 || -e "$exports_path" ]]; then
+        add_audit_result --category 'System Services & Daemon Exposure' --control 'NFS Server Disabled' \
+            --status FAIL --severity Medium \
+            --current "nfsd service $service_state, $( (( running )) && print running || print 'not running'), $exports_path $( [[ -e $exports_path ]] && print present || print absent)" "${fw[@]}" \
+            --recommendation "Disable the NFS server and remove its export list: sudo nfsd disable && sudo rm $exports_path"
+    elif [[ "$service_state" == "enabled" ]]; then
+        # launchd-enabled but dormant: nfsd only starts when /etc/exports
+        # exists. CIS still wants it disabled; not an active exposure.
+        add_audit_result --category 'System Services & Daemon Exposure' --control 'NFS Server Disabled' \
+            --status WARN --severity Medium --current "nfsd service enabled but not running (no $exports_path)" "${fw[@]}" \
+            --recommendation 'Disable the dormant NFS service so creating /etc/exports cannot silently start it: "sudo nfsd disable".'
+    else
+        add_audit_result --category 'System Services & Daemon Exposure' --control 'NFS Server Disabled' \
+            --status PASS --severity Medium --current "nfsd service $service_state, no $exports_path" "${fw[@]}" \
+            --recommendation 'No action required.'
+    fi
+}
+
+check_nfs_server_disabled() {
+    _nfs_server_check /etc/exports
 }
 
 # ---- 36-kernel-boot.zsh ----
@@ -3897,6 +6078,258 @@ check_uptime_and_last_boot() {
         --status INFO --severity Informational --current "Last boot: $boot_date; Uptime: ${days}d ${hours}h" \
         --recommended 'N/A' --cis-macos 'CIS-macOS 1.1' --mscp 'N/A' \
         --recommendation 'Informational only.'
+}
+
+# ---- 40-apple-intelligence.zsh ----
+#
+# Domain 31: Apple Intelligence, Siri & Analytics
+#
+# CIS Apple macOS 26 Tahoe Benchmark v1.0.0 sections 2.5, 2.6.3, 2.6.4,
+# 2.9 and 2.18. Every control here is a profile-enforced
+# com.apple.applicationaccess / assistant key, audited through
+# evaluate_managed_pref (01-core.zsh) — unset keys are WARN, not FAIL.
+
+typeset -g AI_CATEGORY='Apple Intelligence, Siri & Analytics'
+
+check_external_intelligence_disabled() {
+    write_section_banner "$AI_CATEGORY - External Intelligence Extensions"
+    evaluate_managed_pref --category "$AI_CATEGORY" --control 'External Intelligence Integrations Disabled' \
+        --severity Medium --suite com.apple.applicationaccess --key allowExternalIntelligenceIntegrations --expect 0 \
+        --cis 'CIS 4.1, 4.8, 15.3' --nist 'AC-20, SC-7' --mitre 'T1567 (Exfiltration Over Web Service)' \
+        --iso27001 'A.5.14' --nis2 'Art.21(2)(d)' --cis-macos 'CIS-macOS 2.5.1.1' \
+        --mscp 'system_settings_external_intelligence_disable' \
+        --recommendation 'Deploy a Restrictions profile with allowExternalIntelligenceIntegrations=false so Apple Intelligence cannot hand requests to third-party models (e.g. ChatGPT).'
+}
+
+check_external_intelligence_sign_in_disabled() {
+    evaluate_managed_pref --category "$AI_CATEGORY" --control 'External Intelligence Sign-In Disabled' \
+        --severity Medium --suite com.apple.applicationaccess --key allowExternalIntelligenceIntegrationsSignIn --expect 0 \
+        --cis 'CIS 4.1, 4.8, 15.3' --nist 'AC-20' --iso27001 'A.5.14' --nis2 'Art.21(2)(d)' \
+        --cis-macos 'CIS-macOS 2.5.1.1' --mscp 'system_settings_external_intelligence_sign_in_disable' \
+        --recommendation 'Deploy a Restrictions profile with allowExternalIntelligenceIntegrationsSignIn=false so users cannot sign in to third-party intelligence providers.'
+}
+
+check_writing_tools_disabled() {
+    evaluate_managed_pref --category "$AI_CATEGORY" --control 'Writing Tools Disabled' \
+        --severity Low --suite com.apple.applicationaccess --key allowWritingTools --expect 0 \
+        --cis 'CIS 4.1, 4.8, 15.3' --nist 'AC-20' --iso27001 'A.5.14' --nis2 'Art.21(2)(d)' \
+        --cis-macos 'CIS-macOS 2.5.1.2' --mscp 'os_writing_tools_disable' \
+        --recommendation 'Deploy a Restrictions profile with allowWritingTools=false if organizational data must not be processed by Apple Intelligence Writing Tools.'
+}
+
+check_mail_summarization_disabled() {
+    evaluate_managed_pref --category "$AI_CATEGORY" --control 'Mail Summarization Disabled' \
+        --severity Low --suite com.apple.applicationaccess --key allowMailSummary --expect 0 \
+        --cis 'CIS 4.1, 4.8, 15.3' --nist 'AC-20' --iso27001 'A.5.14' --nis2 'Art.21(2)(d)' \
+        --cis-macos 'CIS-macOS 2.5.1.3' --mscp 'os_mail_summary_disable' \
+        --recommendation 'Deploy a Restrictions profile with allowMailSummary=false.'
+}
+
+check_notes_transcription_disabled() {
+    evaluate_managed_pref --category "$AI_CATEGORY" --control 'Notes Transcription Disabled' \
+        --severity Low --suite com.apple.applicationaccess --key allowNotesTranscription --expect 0 \
+        --cis 'CIS 4.1, 4.8, 15.3' --nist 'AC-20' --iso27001 'A.5.14' --nis2 'Art.21(2)(d)' \
+        --cis-macos 'CIS-macOS 2.5.1.4' --mscp 'os_notes_transcription_disable' \
+        --recommendation 'Deploy a Restrictions profile with allowNotesTranscription=false.'
+}
+
+check_notes_summarization_disabled() {
+    evaluate_managed_pref --category "$AI_CATEGORY" --control 'Notes Transcription Summary Disabled' \
+        --severity Low --suite com.apple.applicationaccess --key allowNotesTranscriptionSummary --expect 0 \
+        --cis 'CIS 4.1, 4.8, 15.3' --nist 'AC-20' --iso27001 'A.5.14' --nis2 'Art.21(2)(d)' \
+        --cis-macos 'CIS-macOS 2.5.1.4' --mscp 'os_notes_transcription_summary_disable' \
+        --recommendation 'Deploy a Restrictions profile with allowNotesTranscriptionSummary=false.'
+}
+
+check_siri_disabled() {
+    evaluate_managed_pref --category "$AI_CATEGORY" --control 'Siri Disabled' \
+        --severity Low --suite com.apple.applicationaccess --key allowAssistant --expect 0 \
+        --cis 'CIS 4.1, 4.8' --nist 'CM-7' --mitre 'T1123 (Audio Capture)' --iso27001 'A.8.9' \
+        --nis2 'Art.21(2)(d)' --cis-macos 'CIS-macOS 2.5.2.1' --mscp 'system_settings_siri_disable' \
+        --recommendation 'Deploy a Restrictions profile with allowAssistant=false, per your organization'"'"'s Siri policy.'
+}
+
+check_improve_siri_dictation_disabled() {
+    evaluate_managed_pref --category "$AI_CATEGORY" --control 'Improve Siri & Dictation Disabled' \
+        --severity Low --suite com.apple.assistant.support --key 'Siri Data Sharing Opt-In Status' --expect 2 \
+        --cis 'CIS 4.1, 4.8' --nist 'CM-7, SI-12' --iso27001 'A.5.34' --nis2 'Art.21(2)(d)' \
+        --cis-macos 'CIS-macOS 2.6.3.2' --mscp 'system_settings_improve_siri_dictation_disable' \
+        --recommendation 'Disable System Settings > Privacy & Security > Analytics & Improvements > Improve Siri & Dictation (value 2 = opted out), or enforce it via profile.'
+}
+
+check_improve_assistive_voice_disabled() {
+    evaluate_managed_pref --category "$AI_CATEGORY" --control 'Improve Assistive Voice Features Disabled' \
+        --severity Low --suite com.apple.Accessibility --key AXSAudioDonationSiriImprovementEnabled --expect 0 \
+        --cis 'CIS 4.1, 4.8' --nist 'CM-7, SI-12' --iso27001 'A.5.34' --nis2 'Art.21(2)(d)' \
+        --cis-macos 'CIS-macOS 2.6.3.3' --mscp 'system_settings_improve_assistive_voice_disable' \
+        --recommendation 'Disable System Settings > Privacy & Security > Analytics & Improvements > Improve Assistive Voice Features, or enforce AXSAudioDonationSiriImprovementEnabled=false via profile.'
+}
+
+check_share_with_app_developers_disabled() {
+    evaluate_managed_pref --category "$AI_CATEGORY" --control 'Share with App Developers Disabled' \
+        --severity Low --suite com.apple.applicationaccess --key allowDiagnosticSubmission --expect 0 \
+        --cis 'CIS 4.1, 4.8' --nist 'CM-7, SI-12' --iso27001 'A.5.34' --nis2 'Art.21(2)(d)' \
+        --cis-macos 'CIS-macOS 2.6.3.4' --mscp 'system_settings_diagnostics_reports_disable' \
+        --recommendation 'Deploy a Restrictions profile with allowDiagnosticSubmission=false to stop diagnostic data being shared with Apple and third-party developers.'
+}
+
+check_limit_ad_tracking_enabled() {
+    evaluate_managed_pref --category "$AI_CATEGORY" --control 'Personalized Advertising Disabled' \
+        --severity Low --suite com.apple.applicationaccess --key allowApplePersonalizedAdvertising --expect 0 \
+        --cis 'CIS 4.8' --nist 'CM-7' --iso27001 'A.5.34' --nis2 'Art.21(2)(d)' \
+        --cis-macos 'CIS-macOS 2.6.4' --mscp 'system_settings_personalized_advertising_disable' \
+        --recommendation 'Deploy a Restrictions profile with allowApplePersonalizedAdvertising=false.'
+}
+
+check_help_apple_improve_search_disabled() {
+    evaluate_managed_pref --category "$AI_CATEGORY" --control 'Help Apple Improve Search Disabled' \
+        --severity Low --suite com.apple.assistant.support --key 'Search Queries Data Sharing Status' --expect 2 \
+        --cis 'CIS 4.1, 4.8' --nist 'CM-7, SI-12' --iso27001 'A.5.34' --nis2 'Art.21(2)(d)' \
+        --cis-macos 'CIS-macOS 2.9.1' --mscp 'system_settings_improve_search_disable' \
+        --recommendation 'Disable System Settings > Spotlight > Help Apple Improve Search (value 2 = opted out), or enforce it via profile.'
+}
+
+check_on_device_dictation_enforced() {
+    evaluate_managed_pref --category "$AI_CATEGORY" --control 'On-Device Dictation Enforced' \
+        --severity Low --suite com.apple.applicationaccess --key forceOnDeviceOnlyDictation --expect 1 \
+        --cis 'CIS 4.1' --nist 'SC-7, SI-12' --iso27001 'A.5.34' --nis2 'Art.21(2)(d)' \
+        --cis-macos 'CIS-macOS 2.18.1' --mscp 'os_on_device_dictation_enforce' \
+        --recommendation 'Deploy a Restrictions profile with forceOnDeviceOnlyDictation=true so dictated audio is never sent to Apple servers.'
+}
+
+# ---- 41-power-management.zsh ----
+#
+# Domain 32: Power Management & Sleep
+#
+# CIS Apple macOS 26 Tahoe Benchmark v1.0.0 section 2.10. All three read
+# `pmset -g custom` / `pmset -b -g`; architecture-specific controls report
+# INFO "not applicable" on the other architecture, matching 10-hardware.
+
+typeset -g POWER_CATEGORY='Power Management & Sleep'
+
+# Prints the value of a pmset setting, one line per power source listed
+# in `pmset -g custom` output; with a section name ("Battery Power:"),
+# only that section's value.
+_pmset_values() {
+    local output="$1" setting="$2" section="${3:-}"
+    print -r -- "$output" | awk -v k="$setting" -v s="$section" '
+        /^[A-Za-z].*:$/ { in_section = (s == "" || $0 == s); next }
+        (s == "" || in_section) && $1 == k { print $2 }'
+}
+
+check_sleep_enabled_apple_silicon() {
+    write_section_banner "$POWER_CATEGORY - Sleep & Display Sleep"
+    if ! is_apple_silicon; then
+        add_audit_result --category "$POWER_CATEGORY" --control 'Sleep & Display Sleep (Apple Silicon Laptops)' \
+            --status INFO --severity Informational --current 'Not applicable: Intel Mac (see Power Nap control)' \
+            --recommended 'N/A' --cis-macos 'CIS-macOS 2.10.1.2' --mscp 'os_sleep_and_display_sleep_apple_silicon_enable' \
+            --recommendation 'Informational only.'
+        return 0
+    fi
+
+    run_root system_profiler SPHardwareDataType
+    if [[ "$ROOT_CMD_OUTPUT" != *MacBook* ]]; then
+        add_audit_result --category "$POWER_CATEGORY" --control 'Sleep & Display Sleep (Apple Silicon Laptops)' \
+            --status INFO --severity Informational --current 'Not applicable: not a MacBook (no battery power profile)' \
+            --recommended 'N/A' --cis-macos 'CIS-macOS 2.10.1.2' --mscp 'os_sleep_and_display_sleep_apple_silicon_enable' \
+            --recommendation 'Informational only.'
+        return 0
+    fi
+
+    # Deliberately not the CIS command ("pmset -b -g"): verified live that
+    # it prints the "Currently in use" profile, i.e. the AC settings
+    # whenever the laptop is plugged in. The battery section of
+    # "pmset -g custom" is what the recommendation actually targets.
+    run_root pmset -g custom
+    local pm_output="$ROOT_CMD_OUTPUT" pm_status=$ROOT_CMD_STATUS
+    local sleep_val display_val
+    sleep_val=$(_pmset_values "$pm_output" sleep 'Battery Power:' | head -1)
+    display_val=$(_pmset_values "$pm_output" displaysleep 'Battery Power:' | head -1)
+
+    # CIS: "If the screen saver is properly configured to the benchmark
+    # (15 minutes or less), then this recommendation will also pass no
+    # matter the sleep and displaysleep setting."
+    local idle
+    idle=$(managed_pref_read com.apple.screensaver idleTime)
+    local current="sleep=${sleep_val:-unknown}, displaysleep=${display_val:-unknown}, screensaver idleTime=${idle:-not set}"
+    local -a fw
+    fw=(--recommended 'sleep 1-15 min, displaysleep 1-10 min and <= sleep (or screensaver idleTime <= 900s)'
+        --cis 'CIS 4.1' --nist 'AC-11' --mitre 'T1200 (Hardware Additions)' --iso27001 'A.8.1'
+        --nis2 'Art.21(2)(i)' --cis-macos 'CIS-macOS 2.10.1.2' --mscp 'os_sleep_and_display_sleep_apple_silicon_enable')
+
+    if [[ $pm_status -ne 0 || "$sleep_val" != <-> || "$display_val" != <-> ]]; then
+        add_audit_result --category "$POWER_CATEGORY" --control 'Sleep & Display Sleep (Apple Silicon Laptops)' \
+            --status WARN --severity Low --current "pmset query failed or unparseable: $current" "${fw[@]}" \
+            --recommendation 'Verify battery sleep settings manually with "pmset -g custom".'
+    elif [[ "$idle" == <-> ]] && (( idle > 0 && idle <= 900 )) \
+         || (( sleep_val > 0 && sleep_val <= 15 && display_val > 0 && display_val <= 10 && display_val <= sleep_val )); then
+        add_audit_result --category "$POWER_CATEGORY" --control 'Sleep & Display Sleep (Apple Silicon Laptops)' \
+            --status PASS --severity Low --current "$current" "${fw[@]}" --recommendation 'No action required.'
+    else
+        add_audit_result --category "$POWER_CATEGORY" --control 'Sleep & Display Sleep (Apple Silicon Laptops)' \
+            --status FAIL --severity Low --current "$current" "${fw[@]}" \
+            --recommendation 'Set battery sleep to 15 minutes or less and display sleep to 10 minutes or less: "sudo pmset -b sleep 15 displaysleep 10".'
+    fi
+}
+
+check_power_nap_disabled_intel() {
+    if is_apple_silicon; then
+        add_audit_result --category "$POWER_CATEGORY" --control 'Power Nap Disabled (Intel)' \
+            --status INFO --severity Informational --current 'Not applicable: Apple Silicon Mac' \
+            --recommended 'N/A' --cis-macos 'CIS-macOS 2.10.2' --mscp 'os_power_nap_disable' \
+            --recommendation 'Informational only.'
+        return 0
+    fi
+
+    run_root pmset -g custom
+    local -a fw
+    fw=(--recommended 'powernap 0 on every power source' --cis 'CIS 4.1, 4.8' --nist 'CM-7'
+        --iso27001 'A.8.9' --nis2 'Art.21(2)(d)' --cis-macos 'CIS-macOS 2.10.2' --mscp 'os_power_nap_disable')
+
+    if [[ $ROOT_CMD_STATUS -ne 0 ]]; then
+        add_audit_result --category "$POWER_CATEGORY" --control 'Power Nap Disabled (Intel)' \
+            --status WARN --severity Low --current "pmset query failed: $ROOT_CMD_OUTPUT" "${fw[@]}" \
+            --recommendation 'Verify manually with "pmset -g custom".'
+    elif _pmset_values "$ROOT_CMD_OUTPUT" powernap | grep -qx 1; then
+        add_audit_result --category "$POWER_CATEGORY" --control 'Power Nap Disabled (Intel)' \
+            --status FAIL --severity Low --current 'powernap 1 on at least one power source' "${fw[@]}" \
+            --recommendation 'Disable Power Nap: "sudo pmset -a powernap 0".'
+    else
+        add_audit_result --category "$POWER_CATEGORY" --control 'Power Nap Disabled (Intel)' \
+            --status PASS --severity Low --current 'powernap 0' "${fw[@]}" --recommendation 'No action required.'
+    fi
+}
+
+check_wake_for_network_access_disabled() {
+    run_root pmset -g custom
+    local -a fw
+    fw=(--recommended 'womp 0 on every power source' --cis 'CIS 4.8' --nist 'CM-7, AC-17'
+        --mitre 'T1133 (External Remote Services)' --iso27001 'A.8.20' --nis2 'Art.21(2)(d)'
+        --cis-macos 'CIS-macOS 2.10.3' --mscp 'system_settings_wake_network_access_disable')
+
+    if [[ $ROOT_CMD_STATUS -ne 0 ]]; then
+        add_audit_result --category "$POWER_CATEGORY" --control 'Wake for Network Access Disabled' \
+            --status WARN --severity Low --current "pmset query failed: $ROOT_CMD_OUTPUT" "${fw[@]}" \
+            --recommendation 'Verify manually with "pmset -g custom".'
+        return 0
+    fi
+
+    local womp_values
+    womp_values=$(_pmset_values "$ROOT_CMD_OUTPUT" womp | tr '\n' ' ')
+    if [[ -z "${womp_values// /}" ]]; then
+        # No womp line at all: hardware without Wake-on-LAN support.
+        add_audit_result --category "$POWER_CATEGORY" --control 'Wake for Network Access Disabled' \
+            --status PASS --severity Low --current 'No womp setting reported (not supported on this hardware)' "${fw[@]}" \
+            --recommendation 'No action required.'
+    elif [[ " $womp_values" == *" 1 "* ]]; then
+        add_audit_result --category "$POWER_CATEGORY" --control 'Wake for Network Access Disabled' \
+            --status FAIL --severity Low --current "womp values: $womp_values" "${fw[@]}" \
+            --recommendation 'Disable Wake for network access: "sudo pmset -a womp 0".'
+    else
+        add_audit_result --category "$POWER_CATEGORY" --control 'Wake for Network Access Disabled' \
+            --status PASS --severity Low --current "womp values: $womp_values" "${fw[@]}" \
+            --recommendation 'No action required.'
+    fi
 }
 
 # ---- 90-scoring.zsh ----
@@ -4598,6 +7031,51 @@ EOF
         os_dyld_insert_libraries_unset)
             print -r -- 'sudo launchctl unsetenv DYLD_INSERT_LIBRARIES'
             ;;
+        # --- CIS Apple macOS 26 Tahoe additions. Only single-setting,
+        # reversible fixes are automated; password policy, sudoers,
+        # permission and folder-removal findings stay manual-review. ---
+        system_settings_printer_sharing_disable)
+            print -r -- 'sudo cupsctl --no-share-printers'
+            ;;
+        system_settings_rae_disable)
+            print -r -- 'sudo systemsetup -setremoteappleevents off'
+            ;;
+        system_settings_guest_access_smb_disable)
+            print -r -- 'sudo sysadminctl -smbGuestAccess off'
+            ;;
+        system_settings_time_server_enforce)
+            print -r -- 'sudo systemsetup -setusingnetworktime on'
+            ;;
+        os_time_server_enabled)
+            print -r -- 'sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.timed.plist'
+            ;;
+        system_settings_password_hints_disable)
+            print -r -- 'sudo defaults write /Library/Preferences/com.apple.loginwindow RetriesUntilHint -int 0'
+            ;;
+        system_settings_wake_network_access_disable)
+            print -r -- 'sudo pmset -a womp 0'
+            ;;
+        os_power_nap_disable)
+            print -r -- 'sudo pmset -a powernap 0'
+            ;;
+        os_httpd_disable)
+            cat <<'EOF'
+sudo launchctl disable system/org.apache.httpd
+sudo launchctl bootout system/org.apache.httpd 2>/dev/null || true
+EOF
+            ;;
+        os_nfsd_disable)
+            cat <<'EOF'
+sudo nfsd disable
+[[ -e /etc/exports ]] && echo "Review and remove /etc/exports manually; it was left in place."
+EOF
+            ;;
+        os_bonjour_disable)
+            print -r -- 'sudo defaults write /Library/Preferences/com.apple.mDNSResponder.plist NoMulticastAdvertisements -bool true'
+            ;;
+        os_unlock_active_user_session_disable)
+            print -r -- 'sudo security authorizationdb write system.login.screensaver authenticate-session-owner'
+            ;;
         *)
             print -r -- ''
             ;;
@@ -4795,55 +7273,88 @@ AUDIT_CHECKS=(
     # Domain 6: TCC & Privacy Controls
     check_tcc_full_disk_access_grants check_tcc_screen_recording_grants check_tcc_accessibility_grants
     check_tcc_camera_microphone_grants check_tcc_database_permissions
+    check_location_services_enabled check_location_services_menu_icon
     # Domain 7: Identity, Accounts & Privilege Management
     check_root_account_disabled check_guest_account_disabled check_admin_group_membership_inventory check_password_policy_configured
     check_sudoers_configuration
+    check_password_lockout_threshold check_password_minimum_length check_password_age check_password_history
+    check_sudo_timeout_zero check_sudo_timestamp_per_tty check_sudo_logging_enabled
+    check_admin_password_for_system_preferences check_admin_cannot_unlock_other_sessions
+    check_user_password_hints_absent check_smb_guest_access_disabled check_guest_home_folder_absent
     # Domain 8: Network Firewall & Packet Filtering
     check_firewall_state check_firewall_stealth_mode check_firewall_block_all_incoming check_firewall_signed_app_auto_allow
     check_firewall_per_app_exceptions check_etc_hosts_integrity
     # Domain 9: Remote Access & Sharing Services
     check_screen_sharing_state check_remote_management_state check_file_sharing_state check_remote_login_toggle
+    check_airplay_receiver_disabled check_printer_sharing_disabled check_remote_apple_events_disabled
+    check_internet_sharing_disabled check_content_caching_disabled check_media_sharing_disabled
+    check_bluetooth_sharing_disabled
     # Domain 10: SSH Server & Client Hardening
     check_sshd_password_auth check_sshd_permit_root_login check_sshd_weak_ciphers check_ssh_client_strict_host_key_checking
     # Domain 11: Cryptography & Certificate Trust
     check_system_trust_settings_overrides check_login_keychain_lock_on_sleep check_fips_validated_crypto_note
     # Domain 12: Audit, Logging & Telemetry
     check_audit_subsystem_enabled check_audit_control_flags check_diagnostics_autosubmit check_unified_log_security_events
+    check_network_time_enabled check_time_service_running check_install_log_retention check_audit_retention
+    check_audit_records_access
     # Domain 13: Software Update & Patch Compliance
     check_recent_update_history check_auto_update_configuration check_rapid_security_response_state
+    check_macos_updates_auto_install check_app_store_updates_auto_install check_security_responses_install_enabled
+    check_software_update_deferral
     # Domain 14: MDM, Profiles & Supervision
     check_mdm_enrollment_and_supervision check_installed_profiles_inventory
     # Domain 15: Persistence Mechanisms & Auto-Runs
     check_system_launch_daemons_integrity check_system_launch_agents_integrity check_user_launch_agents_integrity check_login_items_inventory
     check_login_logout_hooks
+    check_shell_startup_file_content check_shell_startup_file_permissions check_authorization_plugins
+    check_directory_services_plugins check_privileged_helper_tools check_cron_and_at_jobs
+    check_legacy_boot_and_periodic_scripts check_ssh_login_scripts check_ssh_authorized_keys_inventory
+    check_python_startup_hooks check_btm_item_integrity check_autostart_inventory
     # Domain 16: Privilege Escalation - File & Directory Permissions
     check_writable_launchd_directories check_writable_path_directories check_suid_sgid_binary_audit
+    check_home_folders_secure check_world_writable_applications check_world_writable_system_folder
+    check_world_writable_library_folder
     # Domain 17: Dylib Hijacking & Code Injection
     check_dyld_insert_libraries_global_env check_writable_dylib_search_paths check_hardened_runtime_spotcheck
     # Domain 18: Credential Exposure & Secret Leaks
     check_ssh_private_key_permissions check_cloud_cli_credential_files check_shell_history_secret_sweep check_sensitive_filename_sweep
     # Domain 19: Screen Lock & Physical Access
     check_screensaver_password_required check_screensaver_grace_period check_auto_login_disabled check_login_window_hardening
+    check_screen_saver_corners_secure check_screensaver_idle_time check_login_window_custom_message
+    check_login_window_password_hints_disabled check_login_window_policy_banner
     # Domain 20: Removable Media & Peripheral Control
     check_usb_restriction_profile_presence check_thunderbolt_security_level
     # Domain 21: Wireless & Network Interface Security
     check_wifi_current_network_security check_bluetooth_power_state check_airdrop_discovery_scope check_network_interface_inventory
     # Domain 22: iCloud & Cloud Sync Surface
     check_icloud_keychain_sync_indicator check_activation_lock_status check_icloud_drive_sync_indicator
+    check_icloud_desktop_documents_sync_disabled
     # Domain 23: Browser & Application Hardening
     check_safari_auto_open_safe_downloads check_safari_developer_menu_note check_safari_fraudulent_site_warning
+    check_safari_cross_site_tracking_prevention check_safari_advertising_privacy_protection
+    check_safari_show_full_website_address check_safari_show_status_bar check_terminal_secure_keyboard_entry
     # Domain 24: Ransomware Resilience & Recovery
-    check_time_machine_configured_and_recent check_time_machine_encryption_note check_local_apfs_snapshots
+    check_time_machine_configured_and_recent check_time_machine_encryption check_local_apfs_snapshots
+    check_time_machine_auto_backup
     # Domain 25: Third-Party Software & Package Inventory
     check_installed_applications_inventory check_homebrew_prefix_permissions check_homebrew_package_inventory
     # Domain 26: System Services & Daemon Exposure
     check_listening_ports_inventory check_nonapple_running_launchd_services
+    check_bonjour_advertising_disabled check_http_server_disabled check_nfs_server_disabled
     # Domain 27: Kernel & Boot Security
     check_boot_security_policy check_authenticated_root_status check_nvram_boot_args check_thirdparty_kext_inventory
     # Domain 28: Virtualization & Container Escape Surface
     check_docker_desktop_presence check_vm_hypervisor_apps_inventory
     # Domain 29: Data Loss Prevention & Sensitive Data
     check_screenshot_save_location_cloud_exposure check_handoff_universal_clipboard_note
+    # Domain 31: Apple Intelligence, Siri & Analytics
+    check_external_intelligence_disabled check_external_intelligence_sign_in_disabled check_writing_tools_disabled
+    check_mail_summarization_disabled check_notes_transcription_disabled check_notes_summarization_disabled
+    check_siri_disabled check_improve_siri_dictation_disabled check_improve_assistive_voice_disabled
+    check_share_with_app_developers_disabled check_limit_ad_tracking_enabled check_help_apple_improve_search_disabled
+    check_on_device_dictation_enforced
+    # Domain 32: Power Management & Sleep
+    check_sleep_enabled_apple_silicon check_power_nap_disabled_intel check_wake_for_network_access_disabled
     # Domain 30: System Inventory & Asset Information
     check_system_hardware_summary check_os_version_and_build check_disk_space_utilization
     check_installed_application_count check_uptime_and_last_boot
