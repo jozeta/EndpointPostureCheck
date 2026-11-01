@@ -24,3 +24,14 @@ Thumbs.db
 
 # Git worktrees
 .worktrees/
+
+# --- Baseline: macOS, Claude Code and secrets ---
+._*
+.remember/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
