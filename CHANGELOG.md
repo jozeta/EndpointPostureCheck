@@ -6,6 +6,9 @@ The project has no tagged releases yet, so changes are grouped by date. Entries 
 
 ## Unreleased
 
+- PSScriptAnalyzer clean-up: checks that fail quietly now say why with `-Verbose`; removed five values
+  that were read but never used (including an unused Device Guard query)
+
 - CI: PSScriptAnalyzer on Windows (errors fail, warnings are listed), ShellCheck for `build.sh` and
   a `zsh -n` syntax check of the macOS script
 

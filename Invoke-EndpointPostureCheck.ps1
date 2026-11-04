@@ -325,9 +325,6 @@ function Test-DMAProtection {
         $policyPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Kernel DMA Protection'
         $policyValue = Get-RegistryValueSafe -Path $policyPath -Name 'DeviceEnumerationPolicy' -DefaultValue $null
 
-        # Bus-relevant hardware capability flag (set by DCH drivers on Thunderbolt/USB4 capable systems).
-        $deviceGuard = $null
-        try { $deviceGuard = Get-CimInstance -Namespace 'root\Microsoft\Windows\DeviceGuard' -ClassName Win32_DeviceGuard -ErrorAction Stop } catch { $deviceGuard = $null }
 
         if ($null -ne $policyValue) {
             $policyMap = @{ 0 = 'Block all (most secure)'; 1 = 'Allow all (least secure)'; 2 = 'Allow only backward-compatible devices'; 3 = 'Allow only external devices with UEFI DMA protection' }
@@ -1096,7 +1093,6 @@ function Test-WDAC {
 
         if ($dg -and $dg.PSObject.Properties.Name -contains 'CodeIntegrityPolicyEnforcementStatus') {
             $status = [int]$dg.CodeIntegrityPolicyEnforcementStatus
-            $desc = $enforcementMap[$status]
             if ($status -eq 2) {
                 Add-AuditResult -Category 'Application Control & Software Whitelisting' -Control 'Windows Defender Application Control (WDAC)' `
                     -Status 'PASS' -Severity 'High' -CurrentValue "Enforced (Policies present: $($hasActivePolicies -or $hasLegacyPolicy))" -RecommendedValue 'Enforced' `
@@ -1293,7 +1289,6 @@ function Test-LAPS {
 
         # Windows LAPS also exposes an operational state under this path once it has run.
         $lapsStatePath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\LAPS\State'
-        $lapsLastRotation = Get-RegistryValueSafe -Path $lapsStatePath -Name 'PwdLastSet' -DefaultValue $null
 
         if ($windowsLapsConfigured) {
             Add-AuditResult -Category 'Identity, Privilege Management & Access Control' -Control 'Local Administrator Password Solution (LAPS)' -Status 'PASS' -Severity 'High' `
@@ -1340,11 +1335,9 @@ function Test-PasswordAndLockoutPolicy {
         }
 
         $lockoutThreshold = Get-SeceditValue $cfg 'LockoutBadCount'
-        $lockoutDuration  = Get-SeceditValue $cfg 'LockoutDuration'
         $minPwdLength     = Get-SeceditValue $cfg 'MinimumPasswordLength'
         $pwdComplexity    = Get-SeceditValue $cfg 'PasswordComplexity'
         $maxPwdAge        = Get-SeceditValue $cfg 'MaximumPasswordAge'
-        $minPwdAge        = Get-SeceditValue $cfg 'MinimumPasswordAge'
         $pwdHistory       = Get-SeceditValue $cfg 'PasswordHistorySize'
 
         if ($lockoutThreshold -and [int]$lockoutThreshold -gt 0 -and [int]$lockoutThreshold -le 10) {
@@ -3338,7 +3331,7 @@ function Test-GPPCachedCredentials {
                 try {
                     $content = Get-Content -LiteralPath $xf.FullName -Raw -ErrorAction SilentlyContinue
                     if ($content -match '(?i)cpassword\s*=\s*"[^"]+"') { $foundFiles += $xf.FullName }
-                } catch { }
+                } catch { Write-Verbose "Skipped: $($_.Exception.Message)" }
             }
         }
 
@@ -3724,7 +3717,7 @@ function Test-VulnerableDriverProtections {
                 $tsLine = $bcdOutput | Where-Object { $_ -match '(?i)testsigning' } | Select-Object -First 1
                 if ($tsLine -and $tsLine -match '(?i)Yes') { $testSigningOn = $true }
             }
-        } catch { }
+        } catch { Write-Verbose "Skipped: $($_.Exception.Message)" }
 
         if ($testSigningOn) {
             Add-AuditResult -Category 'Kernel & Driver Security' -Control 'Kernel-Mode Test Signing' -Status 'FAIL' -Severity 'Critical' `
@@ -3748,7 +3741,7 @@ function Test-VulnerableDriverProtections {
                 try {
                     $sig = Get-AuthenticodeSignature -LiteralPath $drvPath -ErrorAction Stop
                     if ($sig.Status -ne 'Valid') { $unsignedDrivers.Add("$($drv.Name) ($drvPath) [$($sig.Status)]") }
-                } catch { }
+                } catch { Write-Verbose "Skipped: $($_.Exception.Message)" }
             }
 
             if ($unsignedDrivers.Count -eq 0) {
@@ -4100,7 +4093,7 @@ function Test-UACBypassIndicators {
                 try { $cmdValue = (Get-ItemProperty -LiteralPath $bp.Path -Name '(default)' -ErrorAction Stop).'(default)' } catch { $cmdValue = '(unreadable)' }
                 $found.Add("$($bp.Path) [Technique: $($bp.Technique)] -> Command=$cmdValue")
             }
-        } catch { }
+        } catch { Write-Verbose "Skipped: $($_.Exception.Message)" }
     }
 
     if ($found.Count -eq 0) {
@@ -4163,7 +4156,7 @@ function Get-AppLockerBroadDefaultRuleFlags {
             if ($p -match '(?i)^%WINDIR%\\?\*?$' -or $p -match '(?i)^%SYSTEM32%\\?\*?$') { $flags.HasBroadWindowsRule = $true }
             if ($p -match '(?i)^%PROGRAMFILES%\\?\*?$') { $flags.HasBroadProgramFilesRule = $true }
         }
-    } catch { }
+    } catch { Write-Verbose "Skipped: $($_.Exception.Message)" }
     return $flags
 }
 
@@ -4189,7 +4182,7 @@ function Get-AppLockerDenyRuleBinaryNames {
             $sf = $c.GetAttribute('SourceFileName')
             if ($sf) { [void]$names.Add($sf) }
         }
-    } catch { }
+    } catch { Write-Verbose "Skipped: $($_.Exception.Message)" }
     return $names
 }
 
@@ -5212,7 +5205,7 @@ function Test-WifiProfileSecurity {
                 if (($auth -match '(?i)^Open$') -and ($connMode -match '(?i)Connect automatically')) {
                     $autoConnectOpenProfiles.Add("$profileName [Auto-connect to Open network]")
                 }
-            } catch { }
+            } catch { Write-Verbose "Skipped: $($_.Exception.Message)" }
         }
 
         if ($weakProfiles.Count -eq 0) {
@@ -5621,7 +5614,7 @@ function Test-ExportablePrivateKeyCertificates {
                         $exportableFound.Add("$storePath\$($cert.Thumbprint) [Subject=$($cert.Subject)]")
                     }
                 }
-            } catch { }
+            } catch { Write-Verbose "Skipped: $($_.Exception.Message)" }
         }
 
         if ($exportableFound.Count -eq 0) {
@@ -5658,7 +5651,7 @@ function Test-ExportablePrivateKeyCertificates {
                     $entry = "$rootStorePath\$($rc.Thumbprint) [Subject=$($rc.Subject); NotBefore=$($rc.NotBefore.ToString('yyyy-MM-dd'))]"
                     if ($ageDays -ge 0 -and $ageDays -le 90) { $unrecognizedRecent.Add($entry) } else { $unrecognizedOlder.Add($entry) }
                 }
-            } catch { }
+            } catch { Write-Verbose "Skipped: $($_.Exception.Message)" }
         }
 
         if ($unrecognizedRecent.Count -eq 0 -and $unrecognizedOlder.Count -eq 0) {
@@ -5735,7 +5728,7 @@ function Test-DeveloperSecretFileExposure {
                         $azureCliCacheFound.Add($azPath)
                     }
                 }
-            } catch { }
+            } catch { Write-Verbose "Skipped: $($_.Exception.Message)" }
         }
 
         if ($sshKeysFound.Count -eq 0) {
@@ -5814,9 +5807,9 @@ function Test-ThirdPartyAgentSecretExposure {
                     if ($matchLines.Count -gt 0) {
                         $found.Add("$($f.FullName) [$($matchLines.Count) match(es)]")
                     }
-                } catch { }
+                } catch { Write-Verbose "Skipped: $($_.Exception.Message)" }
             }
-        } catch { }
+        } catch { Write-Verbose "Skipped: $($_.Exception.Message)" }
     }
 
     if (-not $anyDirChecked) {
@@ -6257,7 +6250,7 @@ function Test-SMBShareSecurity {
                     $grantDesc = (($badGrants | ForEach-Object { "$($_.AccountName)=$($_.AccessRight)" }) -join ', ')
                     $insecureShares.Add("$($share.Name) [$($share.Path)] -> $grantDesc")
                 }
-            } catch { }
+            } catch { Write-Verbose "Skipped: $($_.Exception.Message)" }
         }
 
         if ($insecureShares.Count -eq 0) {
@@ -6302,7 +6295,7 @@ function Test-FirewallRuleBroadAllowRules {
                         $riskyRules.Add("$($rule.DisplayName) [$($portEntry.Value)/$($portEntry.Key), RemoteAddress=Any]")
                     }
                 }
-            } catch { }
+            } catch { Write-Verbose "Skipped: $($_.Exception.Message)" }
         }
 
         $uniqueRisky = @($riskyRules | Select-Object -Unique)
@@ -6722,7 +6715,7 @@ function Test-FirewallInboundActiveRulesInventory {
                 }
 
                 $ruleLines.Add("$($rule.DisplayName) [Action=$($rule.Action); Protocol=$proto; Port=$port; Profile=$($rule.Profile)] - $binaryNote")
-            } catch { }
+            } catch { Write-Verbose "Skipped: $($_.Exception.Message)" }
         }
 
         $allowCount = @($rules | Where-Object { $_.Action -eq 'Allow' }).Count
@@ -6790,7 +6783,7 @@ function Test-HostsFileIntegrity {
                     $writableByStandardUser = $true
                 }
             }
-        } catch { }
+        } catch { Write-Verbose "Skipped: $($_.Exception.Message)" }
 
         if ($suspiciousEntries.Count -gt 0) {
             Add-AuditResult -Category 'Network Architecture & Protocol Hardening' -Control 'Hosts File Integrity' -Status 'FAIL' -Severity 'Critical' `
@@ -7167,7 +7160,7 @@ function Test-CachedUserProfileInventory {
         }
         $profileSummary = $profiles | ForEach-Object {
             $lastUseText = 'Unknown'
-            try { if ($_.LastUseTime) { $lastUseText = ([Management.ManagementDateTimeConverter]::ToDateTime($_.LastUseTime)).ToString('yyyy-MM-dd') } } catch { }
+            try { if ($_.LastUseTime) { $lastUseText = ([Management.ManagementDateTimeConverter]::ToDateTime($_.LastUseTime)).ToString('yyyy-MM-dd') } } catch { Write-Verbose "Skipped: $($_.Exception.Message)" }
             "$($_.LocalPath) [LastUse=$lastUseText; Loaded=$($_.Loaded); Roaming=$($_.RoamingConfigured)]"
         }
         Add-AuditResult -Category 'System Inventory & Asset Information' -Control 'Cached User Profiles' -Status 'INFO' -Severity 'Informational' `
@@ -7642,13 +7635,13 @@ function Get-SystemInformationSummary {
                 $aadJoined = Get-DsregValue $dsreg 'AzureAdJoined'
                 if ($aadJoined -eq 'YES') { $summary.Domain += ' (Entra ID Joined)' }
             }
-        } catch { }
-    } catch { }
+        } catch { Write-Verbose "Skipped: $($_.Exception.Message)" }
+    } catch { Write-Verbose "Skipped: $($_.Exception.Message)" }
 
     try {
         $cpu = Get-CimInstance -ClassName Win32_Processor -ErrorAction Stop | Select-Object -First 1
         $summary.CPU = "$($cpu.Name.Trim()) ($($cpu.NumberOfCores)C/$($cpu.NumberOfLogicalProcessors)T)"
-    } catch { }
+    } catch { Write-Verbose "Skipped: $($_.Exception.Message)" }
 
     try {
         $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
@@ -7657,17 +7650,17 @@ function Get-SystemInformationSummary {
         $summary.LastBootTime = $lastBoot.ToString('yyyy-MM-dd HH:mm:ss')
         $uptimeSpan = (Get-Date) - $lastBoot
         $summary.Uptime = "{0}d {1}h {2}m" -f $uptimeSpan.Days, $uptimeSpan.Hours, $uptimeSpan.Minutes
-    } catch { }
+    } catch { Write-Verbose "Skipped: $($_.Exception.Message)" }
 
     try {
         $summary.CurrentUser = "$env:USERDOMAIN\$env:USERNAME (elevated session)"
-    } catch { }
+    } catch { Write-Verbose "Skipped: $($_.Exception.Message)" }
 
     try {
         $ips = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop |
             Where-Object { $_.IPAddress -notmatch '^(127\.|169\.254\.)' } | Select-Object -ExpandProperty IPAddress -Unique)
         $summary.IPAddresses = if ($ips.Count -gt 0) { $ips -join ', ' } else { 'No active IPv4 address found' }
-    } catch { }
+    } catch { Write-Verbose "Skipped: $($_.Exception.Message)" }
 
     try {
         $volumes = @(Get-CimInstance -ClassName Win32_LogicalDisk -Filter 'DriveType=3' -ErrorAction Stop)
@@ -7678,12 +7671,12 @@ function Get-SystemInformationSummary {
             "$($_.DeviceID) $freeGb GB free / $sizeGb GB ($pctFree% free)"
         })
         if ($diskParts.Count -gt 0) { $summary.DiskSummary = $diskParts -join '; ' }
-    } catch { }
+    } catch { Write-Verbose "Skipped: $($_.Exception.Message)" }
 
     try {
         $apps = Get-InstalledApplicationsCache
         $summary.InstalledAppCount = "$($apps.Count)"
-    } catch { }
+    } catch { Write-Verbose "Skipped: $($_.Exception.Message)" }
 
     try {
         $blVolumes = @(Get-BitLockerVolume -ErrorAction Stop)
@@ -7693,7 +7686,7 @@ function Get-SystemInformationSummary {
         } else {
             $summary.BitLockerSummary = 'No volumes found'
         }
-    } catch { }
+    } catch { Write-Verbose "Skipped: $($_.Exception.Message)" }
 
     return $summary
 }
@@ -7705,6 +7698,7 @@ function New-HtmlReport {
         (no PowerShell string interpolation inside the template, to keep embedded JS/CSS safe).
     #>
     [CmdletBinding()]
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Writing this report file is the point of the run')]
     param(
         [Parameter(Mandatory = $true)] [string]$OutputPath,
         [Parameter(Mandatory = $true)] [PSObject]$Posture
@@ -8998,6 +8992,7 @@ function New-RemediationScript {
         modular remediation block per FAIL finding from the current audit run.
     #>
     [CmdletBinding()]
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Writing this report file is the point of the run')]
     param([Parameter(Mandatory = $true)][string]$OutputPath)
 
     $failFindings = @($Script:AuditResults | Where-Object { $_.Status -eq 'FAIL' } | Sort-Object -Property @{Expression = {

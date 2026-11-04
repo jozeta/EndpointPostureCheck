@@ -3,5 +3,7 @@
 @{
     Severity     = @('Error', 'Warning')
     # Console output is the point of this script (live per-finding feedback).
-    ExcludeRules = @('PSAvoidUsingWriteHost')
+    # PSUseSingularNouns: the check functions are named after what they audit (Test-SecureBootAndUEFI,
+    # Test-LegacyProtocols, …); renaming 36 public check names would be churn without benefit.
+    ExcludeRules = @('PSAvoidUsingWriteHost', 'PSUseSingularNouns')
 }
