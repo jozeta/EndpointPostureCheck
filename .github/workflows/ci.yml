@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PSScriptAnalyzer
+        run: |
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module PSScriptAnalyzer -Scope CurrentUser -Force
+      - name: Lint (Invoke-ScriptAnalyzer; errors fail, warnings are listed)
+        run: |
+          $r = Invoke-ScriptAnalyzer -Path . -Recurse -Settings ./PSScriptAnalyzerSettings.psd1
+          $r | Sort-Object Severity, ScriptName, Line | Format-Table Severity, RuleName, ScriptName, Line, Message -AutoSize -Wrap | Out-String -Width 250 | Write-Host
+          $errs = @($r | Where-Object Severity -eq 'Error')
+          Write-Host "$($errs.Count) errors, $(@($r).Count - $errs.Count) warnings"
+          if ($errs.Count -gt 0) { exit 1 }
+
+  macos-script:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: ShellCheck the build script
+        run: shellcheck -S warning build.sh
+      - name: zsh syntax check of the macOS script (ShellCheck doesn't support zsh)
+        run: |
+          sudo apt-get install -y -qq zsh >/dev/null
+          zsh -n Invoke-MacPostureCheck.sh

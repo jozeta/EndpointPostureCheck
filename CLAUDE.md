@@ -47,3 +47,18 @@ is restored, and don't run `build.sh` without it (it exits with an error).
   anything. Never make the auditor itself change system state.
 - Keep both editions in step when adding a check that exists on both platforms, and update the
   check counts and domain tables in README.md.
+
+## App standards
+
+This repo follows the app standards in `~/Desktop/code/tools/standards/STANDARDS.md` (rule IDs,
+severities; decisions and waivers in `.claude-standards`). `claude-check --repo .` checks it.
+
+```powershell
+Invoke-ScriptAnalyzer -Path . -Recurse -Settings ./PSScriptAnalyzerSettings.psd1   # lint
+Invoke-Pester -Path tests                                                         # local Pester 5 tests
+```
+
+`tests/` stays local and unpublished (gitignored; waived in `.claude-standards`). The Pester tests
+load helper functions from the script's syntax tree and never run the audit. CI lints on Windows,
+plus ShellCheck on `build.sh` and `zsh -n` on the macOS script.
+

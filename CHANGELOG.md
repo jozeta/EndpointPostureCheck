@@ -6,6 +6,9 @@ The project has no tagged releases yet, so changes are grouped by date. Entries 
 
 ## Unreleased
 
+- CI: PSScriptAnalyzer on Windows (errors fail, warnings are listed), ShellCheck for `build.sh` and
+  a `zsh -n` syntax check of the macOS script
+
 ## 2026-11-02
 
 - Add security policy
