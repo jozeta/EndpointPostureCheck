@@ -1084,7 +1084,6 @@ function Test-WDAC {
     Write-SectionBanner 'Application Control & Software Whitelisting - WDAC'
     try {
         $dg = Get-DeviceGuardStatus
-        $enforcementMap = @{ 0 = 'Off'; 1 = 'Audit Mode'; 2 = 'Enforced' }
 
         $activePolicyDir = Join-Path -Path $env:WINDIR -ChildPath 'System32\CodeIntegrity\CIPolicies\Active'
         $legacyPolicy = Join-Path -Path $env:WINDIR -ChildPath 'System32\CodeIntegrity\SIPolicy.p7b'
@@ -1288,7 +1287,6 @@ function Test-LAPS {
         $legacyLapsPresent = Test-Path -LiteralPath $legacyLapsCse
 
         # Windows LAPS also exposes an operational state under this path once it has run.
-        $lapsStatePath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\LAPS\State'
 
         if ($windowsLapsConfigured) {
             Add-AuditResult -Category 'Identity, Privilege Management & Access Control' -Control 'Local Administrator Password Solution (LAPS)' -Status 'PASS' -Severity 'High' `
@@ -2908,6 +2906,7 @@ function Test-LowPrivilegeWriteAccess {
         }
     } catch {
         # Inaccessible/nonexistent path - treated as not-vulnerable; callers handle existence separately.
+        Write-Verbose "Skipped: $($_.Exception.Message)"
     }
     return $result
 }
@@ -3302,6 +3301,7 @@ function Test-UnattendedInstallFiles {
             }
         } catch {
             # Inaccessible file - skip silently, this is a best-effort presence sweep.
+            Write-Verbose "Skipped: $($_.Exception.Message)"
         }
     }
 
@@ -3403,6 +3403,7 @@ function Test-SAMSystemHiveProtection {
         }
     } catch {
         # vssadmin unavailable or restricted - not a failure condition for this awareness check.
+        Write-Verbose "Skipped: $($_.Exception.Message)"
     }
 
     if (-not $anyVulnerable) {
