@@ -6,6 +6,16 @@ The project has no tagged releases yet, so changes are grouped by date. Entries 
 
 ## Unreleased
 
+- Windows dashboard redesigned in the Låda Glass family look, matching the macOS edition: a port
+  of the macOS template with identical CSS and JavaScript (sidebar domain filter with FAIL/WARN
+  counts, KPI filters, score ring, theme switch, phone card layout, print styles). Long values open
+  in the shared popover instead of the old modal. `build.sh` writes the vendored Låda Glass CSS and
+  icon sprite into a marked, generated region of the `.ps1`, which stays a single pure-ASCII file.
+  The score is formatted with the invariant culture (no "76,3" on a Swedish system).
+- Windows: `Add-AuditResult` takes an optional `-Details` item list, shown behind the measured
+  value in the dashboard and exported in JSON.
+- Dashboard popover (both editions): the pointer can move into it to scroll a long list, and a
+  click no longer closes it straight after hover had opened it.
 - macOS dashboard sidebar no longer jumps: it scrolls on its own inside the window (it was taller
   than the screen, so the lower domains were out of reach), domain links filter in place instead
   of jumping to `#findings`, the active domain shows as a removable chip above the table, and the

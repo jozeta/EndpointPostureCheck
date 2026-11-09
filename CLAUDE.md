@@ -40,6 +40,13 @@ in the repo** (gitignored, waived in `.claude-standards`). When `src/` is presen
 modules there, run `./build.sh`, and run the zsh tests with `tests/run-tests.sh`. Commit the
 rebuilt `Invoke-MacPostureCheck.sh`.
 
+Both dashboards use the vendored Låda Glass design (`vendor/lada-glass/<version>/`). `build.sh`
+also rewrites the `LADA-GLASS-ASSETS` region of `Invoke-EndpointPostureCheck.ps1` from it (never
+edit that region by hand). The Windows `Get-HtmlTemplate` is a port of the macOS template: change
+the dashboard CSS/JS in `src/91-report-html.zsh` and copy it to the `.ps1`; the local test
+`tests/test-report-windows.zsh` fails if they differ. Keep the `.ps1` pure ASCII (Windows
+PowerShell 5.1 reads a BOM-less script as ANSI).
+
 If `src/` is missing, it can be recovered without loss from the built script, since every module
 is marked `# ---- <name>.zsh ----`. Split on those markers, restore each module's shebang line,
 and drop the one blank line `build.sh` adds before each marker. Then rebuild and diff to confirm.

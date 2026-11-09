@@ -1,5 +1,5 @@
 #!/usr/bin/env zsh
-# EndpointPostureCheck for macOS — built 2026-11-09 22:26:46 from src/*.zsh. Do not edit directly.
+# EndpointPostureCheck for macOS — built 2026-11-09 22:35:38 from src/*.zsh. Do not edit directly.
 
 # ---- 00-header.zsh ----
 #
@@ -7735,7 +7735,7 @@ get_html_template() {
 <title>EndpointPostureCheck - {{COMPUTERNAME}}</title>
 <style>
 {{LADA_CSS}}
-/* ---- EndpointPostureCheck dashboard (on top of Låda Glass) ---- */
+/* ---- EndpointPostureCheck dashboard (on top of Lada Glass) ---- */
 .lg-app { max-width: 1680px; margin: 0 auto; }
 @media (min-width: 761px) {
   .lg-app { grid-template-columns: 240px minmax(0, 1fr); }  /* phones keep the design system's top bar */
@@ -7792,7 +7792,8 @@ button.pc-kpi[aria-pressed="true"] { box-shadow: var(--lg-shadow), 0 0 0 2px var
           text-decoration: underline dotted color-mix(in srgb, var(--lg-accent) 70%, transparent); text-underline-offset: 3px; }
 .pc-tip .lg-icon { color: var(--lg-accent); margin-left: 4px; }
 .pc-pop { position: fixed; z-index: 50; max-width: min(440px, calc(100vw - 24px)); max-height: 55vh; overflow: auto; padding: var(--lg-space-m);
-          white-space: pre-line; font-size: var(--lg-fs-small); line-height: 1.55; background: var(--lg-glass-strong); }
+          white-space: pre-line; font-size: var(--lg-fs-small); line-height: 1.55; background: var(--lg-glass-strong);
+          overscroll-behavior: contain; overflow-wrap: anywhere; }
 .pc-sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
 .pc-empty-row td { text-align: center; color: var(--lg-muted); padding: var(--lg-space-xl); }
 footer.pc-foot { text-align: center; padding: var(--lg-space-s) 0 var(--lg-space-l); }
@@ -8000,26 +8001,32 @@ footer.pc-foot { text-align: center; padding: var(--lg-space-s) 0 var(--lg-space
   setTheme(saved);
   all('[data-theme-set]').forEach(function (b) { b.addEventListener('click', function () { setTheme(b.getAttribute('data-theme-set')); }); });
 
-  // Item-list popover: hover, keyboard focus or click; Escape closes it.
-  var pop = doc.getElementById('tipPop'), owner = null;
+  // Item-list popover: hover, keyboard focus or click; Escape closes it. The pointer can
+  // move from the button into the popover (to scroll a long list) without closing it.
+  var pop = doc.getElementById('tipPop'), owner = null, hideTimer = null, overPop = false;
   function show(btn) {
-    owner = btn; pop.textContent = btn.getAttribute('data-tip'); pop.hidden = false;
+    clearTimeout(hideTimer);
+    if (owner && owner !== btn) owner.removeAttribute('aria-describedby');
+    owner = btn; pop.textContent = btn.getAttribute('data-tip'); pop.hidden = false; pop.scrollTop = 0;
     var r = btn.getBoundingClientRect(), w = pop.offsetWidth, h = pop.offsetHeight;
     var left = Math.min(Math.max(12, r.left), window.innerWidth - w - 12);
     var top = r.bottom + 8 + h > window.innerHeight ? Math.max(12, r.top - h - 8) : r.bottom + 8;
     pop.style.left = left + 'px'; pop.style.top = top + 'px';
     btn.setAttribute('aria-describedby', 'tipPop');
   }
-  function hide() { if (owner) owner.removeAttribute('aria-describedby'); owner = null; pop.hidden = true; }
+  function hide() { clearTimeout(hideTimer); if (owner) owner.removeAttribute('aria-describedby'); owner = null; pop.hidden = true; }
+  function hideSoon() { clearTimeout(hideTimer); hideTimer = setTimeout(function () { if (!overPop && doc.activeElement !== owner) hide(); }, 250); }
   all('.pc-tip').forEach(function (b) {
     b.addEventListener('mouseenter', function () { show(b); });
     b.addEventListener('focus', function () { show(b); });
-    b.addEventListener('click', function () { if (owner === b) hide(); else show(b); });
-    b.addEventListener('mouseleave', function () { if (doc.activeElement !== b) hide(); });
-    b.addEventListener('blur', hide);
+    b.addEventListener('click', function () { show(b); });   // hover/focus already opened it; a click must not close it
+    b.addEventListener('mouseleave', hideSoon);
+    b.addEventListener('blur', function () { if (!overPop) hide(); });
   });
+  pop.addEventListener('mouseenter', function () { overPop = true; clearTimeout(hideTimer); });
+  pop.addEventListener('mouseleave', function () { overPop = false; hideSoon(); });
   doc.addEventListener('keydown', function (e) { if (e.key === 'Escape') hide(); });
-  window.addEventListener('scroll', hide, { passive: true });
+  window.addEventListener('scroll', function () { if (!overPop) hide(); }, { passive: true });
 
   apply();
 })();

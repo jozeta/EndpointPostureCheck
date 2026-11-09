@@ -41,7 +41,7 @@ It is designed to run standalone with zero external dependencies — no modules 
 
 - **142 checks, zero dependencies.** Everything runs on native PowerShell, CIM/WMI, and built-in Windows command-line tools (`bcdedit`, `reagentc`, `vssadmin`, `netsh`, `auditpol`, `wevtutil`, `sc`, `secedit`). Nothing to install.
 - **Fault-tolerant by design.** Every single check runs inside its own `try/catch` boundary. A missing subsystem, an unsupported SKU, or an access-denied condition is logged as a `WARN`/`INFO` finding — it never aborts the run.
-- **Executive HTML dashboard.** A self-contained, single-file dashboard with a compliance score ring, risk badge, a **System Overview** panel (hostname, domain/Entra ID join state, uptime, IP, disk space, RAM/CPU, installed app count, BitLocker status), and a searchable/filterable findings table.
+- **Executive HTML dashboard.** A self-contained, single-file dashboard in the Låda Glass family design (frosted glass, dark theme with a light theme that follows the system, and a theme switch). It shows a compliance score ring, risk badge, KPI cards that filter by status, a sidebar listing every domain with its FAIL/WARN count, a **System Overview** panel (hostname, domain/Entra ID join state, uptime, IP, disk space, RAM/CPU, installed app count, BitLocker status), and a searchable, filterable findings table. Long item lists open in a popover. On a phone the table becomes stacked cards, and it has print styles. The design system's CSS and icons are inlined, so the report makes no network requests.
 - **Weighted compliance scoring.** Critical/High severity failures are penalized more heavily than Medium/Low ones; the result is a single 0–100% score and a `LOW`/`MEDIUM`/`HIGH`/`CRITICAL` risk badge.
 - **Multi-framework mapping on every finding.** CIS Controls v8, NIST SP 800-53 Rev.5, MITRE ATT&CK technique IDs, ISO/IEC 27001:2022 Annex A, NIS2 Article 21(2), and NSA/CISA guidance.
 - **Auto-generated remediation script.** `-GenerateRemediationScript` produces a companion `Remediate-EndpointPostureCheck.ps1` with a commented, `ShouldProcess`-gated block for every `FAIL` finding — real executable commands where it's safe to automate, explicit manual-review guidance where it isn't.
@@ -119,7 +119,7 @@ The script must be run from an elevated PowerShell session ("Run as Administrato
 | `MEDIUM` | Score below 80% |
 | `LOW` | Otherwise |
 
-The dashboard lets you filter by status (All / Failures Only / Warnings Only / Critical-High Only), filter by category, and free-text search across control names, categories, and remediation guidance.
+The dashboard lets you filter by status (All / Failures / Warnings / Critical-High, or the KPI cards), filter by domain (the sidebar or the drop-down), and free-text search across control names, categories, measured values, and remediation guidance.
 
 ---
 
@@ -223,7 +223,7 @@ This tool includes deep-inspection checks — LSASS/credential exposure, ACL/pri
 
 **A comprehensive, standalone zsh security posture auditor for macOS 15 (Sequoia) and 26 (Tahoe) endpoints.**
 
-`Invoke-MacPostureCheck.sh` runs **185 read-only security controls** across 32 hardening domains — from Secure Enclave/T2 platform integrity and System Integrity Protection through Gatekeeper, TCC privacy controls, FileVault, credential exposure, and ransomware resilience — and renders the results as a single-file, interactive HTML dashboard, in the same visual language as the Windows edition. Every finding is mapped to CIS Controls v8, NIST SP 800-53 Rev.5, MITRE ATT&CK, ISO/IEC 27001:2022, the NIS2 Directive, NSA/CISA guidance, the CIS Apple macOS Benchmark, and the macOS Security Compliance Project (mSCP) — two mappings the Windows edition doesn't carry, since they're macOS-specific authoritative baselines. Findings backed by a real item list (installed apps, listening ports, admin group members, TCC grants, and more) show a hover tooltip in the HTML dashboard with the full list, one item per line, instead of cluttering the table with a long inline value.
+`Invoke-MacPostureCheck.sh` runs **185 read-only security controls** across 32 hardening domains — from Secure Enclave/T2 platform integrity and System Integrity Protection through Gatekeeper, TCC privacy controls, FileVault, credential exposure, and ransomware resilience — and renders the results as a single-file, interactive HTML dashboard, in the same visual language as the Windows edition. Every finding is mapped to CIS Controls v8, NIST SP 800-53 Rev.5, MITRE ATT&CK, ISO/IEC 27001:2022, the NIS2 Directive, NSA/CISA guidance, the CIS Apple macOS Benchmark, and the macOS Security Compliance Project (mSCP) — two mappings the Windows edition doesn't carry, since they're macOS-specific authoritative baselines. Findings backed by a real item list (installed apps, listening ports, admin group members, TCC grants, and more) show a popover in the HTML dashboard with the full list, one item per line, instead of cluttering the table with a long inline value. Both editions share the same dashboard (Låda Glass design, sidebar domain filter, KPI filters, theme switch).
 
 It runs standalone with zero external dependencies: no Homebrew packages, no Python, nothing beyond the zsh shell and command-line tools Apple ships on every Mac.
 
