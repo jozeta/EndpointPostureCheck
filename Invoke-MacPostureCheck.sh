@@ -1,5 +1,5 @@
 #!/usr/bin/env zsh
-# EndpointPostureCheck for macOS — built 2026-10-28 11:03:32 from src/*.zsh. Do not edit directly.
+# EndpointPostureCheck for macOS — built 2026-11-09 20:42:49 from src/*.zsh. Do not edit directly.
 
 # ---- 00-header.zsh ----
 #
@@ -7,7 +7,7 @@
 # A read-only security posture auditor for macOS 15/26 endpoints.
 #
 # Usage: Invoke-MacPostureCheck.sh [--report-path <dir|file>] [--export-json]
-#                                   [--generate-remediation] [--help]
+#                                   [--generate-remediation] [--generate-profile] [--help]
 #
 # Deliberately NOT running under `set -u`/`set -e`: the #1 design
 # requirement (Global Constraints) is that one check's failure must never
@@ -30,6 +30,7 @@ COMPUTER_NAME=$(scutil --get ComputerName 2>/dev/null || hostname)
 REPORT_PATH=""
 EXPORT_JSON=0
 GENERATE_REMEDIATION=0
+GENERATE_PROFILE=0
 
 print_usage() {
     cat <<'EOF'
@@ -47,6 +48,9 @@ Options:
                                alongside the HTML report.
   --generate-remediation       Generate Remediate-EndpointPostureCheck.sh
                                for every FAIL finding from this run.
+  --generate-profile           Generate EndpointPostureCheck-Hardening.mobileconfig
+                               with every profile-enforceable WARN/FAIL setting
+                               (written for review only; never installed).
   --help                       Show this help text and exit.
 
 Must be run with sudo (root). No changes are made to the system during
@@ -70,6 +74,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --generate-remediation)
             GENERATE_REMEDIATION=1
+            shift
+            ;;
+        --generate-profile)
+            GENERATE_PROFILE=1
             shift
             ;;
         --help|-h)
@@ -434,6 +442,7 @@ evaluate_managed_pref() {
             add_audit_result "${base[@]}" --status WARN --severity "$severity" \
                 --current "$key not set - not enforced by a configuration profile" \
                 --recommendation "$recommendation"
+            record_profile_fix "$suite" "$key" "${expect:-${max:-$min}}"
         fi
         return 0
     fi
@@ -453,6 +462,7 @@ evaluate_managed_pref() {
     else
         add_audit_result "${base[@]}" --status FAIL --severity "$severity" \
             --current "$suite / $key = $value" --recommendation "$recommendation"
+        record_profile_fix "$suite" "$key" "${expect:-${max:-$min}}"
     fi
 }
 
@@ -522,6 +532,11 @@ evaluate_profile_payload() {
         [[ "$got" != "$want" ]] && mismatch=1
     done
 
+    if [[ $mismatch -eq 1 || $found -ne ${#pairs[@]} ]]; then
+        for pair in "${pairs[@]}"; do
+            record_profile_fix com.apple.Safari "${pair%%=*}" "${pair#*=}"
+        done
+    fi
     if [[ $mismatch -eq 1 ]]; then
         add_audit_result "${base[@]}" --status FAIL --severity "$severity" \
             --current "${(j:, :)seen}" --recommendation "$recommendation"
@@ -533,6 +548,84 @@ evaluate_profile_payload() {
             --current "${(j:, :)seen} - not fully enforced by a configuration profile" \
             --recommendation "$recommendation"
     fi
+}
+
+# Compliant values for every profile-enforceable setting that came out
+# WARN or FAIL this run; 94-profile.zsh turns them into a .mobileconfig
+# (--generate-profile). Parallel arrays, one entry per suite/key.
+typeset -ga PROFILE_FIX_SUITES PROFILE_FIX_KEYS PROFILE_FIX_VALUES
+
+record_profile_fix() {
+    local suite="$1" key="$2" value="$3" i
+    [[ -n "$suite" && -n "$key" && -n "$value" ]] || return 0
+    for (( i = 1; i <= ${#PROFILE_FIX_KEYS[@]}; i++ )); do
+        [[ "${PROFILE_FIX_SUITES[$i]}" == "$suite" && "${PROFILE_FIX_KEYS[$i]}" == "$key" ]] && return 0
+    done
+    PROFILE_FIX_SUITES+=("$suite"); PROFILE_FIX_KEYS+=("$key"); PROFILE_FIX_VALUES+=("$value")
+}
+
+# Background prefetch for slow, independent queries (sfltool dumpbtm,
+# system_profiler SPAirPortDataType, the XProtect Remediator log): started
+# at the beginning of main(), consumed by the check that needs it.
+# run_prefetched falls back to running the command inline when nothing
+# was prefetched (or the prefetch left no result), so checks behave the
+# same when sourced alone in tests.
+typeset -g PREFETCH_DIR=""
+typeset -gA PREFETCH_PID
+
+prefetch() {
+    local name="$1"; shift
+    if [[ -z "$PREFETCH_DIR" ]]; then
+        PREFETCH_DIR=$(mktemp -d -t epc-prefetch) || return 0
+    fi
+    { "$@" > "$PREFETCH_DIR/$name.out" 2>&1; print -r -- $? > "$PREFETCH_DIR/$name.rc"; } &
+    # Quoted on purpose: verified live that zsh leaves an unquoted $! in an
+    # associative-element assignment unexpanded (stores the text "$!").
+    PREFETCH_PID[$name]="$!"
+}
+
+# Waits for a prefetched result by polling for its .rc file while the
+# background process is alive. A bug here once stored the literal text
+# "$!" as the PID, `wait` returned at once, and the inline fallback
+# started a second `sfltool dumpbtm` that hung beside the first.
+# A prefetched command is therefore never re-run: a missing result or a
+# timeout becomes a failed query (status 124) that the check reports as
+# WARN. Only names that were never prefetched run inline.
+: ${PREFETCH_TIMEOUT:=180}
+
+run_prefetched() {
+    local name="$1"; shift
+    local pid="${PREFETCH_PID[$name]:-}" waited=0
+    if [[ -z "$pid" ]]; then
+        run_root "$@"
+        return 0
+    fi
+    unset "PREFETCH_PID[$name]"
+    while [[ ! -f "$PREFETCH_DIR/$name.rc" ]] && kill -0 "$pid" 2>/dev/null; do
+        if (( waited >= PREFETCH_TIMEOUT * 5 )); then
+            kill "$pid" 2>/dev/null
+            pkill -P "$pid" 2>/dev/null
+            break
+        fi
+        sleep 0.2
+        waited=$((waited + 1))
+    done
+    if [[ -f "$PREFETCH_DIR/$name.rc" ]]; then
+        ROOT_CMD_OUTPUT=$(< "$PREFETCH_DIR/$name.out")
+        ROOT_CMD_STATUS=$(< "$PREFETCH_DIR/$name.rc")
+    else
+        ROOT_CMD_OUTPUT="background query '$*' did not finish within ${PREFETCH_TIMEOUT}s"
+        ROOT_CMD_STATUS=124
+    fi
+    return 0
+}
+
+prefetch_cleanup() {
+    local pid
+    for pid in "${PREFETCH_PID[@]}"; do pkill -P "$pid" 2>/dev/null; kill "$pid" 2>/dev/null; done
+    PREFETCH_PID=()
+    [[ -n "$PREFETCH_DIR" && -d "$PREFETCH_DIR" ]] && command rm -rf "$PREFETCH_DIR"
+    PREFETCH_DIR=""
 }
 
 # ---- 10-hardware.zsh ----
@@ -550,13 +643,13 @@ check_secure_enclave_presence() {
                 --current 'Secure Enclave (SEP) detected via ioreg' --recommended 'Secure Enclave present' \
                 --cis 'CIS 10.5' --nist 'IA-3, SC-28' --mitre 'T1552.004' --iso27001 'A.8.24' \
                 --nis2 'Art.21(2)(h)' --nsa 'NSA/CISA Advancing Zero Trust Maturity - Device Pillar' \
-                --cis-macos 'CIS-macOS 1.1' --mscp 'os_secure_enclave_present' \
+                --cis-macos 'N/A' --mscp 'os_secure_enclave' \
                 --recommendation 'No action required. Every Apple Silicon Mac ships with a Secure Enclave.'
         else
             add_audit_result --category 'Hardware, Firmware & Platform Integrity' \
                 --control 'Secure Enclave Presence' --status WARN --severity Medium \
                 --current 'Secure Enclave not detected via ioreg' --recommended 'Secure Enclave present' \
-                --cis 'CIS 10.5' --nist 'IA-3, SC-28' --cis-macos 'CIS-macOS 1.1' --mscp 'os_secure_enclave_present' \
+                --cis 'CIS 10.5' --nist 'IA-3, SC-28' --cis-macos 'N/A' --mscp 'os_secure_enclave' \
                 --recommendation 'Unexpected on Apple Silicon hardware. Verify with "system_profiler SPiBridgeDataType" and Apple Diagnostics; this may indicate a query failure rather than a real absence.'
         fi
     else
@@ -565,13 +658,13 @@ check_secure_enclave_presence() {
             add_audit_result --category 'Hardware, Firmware & Platform Integrity' \
                 --control 'Secure Enclave Presence' --status PASS --severity High \
                 --current 'Apple T2 Security Chip detected' --recommended 'T2 Security Chip present' \
-                --cis 'CIS 10.5' --nist 'IA-3, SC-28' --cis-macos 'CIS-macOS 1.1' --mscp 'os_secure_enclave_present' \
+                --cis 'CIS 10.5' --nist 'IA-3, SC-28' --cis-macos 'N/A' --mscp 'os_secure_enclave' \
                 --recommendation 'No action required.'
         else
             add_audit_result --category 'Hardware, Firmware & Platform Integrity' \
                 --control 'Secure Enclave Presence' --status WARN --severity High \
                 --current 'No T2 Security Chip detected' --recommended 'T2 Security Chip present' \
-                --cis 'CIS 10.5' --nist 'IA-3, SC-28' --cis-macos 'CIS-macOS 1.1' --mscp 'os_secure_enclave_present' \
+                --cis 'CIS 10.5' --nist 'IA-3, SC-28' --cis-macos 'N/A' --mscp 'os_secure_enclave' \
                 --recommendation 'This Intel Mac has no T2 chip: no hardware root of trust, no local Secure Boot, no hardware-bound key storage. Prioritize this device for hardware refresh where BitLocker/FileVault-equivalent guarantees matter.'
         fi
     fi
@@ -590,7 +683,7 @@ check_hardware_identification() {
     add_audit_result --category 'Hardware, Firmware & Platform Integrity' \
         --control 'System Hardware Identification' --status INFO --severity Informational \
         --current "Model=$model; Chip/CPU=$chip; Serial=$serial" --recommended 'N/A' \
-        --cis-macos 'CIS-macOS 1.1' --mscp 'N/A' \
+        --cis-macos 'N/A' --mscp 'N/A' \
         --recommendation 'Informational only. Confirm this asset record matches your inventory/MDM record.'
 }
 
@@ -603,7 +696,7 @@ check_boot_rom_firmware_version() {
     add_audit_result --category 'Hardware, Firmware & Platform Integrity' \
         --control 'Boot ROM / System Firmware Version' --status INFO --severity Informational \
         --current "$fw" --recommended 'Latest firmware per macOS Software Update' \
-        --cis-macos 'CIS-macOS 1.1' --mscp 'N/A' \
+        --cis-macos 'N/A' --mscp 'N/A' \
         --recommendation 'Informational only. Firmware updates ship bundled with macOS Software Update; keep the OS current.'
 }
 
@@ -620,20 +713,20 @@ check_sip_status() {
             --status FAIL --severity Critical --current "$ROOT_CMD_OUTPUT" \
             --recommended 'System Integrity Protection status: enabled.' \
             --cis 'CIS 10.5' --nist 'SI-7, SC-28' --mitre 'T1553.006' --iso27001 'A.8.24' --nis2 'Art.21(2)(d)' \
-            --nsa 'NSA/CISA macOS Hardening Guidance' --cis-macos 'CIS-macOS 5.1.1' --mscp 'os_sip_enable' \
+            --nsa 'NSA/CISA macOS Hardening Guidance' --cis-macos 'CIS-macOS 5.1.2' --mscp 'os_sip_enable' \
             --recommendation 'Re-enable SIP: boot into Recovery (Apple Silicon: hold the power button; Intel: Cmd+R) and run "csrutil enable" from Terminal, then reboot.'
     elif [[ "$ROOT_CMD_OUTPUT" == *"enabled"* ]]; then
         add_audit_result --category 'SIP & Kernel Security' --control 'System Integrity Protection (SIP)' \
             --status PASS --severity Critical --current "$ROOT_CMD_OUTPUT" \
             --recommended 'System Integrity Protection status: enabled.' \
             --cis 'CIS 10.5' --nist 'SI-7, SC-28' --mitre 'T1553.006' --iso27001 'A.8.24' --nis2 'Art.21(2)(d)' \
-            --nsa 'NSA/CISA macOS Hardening Guidance' --cis-macos 'CIS-macOS 5.1.1' --mscp 'os_sip_enable' \
+            --nsa 'NSA/CISA macOS Hardening Guidance' --cis-macos 'CIS-macOS 5.1.2' --mscp 'os_sip_enable' \
             --recommendation 'No action required.'
     else
         add_audit_result --category 'SIP & Kernel Security' --control 'System Integrity Protection (SIP)' \
             --status WARN --severity Low --current "Query failed or unrecognized output: $ROOT_CMD_OUTPUT" \
             --recommended 'System Integrity Protection status: enabled.' \
-            --cis 'CIS 10.5' --nist 'SI-7, SC-28' --cis-macos 'CIS-macOS 5.1.1' --mscp 'os_sip_enable' \
+            --cis 'CIS 10.5' --nist 'SI-7, SC-28' --cis-macos 'CIS-macOS 5.1.2' --mscp 'os_sip_enable' \
             --recommendation 'Unable to determine SIP status via csrutil; verify manually with "csrutil status" in Terminal.'
     fi
 }
@@ -645,7 +738,7 @@ check_sip_custom_configuration() {
         add_audit_result --category 'SIP & Kernel Security' --control 'SIP Custom Configuration (Partial Disable)' \
             --status WARN --severity Low --current "csrutil query failed: $ROOT_CMD_OUTPUT" \
             --recommended 'No custom SIP exceptions; full default protection set' \
-            --cis-macos 'CIS-macOS 5.1.1' --mscp 'os_sip_enable' \
+            --cis-macos 'CIS-macOS 5.1.2' --mscp 'os_sip_enable' \
             --recommendation 'Unable to query SIP configuration; verify manually with "csrutil status" in Terminal.'
     elif [[ "$ROOT_CMD_OUTPUT" == *"Custom Configuration"* ]]; then
         local disabled_items
@@ -655,13 +748,13 @@ check_sip_custom_configuration() {
             --status WARN --severity High --current "$disabled_items" \
             --recommended 'No custom SIP exceptions; full default protection set' \
             --cis 'CIS 10.5' --nist 'SI-7, SC-28' --mitre 'T1553.006' --iso27001 'A.8.24' --nis2 'Art.21(2)(d)' \
-            --cis-macos 'CIS-macOS 5.1.1' --mscp 'os_sip_enable' \
+            --cis-macos 'CIS-macOS 5.1.2' --mscp 'os_sip_enable' \
             --recommendation 'A custom SIP configuration was detected, weakening specific protections. Boot into Recovery and run "csrutil clear" then "csrutil enable" to restore the full default protection set unless this is a deliberate, documented exception.'
     else
         add_audit_result --category 'SIP & Kernel Security' --control 'SIP Custom Configuration (Partial Disable)' \
             --status PASS --severity High --current 'No custom SIP configuration detected' \
             --recommended 'No custom SIP exceptions; full default protection set' \
-            --cis 'CIS 10.5' --nist 'SI-7, SC-28' --cis-macos 'CIS-macOS 5.1.1' --mscp 'os_sip_enable' \
+            --cis 'CIS 10.5' --nist 'SI-7, SC-28' --cis-macos 'CIS-macOS 5.1.2' --mscp 'os_sip_enable' \
             --recommendation 'No action required.'
     fi
 }
@@ -673,7 +766,7 @@ check_third_party_system_extensions() {
         add_audit_result --category 'SIP & Kernel Security' --control 'Third-Party System Extensions Inventory' \
             --status WARN --severity Low --current "systemextensionsctl query failed: $ROOT_CMD_OUTPUT" \
             --recommended 'Every active system extension is recognized and required' \
-            --cis-macos 'CIS-macOS 5.1' --mscp 'os_kext_signing_enforce' \
+            --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'Unable to query system extensions; verify manually with "systemextensionsctl list" in Terminal.'
         return
     fi
@@ -701,14 +794,14 @@ check_third_party_system_extensions() {
             --details "$joined" \
             --recommended 'Every active system extension is recognized and required' \
             --cis 'CIS 2.5' --nist 'CM-7, SI-7' --mitre 'T1547 (Boot or Logon Autostart Execution)' --iso27001 'A.8.19' \
-            --cis-macos 'CIS-macOS 5.1' --mscp 'os_kext_signing_enforce' \
+            --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'Review "systemextensionsctl list" output and confirm each non-Apple system extension is recognized, still needed, and from a trusted vendor.'
     else
         add_audit_result --category 'SIP & Kernel Security' --control 'Third-Party System Extensions Inventory' \
             --status PASS --severity Medium \
             --current "$activated_lines total active system extension(s), none non-Apple" \
             --recommended 'Every active system extension is recognized and required' \
-            --cis 'CIS 2.5' --nist 'CM-7, SI-7' --cis-macos 'CIS-macOS 5.1' --mscp 'os_kext_signing_enforce' \
+            --cis 'CIS 2.5' --nist 'CM-7, SI-7' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'No action required.'
     fi
 }
@@ -720,19 +813,19 @@ check_nvram_csr_override() {
         add_audit_result --category 'SIP & Kernel Security' --control 'NVRAM SIP Configuration Override Present' \
             --status WARN --severity Medium --current "$ROOT_CMD_OUTPUT" \
             --recommended 'No csr-active-config NVRAM variable set (default SIP configuration)' \
-            --cis 'CIS 10.5' --nist 'SI-7, SC-28' --cis-macos 'CIS-macOS 5.1.1' --mscp 'os_sip_enable' \
+            --cis 'CIS 10.5' --nist 'SI-7, SC-28' --cis-macos 'CIS-macOS 5.1.2' --mscp 'os_sip_enable' \
             --recommendation 'An explicit SIP configuration override is stored in NVRAM. Confirm this was set deliberately; clear it with "nvram -d csr-active-config" from Recovery if not.'
     elif [[ "$ROOT_CMD_OUTPUT" == *"Error getting variable"* ]]; then
         add_audit_result --category 'SIP & Kernel Security' --control 'NVRAM SIP Configuration Override Present' \
             --status PASS --severity Medium --current 'No csr-active-config NVRAM variable set' \
             --recommended 'No csr-active-config NVRAM variable set (default SIP configuration)' \
-            --cis 'CIS 10.5' --nist 'SI-7, SC-28' --cis-macos 'CIS-macOS 5.1.1' --mscp 'os_sip_enable' \
+            --cis 'CIS 10.5' --nist 'SI-7, SC-28' --cis-macos 'CIS-macOS 5.1.2' --mscp 'os_sip_enable' \
             --recommendation 'No action required.'
     else
         add_audit_result --category 'SIP & Kernel Security' --control 'NVRAM SIP Configuration Override Present' \
             --status WARN --severity Low --current "nvram query failed: $ROOT_CMD_OUTPUT" \
             --recommended 'No csr-active-config NVRAM variable set (default SIP configuration)' \
-            --cis-macos 'CIS-macOS 5.1.1' --mscp 'os_sip_enable' \
+            --cis-macos 'CIS-macOS 5.1.2' --mscp 'os_sip_enable' \
             --recommendation 'Unable to query NVRAM SIP override state; verify manually with "nvram csr-active-config" in Terminal.'
     fi
 }
@@ -750,20 +843,20 @@ check_filevault_status() {
             --status PASS --severity Critical --current "$ROOT_CMD_OUTPUT" --recommended 'FileVault is On.' \
             --cis 'CIS 3.11' --nist 'SC-28' --mitre 'T1486 (Data Encrypted for Impact — inverse control)' \
             --iso27001 'A.8.24' --nis2 'Art.21(2)(h)' --nsa 'NSA/CISA Data-at-Rest Encryption Guidance' \
-            --cis-macos 'CIS-macOS 3.1' --mscp 'os_filevault_enable' \
+            --cis-macos 'CIS-macOS 2.6.6' --mscp 'system_settings_filevault_enforce' \
             --recommendation 'No action required.'
     elif [[ "$ROOT_CMD_OUTPUT" == *"FileVault is Off."* ]]; then
         add_audit_result --category 'Volume Encryption & Data-at-Rest (FileVault)' --control 'FileVault Status' \
             --status FAIL --severity Critical --current "$ROOT_CMD_OUTPUT" --recommended 'FileVault is On.' \
             --cis 'CIS 3.11' --nist 'SC-28' --mitre 'T1486 (Data Encrypted for Impact — inverse control)' \
             --iso27001 'A.8.24' --nis2 'Art.21(2)(h)' --nsa 'NSA/CISA Data-at-Rest Encryption Guidance' \
-            --cis-macos 'CIS-macOS 3.1' --mscp 'os_filevault_enable' \
+            --cis-macos 'CIS-macOS 2.6.6' --mscp 'system_settings_filevault_enforce' \
             --recommendation 'Enable FileVault via System Settings > Privacy & Security > FileVault, or run "sudo fdesetup enable" from Terminal.'
     else
         add_audit_result --category 'Volume Encryption & Data-at-Rest (FileVault)' --control 'FileVault Status' \
             --status WARN --severity Low --current "Query failed or unrecognized output: $ROOT_CMD_OUTPUT" \
             --recommended 'FileVault is On.' \
-            --cis 'CIS 3.11' --nist 'SC-28' --cis-macos 'CIS-macOS 3.1' --mscp 'os_filevault_enable' \
+            --cis 'CIS 3.11' --nist 'SC-28' --cis-macos 'CIS-macOS 2.6.6' --mscp 'system_settings_filevault_enforce' \
             --recommendation 'Unable to determine FileVault status via fdesetup; verify manually with "fdesetup status" in Terminal.'
     fi
 }
@@ -778,7 +871,7 @@ check_filevault_deferred_enablement() {
             --recommended 'No deferred enablement pending' \
             --cis 'CIS 3.11' --nist 'SC-28' --mitre 'T1486 (Data Encrypted for Impact — inverse control)' \
             --iso27001 'A.8.24' --nis2 'Art.21(2)(h)' --nsa 'NSA/CISA Data-at-Rest Encryption Guidance' \
-            --cis-macos 'CIS-macOS 3.1' --mscp 'os_filevault_enable, os_filevault_autologin_disable' \
+            --cis-macos 'CIS-macOS 2.6.6' --mscp 'system_settings_filevault_enforce, os_filevault_autologin_disable' \
             --recommendation 'Have the affected user log out and back in to complete FileVault encryption; deferred enablement leaves the volume unencrypted until then.'
     elif [[ "$ROOT_CMD_STATUS" -eq 0 ]]; then
         # Absence-of-bad-signal branch: only reachable once we know the
@@ -792,14 +885,14 @@ check_filevault_deferred_enablement() {
             --recommended 'No deferred enablement pending' \
             --cis 'CIS 3.11' --nist 'SC-28' --mitre 'T1486 (Data Encrypted for Impact — inverse control)' \
             --iso27001 'A.8.24' --nis2 'Art.21(2)(h)' --nsa 'NSA/CISA Data-at-Rest Encryption Guidance' \
-            --cis-macos 'CIS-macOS 3.1' --mscp 'os_filevault_enable, os_filevault_autologin_disable' \
+            --cis-macos 'CIS-macOS 2.6.6' --mscp 'system_settings_filevault_enforce, os_filevault_autologin_disable' \
             --recommendation 'No action required.'
     else
         add_audit_result --category 'Volume Encryption & Data-at-Rest (FileVault)' \
             --control 'FileVault Deferred Enablement Pending' \
             --status WARN --severity Low --current "fdesetup query failed: $ROOT_CMD_OUTPUT" \
             --recommended 'No deferred enablement pending' \
-            --cis-macos 'CIS-macOS 3.1' --mscp 'os_filevault_enable, os_filevault_autologin_disable' \
+            --cis-macos 'CIS-macOS 2.6.6' --mscp 'system_settings_filevault_enforce, os_filevault_autologin_disable' \
             --recommendation 'Unable to determine FileVault deferred enablement state; verify manually with "fdesetup status" in Terminal.'
     fi
 }
@@ -815,7 +908,7 @@ check_filevault_enabled_user_count() {
         add_audit_result --category 'Volume Encryption & Data-at-Rest (FileVault)' \
             --control 'FileVault-Authorized User Count' \
             --status WARN --severity Low --current "fdesetup list query failed: $ROOT_CMD_OUTPUT" \
-            --recommended 'N/A' --cis-macos 'CIS-macOS 3.1' --mscp 'N/A' \
+            --recommended 'N/A' --cis-macos 'CIS-macOS 2.6.6' --mscp 'N/A' \
             --recommendation 'Unable to query FileVault-authorized users; verify manually with "sudo fdesetup list" in Terminal.'
         return
     fi
@@ -837,7 +930,7 @@ check_filevault_enabled_user_count() {
         --control 'FileVault-Authorized User Count' \
         --status INFO --severity Informational \
         --current "${#users[@]} user(s) authorized to unlock FileVault" --details "$joined" --recommended 'N/A' \
-        --cis-macos 'CIS-macOS 3.1' --mscp 'N/A' \
+        --cis-macos 'CIS-macOS 2.6.6' --mscp 'N/A' \
         --recommendation 'Informational only. Confirm this list matches expected FileVault-authorized users.'
 }
 
@@ -857,14 +950,14 @@ check_filevault_recovery_key_escrow() {
             --control 'FileVault Recovery Key Escrow' \
             --status INFO --severity Informational \
             --current 'A personal recovery key (FileVaultPRK.dat) is present locally, pending escrow' \
-            --recommended 'N/A' --cis-macos 'CIS-macOS 3.1' --mscp 'N/A' \
+            --recommended 'N/A' --cis-macos 'CIS-macOS 2.6.6' --mscp 'N/A' \
             --recommendation 'Confirm this recovery key completes escrow to your MDM/institutional record; do not rely on it remaining only on this device.'
     else
         add_audit_result --category 'Volume Encryption & Data-at-Rest (FileVault)' \
             --control 'FileVault Recovery Key Escrow' \
             --status INFO --severity Informational \
             --current 'No pending local personal recovery key file found; escrow status cannot be reliably determined from the command line' \
-            --recommended 'N/A' --cis-macos 'CIS-macOS 3.1' --mscp 'N/A' \
+            --recommended 'N/A' --cis-macos 'CIS-macOS 2.6.6' --mscp 'N/A' \
             --recommendation 'Informational only. Confirm recovery-key escrow status manually via your MDM console.'
     fi
 }
@@ -884,7 +977,7 @@ check_gatekeeper_status() {
             --recommended 'assessments enabled' \
             --cis 'CIS 2.5' --nist 'CM-7, SI-7' --mitre 'T1553.001 (Gatekeeper Bypass)' --iso27001 'A.8.19' \
             --nis2 'Art.21(2)(d)' --nsa 'NSA/CISA macOS Hardening Guidance' \
-            --cis-macos 'CIS-macOS 5.1.4' --mscp 'os_gatekeeper_enable' \
+            --cis-macos 'CIS-macOS 2.6.5' --mscp 'os_gatekeeper_enable' \
             --recommendation 'No action required.'
     elif [[ "$ROOT_CMD_OUTPUT" == *"assessments disabled"* ]]; then
         add_audit_result --category 'Gatekeeper, Notarization & Application Control' \
@@ -893,7 +986,7 @@ check_gatekeeper_status() {
             --recommended 'assessments enabled' \
             --cis 'CIS 2.5' --nist 'CM-7, SI-7' --mitre 'T1553.001 (Gatekeeper Bypass)' --iso27001 'A.8.19' \
             --nis2 'Art.21(2)(d)' --nsa 'NSA/CISA macOS Hardening Guidance' \
-            --cis-macos 'CIS-macOS 5.1.4' --mscp 'os_gatekeeper_enable' \
+            --cis-macos 'CIS-macOS 2.6.5' --mscp 'os_gatekeeper_enable' \
             --recommendation 'Re-enable Gatekeeper: run "sudo spctl --master-enable" in Terminal, or enable it via System Settings > Privacy & Security > Security ("App Store and identified developers").'
     else
         # Fault isolation: PASS above is only reached on an explicit
@@ -905,7 +998,7 @@ check_gatekeeper_status() {
             --control 'Gatekeeper Status' \
             --status WARN --severity Low --current "Query failed or unrecognized output: $ROOT_CMD_OUTPUT" \
             --recommended 'assessments enabled' \
-            --cis 'CIS 2.5' --nist 'CM-7, SI-7' --cis-macos 'CIS-macOS 5.1.4' --mscp 'os_gatekeeper_enable' \
+            --cis 'CIS 2.5' --nist 'CM-7, SI-7' --cis-macos 'CIS-macOS 2.6.5' --mscp 'os_gatekeeper_enable' \
             --recommendation 'Unable to determine Gatekeeper status via spctl; verify manually with "spctl --status" in Terminal.'
     fi
 }
@@ -921,7 +1014,7 @@ check_quarantine_enforcement_telemetry() {
             --control 'Quarantine Enforcement Telemetry' \
             --status WARN --severity Low --current 'No console user detected' \
             --recommended 'N/A' \
-            --cis-macos 'CIS-macOS 5.1.4' --mscp 'N/A' \
+            --cis-macos 'CIS-macOS 2.6.5' --mscp 'N/A' \
             --recommendation 'Re-run interactively at a console login session to evaluate quarantine event telemetry.'
         return
     fi
@@ -938,7 +1031,7 @@ check_quarantine_enforcement_telemetry() {
         --control 'Quarantine Enforcement Telemetry' \
         --status INFO --severity Informational \
         --current "$count quarantine event(s) recorded" --recommended 'N/A' \
-        --cis-macos 'CIS-macOS 5.1.4' --mscp 'N/A' \
+        --cis-macos 'CIS-macOS 2.6.5' --mscp 'N/A' \
         --recommendation 'Informational only. Gatekeeper/quarantine records one event each time it evaluates a downloaded file; a nonzero count confirms the quarantine mechanism is actively logging.'
 }
 
@@ -975,7 +1068,7 @@ _gatekeeper_scan_apps_dir() {
         --current "$flagged/$total installed application(s) still carry the quarantine attribute" \
         --details "$joined" \
         --recommended 'N/A' \
-        --cis-macos 'CIS-macOS 5.1.4' --mscp 'N/A' \
+        --cis-macos 'CIS-macOS 2.6.5' --mscp 'N/A' \
         --recommendation 'Informational only. Quarantine flags are commonly cleared on first launch; use this as an inventory baseline, not a pass/fail signal.'
 }
 
@@ -1001,8 +1094,8 @@ _bundle_freshness_check() {
 
     local mscp_id
     case "$control_name" in
-        'XProtect Update Freshness') mscp_id='os_xprotect_update' ;;
-        'MRT Update Freshness') mscp_id='os_mrt_update' ;;
+        'XProtect Update Freshness') mscp_id='N/A' ;;
+        'MRT Update Freshness') mscp_id='N/A' ;;
         *) mscp_id='N/A' ;;
     esac
 
@@ -1013,7 +1106,7 @@ _bundle_freshness_check() {
             --status WARN --severity Medium --current "${bundle_label} bundle not found at expected path" \
             --recommended 'Definitions updated within the last 30 days' \
             --cis 'CIS 7.2' --nist 'SI-3' --mitre 'T1204 (User Execution)' --iso27001 'A.8.7' \
-            --nis2 'Art.21(2)(d)' --nsa 'NSA/CISA Malware Defense Guidance' --cis-macos 'CIS-macOS 1.3' \
+            --nis2 'Art.21(2)(d)' --nsa 'NSA/CISA Malware Defense Guidance' --cis-macos "$( [[ "$control_name" == XProtect* ]] && print 'CIS-macOS 5.10' || print 'N/A')" \
             --mscp "$mscp_id" \
             --recommendation 'Run Software Update, or check "softwareupdate --background-critical", to fetch the latest malware definitions.'
         return
@@ -1033,7 +1126,7 @@ _bundle_freshness_check() {
             --status PASS --severity Medium --current "Version=$version, last updated $age_days day(s) ago" \
             --recommended 'Definitions updated within the last 30 days' \
             --cis 'CIS 7.2' --nist 'SI-3' --mitre 'T1204 (User Execution)' --iso27001 'A.8.7' \
-            --nis2 'Art.21(2)(d)' --nsa 'NSA/CISA Malware Defense Guidance' --cis-macos 'CIS-macOS 1.3' \
+            --nis2 'Art.21(2)(d)' --nsa 'NSA/CISA Malware Defense Guidance' --cis-macos "$( [[ "$control_name" == XProtect* ]] && print 'CIS-macOS 5.10' || print 'N/A')" \
             --mscp "$mscp_id" \
             --recommendation 'No action required.'
     else
@@ -1041,7 +1134,7 @@ _bundle_freshness_check() {
             --status WARN --severity Medium --current "Version=$version, last updated $age_days day(s) ago" \
             --recommended 'Definitions updated within the last 30 days' \
             --cis 'CIS 7.2' --nist 'SI-3' --mitre 'T1204 (User Execution)' --iso27001 'A.8.7' \
-            --nis2 'Art.21(2)(d)' --nsa 'NSA/CISA Malware Defense Guidance' --cis-macos 'CIS-macOS 1.3' \
+            --nis2 'Art.21(2)(d)' --nsa 'NSA/CISA Malware Defense Guidance' --cis-macos "$( [[ "$control_name" == XProtect* ]] && print 'CIS-macOS 5.10' || print 'N/A')" \
             --mscp "$mscp_id" \
             --recommendation 'Run Software Update, or check "softwareupdate --background-critical", to fetch the latest malware definitions.'
     fi
@@ -1068,7 +1161,7 @@ check_third_party_edr_presence() {
         # identically to a verified "no EDR agent found" result below.
         add_audit_result --category 'Malware Defense (XProtect / MRT / EDR)' --control 'Third-Party EDR/MDE Presence' \
             --status WARN --severity Low --current "launchctl query failed: $ROOT_CMD_OUTPUT" \
-            --recommended 'N/A' --cis-macos 'CIS-macOS 1.3' --mscp 'N/A' \
+            --recommended 'N/A' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'Unable to enumerate running processes; verify manually with "launchctl list" in Terminal.'
         return
     fi
@@ -1092,14 +1185,14 @@ check_third_party_edr_presence() {
             --status INFO --severity Informational --current "EDR agent(s) detected: $joined" \
             --recommended 'N/A' \
             --cis 'CIS 7.1' --nist 'SI-3' --mitre 'T1562.001 (Disable or Modify Tools)' --iso27001 'A.8.7' \
-            --nis2 'Art.21(2)(d)' --cis-macos 'CIS-macOS 1.3' --mscp 'N/A' \
+            --nis2 'Art.21(2)(d)' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'Informational only. A recognized third-party EDR/MDE agent process is running.'
     else
         add_audit_result --category 'Malware Defense (XProtect / MRT / EDR)' --control 'Third-Party EDR/MDE Presence' \
             --status WARN --severity Medium --current 'No known third-party EDR/MDE agent process detected' \
             --recommended 'A recognized EDR/MDE agent process is running' \
             --cis 'CIS 7.1' --nist 'SI-3' --mitre 'T1562.001 (Disable or Modify Tools)' --iso27001 'A.8.7' \
-            --nis2 'Art.21(2)(d)' --cis-macos 'CIS-macOS 1.3' --mscp 'N/A' \
+            --nis2 'Art.21(2)(d)' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'Confirm whether an EDR agent is expected on this fleet tier; XProtect/MRT alone provide baseline malware defense coverage only.'
     fi
 }
@@ -1138,8 +1231,71 @@ check_endpoint_security_clients() {
     # separate per the "no duplicate/contradictory checks" principle.
     add_audit_result --category 'Malware Defense (XProtect / MRT / EDR)' --control 'Endpoint Security Framework Clients' \
         --status INFO --severity Informational --current "$count Endpoint Security framework client(s) registered" \
-        --recommended 'N/A' --cis-macos 'CIS-macOS 1.3' --mscp 'N/A' \
+        --recommended 'N/A' --cis-macos 'N/A' --mscp 'N/A' \
         --recommendation 'Informational only. This reflects Endpoint Security framework registration specifically, which is a stronger EDR-presence signal than a running-process check.'
+}
+
+# XProtect Remediator scans (run by macOS when idle) log one structured
+# result per remediator to the unified log: subsystem
+# com.apple.XProtectFramework.PluginAPI, category XPEvent.structured,
+# eventMessage {"status_code":20,"status_message":"NoThreatDetected",...}
+# (verified live). Anything other than NoThreatDetected / codes 0 and 20
+# means a remediator found or acted on something — an actual detection,
+# not a configuration state. 7-day window, prefetched in main().
+XPR_LOG_PREDICATE='subsystem == "com.apple.XProtectFramework.PluginAPI" && category == "XPEvent.structured"'
+
+xpr_log_query() {
+    "${LOG_BIN:-/usr/bin/log}" show --last 7d --style ndjson --predicate "$XPR_LOG_PREDICATE"
+}
+
+check_xprotect_remediator_results() {
+    run_prefetched xpr_log xpr_log_query
+    local -a fw
+    fw=(--recommended 'Every XProtect Remediator scan in the last 7 days reports NoThreatDetected'
+        --cis 'CIS 10.1' --nist 'SI-3, SI-4' --mitre 'T1204 (User Execution)' --iso27001 'A.8.7'
+        --nis2 'Art.21(2)(e)' --cis-macos 'CIS-macOS 5.10' --mscp 'N/A')
+
+    if [[ $ROOT_CMD_STATUS -ne 0 ]]; then
+        add_audit_result --category 'Malware Defense (XProtect / MRT / EDR)' --control 'XProtect Remediator Scan Results' \
+            --status WARN --severity Low --current "Unified log query failed: ${ROOT_CMD_OUTPUT[1,200]}" "${fw[@]}" \
+            --recommendation 'Re-run with sudo; reading XProtect Remediator results requires access to the unified log.'
+        return 0
+    fi
+
+    local line="" remediator="" message="" code="" caused=""
+    local -a detections
+    local -A seen_remediators
+    local scans=0
+    for line in "${(@f)ROOT_CMD_OUTPUT}"; do
+        [[ "$line" == *XPEvent.structured* ]] || continue
+        [[ "$line" =~ 'XProtectRemediator([A-Za-z0-9]+)"' ]] && remediator="${match[1]}" || remediator="unknown"
+        [[ "$line" =~ 'status_message\\":\\"([^\\]*)\\"' ]] && message="${match[1]}" || message=""
+        [[ "$line" =~ 'status_code\\":(-?[0-9]+)' ]] && code="${match[1]}" || code=""
+        scans=$((scans + 1)); seen_remediators[$remediator]=1
+        if [[ "$message" != NoThreatDetected && "$code" != 20 && "$code" != 0 ]]; then
+            caused=""
+            # caused_by paths are JSON-escaped twice in ndjson (\/ or \\/):
+            # drop every backslash and quote; macOS paths carry neither.
+            [[ "$line" =~ 'caused_by\\":\[([^]]*)\]' ]] && { caused="${match[1]//\\/}"; caused="${caused//\"/}"; }
+            [[ "$line" =~ '"timestamp":"([0-9-]+ [0-9:]+)' ]] || match=("")
+            detections+=("${match[1]:-?} $remediator: ${message:-status $code}${caused:+ (caused by: ${caused[1,200]})}")
+        fi
+    done
+
+    if [[ ${#detections[@]} -gt 0 ]]; then
+        add_audit_result --category 'Malware Defense (XProtect / MRT / EDR)' --control 'XProtect Remediator Scan Results' \
+            --status FAIL --severity Critical --current "${#detections[@]} XProtect Remediator result(s) other than NoThreatDetected" \
+            --details "${(F)detections}" "${fw[@]}" \
+            --recommendation 'Treat as a possible active infection: preserve the unified log ("log collect --last 7d") and the listed paths for forensics, then investigate the remediator family named. XProtect may already have removed the payload, but the initial access vector (download, paste-in-Terminal lure, cracked app) remains.'
+    elif [[ $scans -eq 0 ]]; then
+        add_audit_result --category 'Malware Defense (XProtect / MRT / EDR)' --control 'XProtect Remediator Scan Results' \
+            --status WARN --severity Low --current 'No XProtect Remediator scan results logged in the last 7 days' "${fw[@]}" \
+            --recommendation 'macOS runs XProtect Remediator scans in the background when the Mac is idle (and on power). If none ran in a week, confirm XProtect is current and the Mac is not always asleep or busy.'
+    else
+        add_audit_result --category 'Malware Defense (XProtect / MRT / EDR)' --control 'XProtect Remediator Scan Results' \
+            --status PASS --severity Critical --current "$scans scan result(s) from ${#seen_remediators} remediator(s) in 7 days, no threats detected" \
+            --details "${(F)${(@ko)seen_remediators}}" "${fw[@]}" --recommendation 'No action required.'
+    fi
 }
 
 # ---- 15-tcc-privacy.zsh ----
@@ -1199,7 +1355,7 @@ _tcc_report_service_grant() {
                 --current 'Unable to query TCC database — authorization denied' \
                 --recommended 'N/A' \
                 --cis 'CIS 3.3' --nist 'AC-6' --mitre 'T1005 (Data from Local System)' --iso27001 'A.8.3' \
-                --nis2 'Art.21(2)(i)' --cis-macos 'CIS-macOS 5.1.3' --mscp 'N/A' \
+                --nis2 'Art.21(2)(i)' --cis-macos "$( [[ "$control" == 'Full Disk Access Grants' ]] && print 'CIS-macOS 2.6.2.1' || print 'N/A')" --mscp 'N/A' \
                 --recommendation 'Grant Full Disk Access to the terminal application (or shell) used to run this script in System Settings > Privacy & Security > Full Disk Access, then re-run.'
             ;;
         QUERY_ERROR:*)
@@ -1208,7 +1364,7 @@ _tcc_report_service_grant() {
                 --current "TCC database query failed: ${result#QUERY_ERROR:}" \
                 --recommended 'N/A' \
                 --cis 'CIS 3.3' --nist 'AC-6' --mitre 'T1005 (Data from Local System)' --iso27001 'A.8.3' \
-                --nis2 'Art.21(2)(i)' --cis-macos 'CIS-macOS 5.1.3' --mscp 'N/A' \
+                --nis2 'Art.21(2)(i)' --cis-macos "$( [[ "$control" == 'Full Disk Access Grants' ]] && print 'CIS-macOS 2.6.2.1' || print 'N/A')" --mscp 'N/A' \
                 --recommendation 'Unable to determine grant count; verify manually by querying the TCC database as an administrator with Full Disk Access.'
             ;;
         *)
@@ -1224,7 +1380,7 @@ _tcc_report_service_grant() {
                 --status INFO --severity Informational \
                 --current "${#nonempty[@]} app(s) granted $label" --details "$joined" --recommended 'N/A' \
                 --cis 'CIS 3.3' --nist 'AC-6' --mitre 'T1005 (Data from Local System)' --iso27001 'A.8.3' \
-                --nis2 'Art.21(2)(i)' --cis-macos 'CIS-macOS 5.1.3' --mscp 'N/A' \
+                --nis2 'Art.21(2)(i)' --cis-macos "$( [[ "$control" == 'Full Disk Access Grants' ]] && print 'CIS-macOS 2.6.2.1' || print 'N/A')" --mscp 'N/A' \
                 --recommendation 'Informational only. Review the granted application list and confirm each grant is expected.'
             ;;
     esac
@@ -1278,7 +1434,7 @@ check_tcc_camera_microphone_grants() {
         --current "Camera: ${#camera_nonempty[@]} app(s); Microphone: ${#mic_nonempty[@]} app(s)" \
         --details "$details_text" --recommended 'N/A' \
         --cis 'CIS 3.3' --nist 'AC-6' --mitre 'T1005 (Data from Local System)' --iso27001 'A.8.3' \
-        --nis2 'Art.21(2)(i)' --cis-macos 'CIS-macOS 5.1.3' --mscp 'N/A' \
+        --nis2 'Art.21(2)(i)' --cis-macos 'N/A' --mscp 'N/A' \
         --recommendation 'Informational only. Review the granted application list and confirm each grant is expected.'
 }
 
@@ -1292,7 +1448,7 @@ _tcc_report_camera_mic_failure() {
             --current 'Unable to query TCC database — authorization denied' \
             --recommended 'N/A' \
             --cis 'CIS 3.3' --nist 'AC-6' --mitre 'T1005 (Data from Local System)' --iso27001 'A.8.3' \
-            --nis2 'Art.21(2)(i)' --cis-macos 'CIS-macOS 5.1.3' --mscp 'N/A' \
+            --nis2 'Art.21(2)(i)' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'Grant Full Disk Access to the terminal application (or shell) used to run this script in System Settings > Privacy & Security > Full Disk Access, then re-run.'
     else
         add_audit_result --category 'TCC & Privacy Controls' --control 'Camera & Microphone Grants' \
@@ -1300,7 +1456,7 @@ _tcc_report_camera_mic_failure() {
             --current "TCC database query failed: ${result#QUERY_ERROR:}" \
             --recommended 'N/A' \
             --cis 'CIS 3.3' --nist 'AC-6' --mitre 'T1005 (Data from Local System)' --iso27001 'A.8.3' \
-            --nis2 'Art.21(2)(i)' --cis-macos 'CIS-macOS 5.1.3' --mscp 'N/A' \
+            --nis2 'Art.21(2)(i)' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'Unable to determine grant count; verify manually by querying the TCC database as an administrator with Full Disk Access.'
     fi
 }
@@ -1320,7 +1476,7 @@ check_tcc_database_permissions() {
             --status WARN --severity Low \
             --current "Query failed or unrecognized output: $ROOT_CMD_OUTPUT" \
             --recommended 'root:wheel (or root:_tcc), no group/other write bit' \
-            --cis 'CIS 3.3' --nist 'AC-6, SI-7' --cis-macos 'CIS-macOS 5.1.3' --mscp 'N/A' \
+            --cis 'CIS 3.3' --nist 'AC-6, SI-7' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'Unable to verify TCC database file permissions; check manually with "stat -f \"%Su:%Sg %Lp\" \"/Library/Application Support/com.apple.TCC/TCC.db\"".'
         return
     fi
@@ -1342,7 +1498,7 @@ check_tcc_database_permissions() {
             --current "$owner_group $mode" \
             --recommended 'root:wheel (or root:_tcc), no group/other write bit' \
             --cis 'CIS 3.3' --nist 'AC-6, SI-7' --mitre 'T1548.006 (TCC Manipulation)' --iso27001 'A.8.3' \
-            --nis2 'Art.21(2)(d)' --nsa 'NSA/CISA macOS Hardening Guidance' --cis-macos 'CIS-macOS 5.1.3' --mscp 'N/A' \
+            --nis2 'Art.21(2)(d)' --nsa 'NSA/CISA macOS Hardening Guidance' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'This indicates SIP is compromised or the TCC database was tampered with outside Apple'"'"'s normal management path; treat as a possible active-compromise indicator and investigate before remediating.'
     else
         add_audit_result --category 'TCC & Privacy Controls' --control 'TCC Database File Permissions' \
@@ -1350,7 +1506,7 @@ check_tcc_database_permissions() {
             --current "$owner_group $mode" \
             --recommended 'root:wheel (or root:_tcc), no group/other write bit' \
             --cis 'CIS 3.3' --nist 'AC-6, SI-7' --mitre 'T1548.006 (TCC Manipulation)' --iso27001 'A.8.3' \
-            --nis2 'Art.21(2)(d)' --nsa 'NSA/CISA macOS Hardening Guidance' --cis-macos 'CIS-macOS 5.1.3' --mscp 'N/A' \
+            --nis2 'Art.21(2)(d)' --nsa 'NSA/CISA macOS Hardening Guidance' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'No action required.'
     fi
 }
@@ -1407,7 +1563,7 @@ check_root_account_disabled() {
             --control 'Root Account Disabled' \
             --status WARN --severity Low --current "dscl query failed: $ROOT_CMD_OUTPUT" \
             --recommended 'Password: *' \
-            --cis 'CIS 5.4' --nist 'AC-6, IA-2' --cis-macos 'CIS-macOS 6.1' --mscp 'os_root_disable' \
+            --cis 'CIS 5.4' --nist 'AC-6, IA-2' --cis-macos 'CIS-macOS 5.6' --mscp 'os_root_disable' \
             --recommendation 'Unable to determine root account status; verify manually with "dscl . -read /Users/root Password".'
     elif [[ "$ROOT_CMD_OUTPUT" == *"Password: *"* ]]; then
         add_audit_result --category 'Identity, Accounts & Privilege Management' \
@@ -1415,7 +1571,7 @@ check_root_account_disabled() {
             --status PASS --severity Critical --current "$ROOT_CMD_OUTPUT" \
             --recommended 'Password: *' \
             --cis 'CIS 5.4' --nist 'AC-6, IA-2' --mitre 'T1078.001 (Default Accounts)' --iso27001 'A.8.2' \
-            --nis2 'Art.21(2)(i)' --nsa 'NSA/CISA macOS Hardening Guidance' --cis-macos 'CIS-macOS 6.1' --mscp 'os_root_disable' \
+            --nis2 'Art.21(2)(i)' --nsa 'NSA/CISA macOS Hardening Guidance' --cis-macos 'CIS-macOS 5.6' --mscp 'os_root_disable' \
             --recommendation 'No action required.'
     else
         add_audit_result --category 'Identity, Accounts & Privilege Management' \
@@ -1423,7 +1579,7 @@ check_root_account_disabled() {
             --status FAIL --severity Critical --current "$ROOT_CMD_OUTPUT" \
             --recommended 'Password: *' \
             --cis 'CIS 5.4' --nist 'AC-6, IA-2' --mitre 'T1078.001 (Default Accounts)' --iso27001 'A.8.2' \
-            --nis2 'Art.21(2)(i)' --nsa 'NSA/CISA macOS Hardening Guidance' --cis-macos 'CIS-macOS 6.1' --mscp 'os_root_disable' \
+            --nis2 'Art.21(2)(i)' --nsa 'NSA/CISA macOS Hardening Guidance' --cis-macos 'CIS-macOS 5.6' --mscp 'os_root_disable' \
             --recommendation 'Disable the root account: use Directory Utility ("Disable Root User") or run "sudo dsenableroot -d" — resetting the root password with "dscl . -passwd" is not sufficient.'
     fi
 }
@@ -1438,7 +1594,7 @@ check_guest_account_disabled() {
             --status FAIL --severity High --current 'GuestEnabled=1' \
             --recommended 'GuestEnabled=0' \
             --cis 'CIS 5.4' --nist 'AC-6, IA-2' --mitre 'T1078.001 (Default Accounts)' --iso27001 'A.8.2' \
-            --nis2 'Art.21(2)(i)' --cis-macos 'CIS-macOS 6.2' --mscp 'os_guest_account_disable' \
+            --nis2 'Art.21(2)(i)' --cis-macos 'CIS-macOS 2.13.1' --mscp 'system_settings_guest_account_disable' \
             --recommendation 'Disable the Guest account: System Settings > Users & Groups > Guest User, or "sudo defaults write /Library/Preferences/com.apple.loginwindow GuestEnabled -bool false".'
     else
         add_audit_result --category 'Identity, Accounts & Privilege Management' \
@@ -1446,7 +1602,7 @@ check_guest_account_disabled() {
             --status PASS --severity High --current "GuestEnabled=$guest_enabled" \
             --recommended 'GuestEnabled=0' \
             --cis 'CIS 5.4' --nist 'AC-6, IA-2' --mitre 'T1078.001 (Default Accounts)' --iso27001 'A.8.2' \
-            --nis2 'Art.21(2)(i)' --cis-macos 'CIS-macOS 6.2' --mscp 'os_guest_account_disable' \
+            --nis2 'Art.21(2)(i)' --cis-macos 'CIS-macOS 2.13.1' --mscp 'system_settings_guest_account_disable' \
             --recommendation 'No action required.'
     fi
 }
@@ -1460,7 +1616,7 @@ check_admin_group_membership_inventory() {
         add_audit_result --category 'Identity, Accounts & Privilege Management' \
             --control 'Admin Group Membership Inventory' \
             --status WARN --severity Low --current "dscl query failed: $ROOT_CMD_OUTPUT" \
-            --recommended 'N/A' --cis-macos 'CIS-macOS 6.3' --mscp 'N/A' \
+            --recommended 'N/A' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'Unable to enumerate admin group membership; verify manually with "dscl . -read /Groups/admin GroupMembership".'
         return
     fi
@@ -1477,7 +1633,7 @@ check_admin_group_membership_inventory() {
         --control 'Admin Group Membership Inventory' \
         --status INFO --severity Informational \
         --current "$count member(s)" --details "$joined" --recommended 'N/A' \
-        --cis 'CIS 5.1' --nist 'AC-6' --iso27001 'A.8.2' --cis-macos 'CIS-macOS 6.3' --mscp 'N/A' \
+        --cis 'CIS 5.1' --nist 'AC-6' --iso27001 'A.8.2' --cis-macos 'N/A' --mscp 'N/A' \
         --recommendation 'Informational only. Confirm the admin roster matches the expected list of privileged users.'
 }
 
@@ -1508,7 +1664,7 @@ check_password_policy_configured() {
             --status INFO --severity Informational \
             --current "${#unique_rules[@]} password content rule(s) configured" --details "$joined" --recommended 'N/A' \
             --cis 'CIS 5.2' --nist 'IA-5' --mitre 'T1110 (Brute Force)' --iso27001 'A.8.5' \
-            --nis2 'Art.21(2)(i)' --cis-macos 'CIS-macOS 6.4' --mscp 'os_policy_banner_loginwindow_enforce' \
+            --nis2 'Art.21(2)(i)' --cis-macos 'CIS-macOS 5.2' --mscp 'os_policy_banner_loginwindow_enforce' \
             --recommendation 'Informational only. Review the policy content matches organizational requirements.'
     else
         add_audit_result --category 'Identity, Accounts & Privilege Management' \
@@ -1517,7 +1673,7 @@ check_password_policy_configured() {
             --current 'No explicit password content policy configured' \
             --recommended 'A password content policy is configured' \
             --cis 'CIS 5.2' --nist 'IA-5' --mitre 'T1110 (Brute Force)' --iso27001 'A.8.5' \
-            --nis2 'Art.21(2)(i)' --cis-macos 'CIS-macOS 6.4' --mscp 'os_policy_banner_loginwindow_enforce' \
+            --nis2 'Art.21(2)(i)' --cis-macos 'CIS-macOS 5.2' --mscp 'os_policy_banner_loginwindow_enforce' \
             --recommendation 'Configure a password content policy via "pwpolicy", or deploy one through an MDM Passcode payload.'
     fi
 }
@@ -1911,14 +2067,14 @@ check_firewall_state() {
             --status PASS --severity High --current "$ROOT_CMD_OUTPUT" \
             --recommended 'Firewall enabled' \
             --cis 'CIS 4.1' --nist 'SC-7' --mitre 'T1562.004 (Disable or Modify System Firewall)' --iso27001 'A.8.20' \
-            --nis2 'Art.21(2)(d)' --nsa 'NSA/CISA macOS Hardening Guidance' --cis-macos 'CIS-macOS 2.4.1' --mscp 'os_firewall_enable' \
+            --nis2 'Art.21(2)(d)' --nsa 'NSA/CISA macOS Hardening Guidance' --cis-macos 'CIS-macOS 2.2.1' --mscp 'system_settings_firewall_enable' \
             --recommendation 'No action required.'
     elif [[ "$ROOT_CMD_OUTPUT" == *"disabled"* ]]; then
         add_audit_result --category 'Network Firewall & Packet Filtering' --control 'Firewall State' \
             --status FAIL --severity High --current "$ROOT_CMD_OUTPUT" \
             --recommended 'Firewall enabled' \
             --cis 'CIS 4.1' --nist 'SC-7' --mitre 'T1562.004 (Disable or Modify System Firewall)' --iso27001 'A.8.20' \
-            --nis2 'Art.21(2)(d)' --nsa 'NSA/CISA macOS Hardening Guidance' --cis-macos 'CIS-macOS 2.4.1' --mscp 'os_firewall_enable' \
+            --nis2 'Art.21(2)(d)' --nsa 'NSA/CISA macOS Hardening Guidance' --cis-macos 'CIS-macOS 2.2.1' --mscp 'system_settings_firewall_enable' \
             --recommendation 'Enable the firewall: System Settings > Network > Firewall, or "sudo \"$SOCKETFILTERFW\" --setglobalstate on".'
     else
         # Fault isolation: a failing/unrecognized query must never be
@@ -1927,7 +2083,7 @@ check_firewall_state() {
         add_audit_result --category 'Network Firewall & Packet Filtering' --control 'Firewall State' \
             --status WARN --severity Low --current "Query failed or unrecognized output: $ROOT_CMD_OUTPUT" \
             --recommended 'Firewall enabled' \
-            --cis 'CIS 4.1' --nist 'SC-7' --cis-macos 'CIS-macOS 2.4.1' --mscp 'os_firewall_enable' \
+            --cis 'CIS 4.1' --nist 'SC-7' --cis-macos 'CIS-macOS 2.2.1' --mscp 'system_settings_firewall_enable' \
             --recommendation 'Unable to determine firewall state; verify manually with "socketfilterfw --getglobalstate".'
     fi
 }
@@ -1940,14 +2096,14 @@ check_firewall_stealth_mode() {
             --status PASS --severity Medium --current "$ROOT_CMD_OUTPUT" \
             --recommended 'Stealth mode enabled' \
             --cis 'CIS 4.1' --nist 'SC-7' --mitre 'T1046 (Network Service Discovery)' --iso27001 'A.8.20' \
-            --nis2 'Art.21(2)(d)' --cis-macos 'CIS-macOS 2.4.2' --mscp 'os_firewall_stealth_mode_enable' \
+            --nis2 'Art.21(2)(d)' --cis-macos 'CIS-macOS 2.2.2' --mscp 'system_settings_firewall_stealth_mode_enable' \
             --recommendation 'No action required.'
     elif [[ "$ROOT_CMD_OUTPUT" == *"disabled"* ]]; then
         add_audit_result --category 'Network Firewall & Packet Filtering' --control 'Firewall Stealth Mode' \
             --status WARN --severity Medium --current "$ROOT_CMD_OUTPUT" \
             --recommended 'Stealth mode enabled' \
             --cis 'CIS 4.1' --nist 'SC-7' --mitre 'T1046 (Network Service Discovery)' --iso27001 'A.8.20' \
-            --nis2 'Art.21(2)(d)' --cis-macos 'CIS-macOS 2.4.2' --mscp 'os_firewall_stealth_mode_enable' \
+            --nis2 'Art.21(2)(d)' --cis-macos 'CIS-macOS 2.2.2' --mscp 'system_settings_firewall_stealth_mode_enable' \
             --recommendation 'Enable stealth mode: "sudo \"$SOCKETFILTERFW\" --setstealthmode on".'
     else
         # Fault isolation: a failing/unrecognized query is a distinct,
@@ -1955,7 +2111,7 @@ check_firewall_stealth_mode() {
         add_audit_result --category 'Network Firewall & Packet Filtering' --control 'Firewall Stealth Mode' \
             --status WARN --severity Low --current "Query failed or unrecognized output: $ROOT_CMD_OUTPUT" \
             --recommended 'Stealth mode enabled' \
-            --cis 'CIS 4.1' --nist 'SC-7' --cis-macos 'CIS-macOS 2.4.2' --mscp 'os_firewall_stealth_mode_enable' \
+            --cis 'CIS 4.1' --nist 'SC-7' --cis-macos 'CIS-macOS 2.2.2' --mscp 'system_settings_firewall_stealth_mode_enable' \
             --recommendation 'Unable to determine stealth mode state; verify manually with "socketfilterfw --getstealthmode".'
     fi
 }
@@ -1967,7 +2123,7 @@ check_firewall_block_all_incoming() {
     # sharing use cases — environment-dependent, not a judgement.
     add_audit_result --category 'Network Firewall & Packet Filtering' --control 'Block All Incoming Connections' \
         --status INFO --severity Informational --current "$ROOT_CMD_OUTPUT" \
-        --recommended 'N/A' --cis-macos 'CIS-macOS 2.4.1' --mscp 'N/A' \
+        --recommended 'N/A' --cis-macos 'N/A' --mscp 'N/A' \
         --recommendation 'Informational only. Whether to block all incoming connections depends on whether this Mac needs to offer any sharing services.'
 }
 
@@ -1978,7 +2134,7 @@ check_firewall_signed_app_auto_allow() {
     # software is expected behavior, not a misconfiguration.
     add_audit_result --category 'Network Firewall & Packet Filtering' --control 'Signed Application Auto-Allow' \
         --status INFO --severity Informational --current "$ROOT_CMD_OUTPUT" \
-        --recommended 'N/A' --cis-macos 'CIS-macOS 2.4.1' --mscp 'N/A' \
+        --recommended 'N/A' --cis-macos 'N/A' --mscp 'N/A' \
         --recommendation 'Informational only. Auto-allowing signed built-in software is expected default behavior.'
 }
 
@@ -1996,7 +2152,7 @@ check_firewall_per_app_exceptions() {
         # reported as "0 app(s)".
         add_audit_result --category 'Network Firewall & Packet Filtering' --control 'Per-App Firewall Exceptions' \
             --status WARN --severity Low --current "Query failed or unrecognized output: $ROOT_CMD_OUTPUT" \
-            --recommended 'N/A' --cis-macos 'CIS-macOS 2.4.1' --mscp 'N/A' \
+            --recommended 'N/A' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'Unable to determine per-app firewall exceptions; verify manually with "socketfilterfw --listapps".'
         return
     fi
@@ -2029,7 +2185,7 @@ check_firewall_per_app_exceptions() {
     add_audit_result --category 'Network Firewall & Packet Filtering' --control 'Per-App Firewall Exceptions' \
         --status INFO --severity Informational --current "$count app(s) with a firewall exception configured" \
         --details "$joined" \
-        --recommended 'N/A' --cis-macos 'CIS-macOS 2.4.1' --mscp 'N/A' \
+        --recommended 'N/A' --cis-macos 'N/A' --mscp 'N/A' \
         --recommendation 'Informational only. Review the per-app exception list periodically for unrecognized or stale entries.'
 }
 
@@ -2099,14 +2255,14 @@ _launchd_service_enabled_check() {
 
     case "$control_name" in
         'Screen Sharing')
-            mitre='T1021.005 (VNC)'; cis_macos='CIS-macOS 2.5.2'
-            mscp_id='os_screen_sharing_disable'; nsa='NSA/CISA macOS Hardening Guidance' ;;
+            mitre='T1021.005 (VNC)'; cis_macos='CIS-macOS 2.3.3.1'
+            mscp_id='system_settings_screen_sharing_disable'; nsa='NSA/CISA macOS Hardening Guidance' ;;
         'Remote Management (ARD)')
-            mitre='T1021.005 (VNC)'; cis_macos='CIS-macOS 2.5.2'
-            mscp_id='os_remote_management_disable'; nsa='NSA/CISA macOS Hardening Guidance' ;;
+            mitre='T1021.005 (VNC)'; cis_macos='CIS-macOS 2.3.3.5'
+            mscp_id='system_settings_remote_management_disable'; nsa='NSA/CISA macOS Hardening Guidance' ;;
         'File Sharing (SMB)')
-            mitre='T1021.002 (SMB/Windows Admin Shares)'; cis_macos='CIS-macOS 2.5.1'
-            mscp_id='os_file_sharing_disable'; nsa='N/A' ;;
+            mitre='T1021.002 (SMB/Windows Admin Shares)'; cis_macos='CIS-macOS 2.3.3.2'
+            mscp_id='system_settings_smbd_disable'; nsa='N/A' ;;
         *)
             mitre='N/A'; cis_macos='N/A'; mscp_id='N/A'; nsa='N/A' ;;
     esac
@@ -2151,14 +2307,14 @@ check_remote_login_toggle() {
             --status WARN --severity Medium --current 'Remote Login: On' \
             --recommended 'Remote Login: Off' \
             --cis 'CIS 4.9' --nist 'AC-17' --mitre 'T1021.004 (SSH)' --iso27001 'A.8.20' \
-            --nis2 'Art.21(2)(d)' --cis-macos 'CIS-macOS 2.5.3' --mscp 'os_ssh_server_disable' \
+            --nis2 'Art.21(2)(d)' --cis-macos 'CIS-macOS 2.3.3.4' --mscp 'system_settings_ssh_disable' \
             --recommendation 'Disable via System Settings > General > Sharing > Remote Login unless SSH access is required (see the SSH Server & Client Hardening domain for hardening if it is), or "sudo systemsetup -setremotelogin off".'
     elif [[ "$ROOT_CMD_OUTPUT" == *"Off"* ]]; then
         add_audit_result --category 'Remote Access & Sharing Services' --control 'Remote Login (SSH) Toggle' \
             --status PASS --severity Medium --current 'Remote Login: Off' \
             --recommended 'Remote Login: Off' \
             --cis 'CIS 4.9' --nist 'AC-17' --mitre 'T1021.004 (SSH)' --iso27001 'A.8.20' \
-            --nis2 'Art.21(2)(d)' --cis-macos 'CIS-macOS 2.5.3' --mscp 'os_ssh_server_disable' \
+            --nis2 'Art.21(2)(d)' --cis-macos 'CIS-macOS 2.3.3.4' --mscp 'system_settings_ssh_disable' \
             --recommendation 'No action required.'
     else
         # Fault isolation: a failing/unrecognized query must never be
@@ -2166,7 +2322,7 @@ check_remote_login_toggle() {
         add_audit_result --category 'Remote Access & Sharing Services' --control 'Remote Login (SSH) Toggle' \
             --status WARN --severity Low --current "Query failed or unrecognized output: $ROOT_CMD_OUTPUT" \
             --recommended 'Remote Login: Off' \
-            --cis 'CIS 4.9' --nist 'AC-17' --cis-macos 'CIS-macOS 2.5.3' --mscp 'os_ssh_server_disable' \
+            --cis 'CIS 4.9' --nist 'AC-17' --cis-macos 'CIS-macOS 2.3.3.4' --mscp 'system_settings_ssh_disable' \
             --recommendation 'Unable to determine remote login state; verify manually with "systemsetup -getremotelogin".'
     fi
 }
@@ -2344,7 +2500,7 @@ check_sshd_password_auth() {
         add_audit_result --category 'SSH Server & Client Hardening' --control 'sshd Password Authentication' \
             --status WARN --severity Low --current 'sshd not available for query' \
             --recommended 'PasswordAuthentication no' \
-            --cis 'CIS 5.9' --nist 'IA-2, IA-5' --cis-macos 'CIS-macOS 5.9' --mscp 'os_sshd_password_authentication_disable' \
+            --cis 'CIS 5.9' --nist 'IA-2, IA-5' --cis-macos 'N/A' --mscp 'auth_ssh_password_authentication_disable' \
             --recommendation 'Unable to query sshd effective configuration; verify manually with "sshd -T".'
         return
     fi
@@ -2359,7 +2515,7 @@ check_sshd_password_auth() {
                 --status PASS --severity High --current 'PasswordAuthentication no' \
                 --recommended 'PasswordAuthentication no' \
                 --cis 'CIS 5.9' --nist 'IA-2, IA-5' --mitre 'T1110 (Brute Force)' --iso27001 'A.8.5' \
-                --nis2 'Art.21(2)(i)' --nsa 'NSA/CISA SSH Hardening Guidance' --cis-macos 'CIS-macOS 5.9' --mscp 'os_sshd_password_authentication_disable' \
+                --nis2 'Art.21(2)(i)' --nsa 'NSA/CISA SSH Hardening Guidance' --cis-macos 'N/A' --mscp 'auth_ssh_password_authentication_disable' \
                 --recommendation 'No action required.'
             ;;
         yes)
@@ -2367,14 +2523,14 @@ check_sshd_password_auth() {
                 --status WARN --severity High --current 'PasswordAuthentication yes' \
                 --recommended 'PasswordAuthentication no' \
                 --cis 'CIS 5.9' --nist 'IA-2, IA-5' --mitre 'T1110 (Brute Force)' --iso27001 'A.8.5' \
-                --nis2 'Art.21(2)(i)' --nsa 'NSA/CISA SSH Hardening Guidance' --cis-macos 'CIS-macOS 5.9' --mscp 'os_sshd_password_authentication_disable' \
+                --nis2 'Art.21(2)(i)' --nsa 'NSA/CISA SSH Hardening Guidance' --cis-macos 'N/A' --mscp 'auth_ssh_password_authentication_disable' \
                 --recommendation 'Set "PasswordAuthentication no" in /etc/ssh/sshd_config and rely on key-based authentication.'
             ;;
         *)
             add_audit_result --category 'SSH Server & Client Hardening' --control 'sshd Password Authentication' \
                 --status WARN --severity Low --current "Query failed or unrecognized output: $line" \
                 --recommended 'PasswordAuthentication no' \
-                --cis 'CIS 5.9' --nist 'IA-2, IA-5' --cis-macos 'CIS-macOS 5.9' --mscp 'os_sshd_password_authentication_disable' \
+                --cis 'CIS 5.9' --nist 'IA-2, IA-5' --cis-macos 'N/A' --mscp 'auth_ssh_password_authentication_disable' \
                 --recommendation 'Unable to determine PasswordAuthentication setting; verify manually with "sshd -T".'
             ;;
     esac
@@ -2387,7 +2543,7 @@ check_sshd_permit_root_login() {
         add_audit_result --category 'SSH Server & Client Hardening' --control 'sshd Permit Root Login' \
             --status WARN --severity Low --current 'sshd not available for query' \
             --recommended 'PermitRootLogin no' \
-            --cis 'CIS 5.9' --nist 'AC-6, IA-2' --cis-macos 'CIS-macOS 5.9' --mscp 'os_sshd_permit_root_login_disable' \
+            --cis 'CIS 5.9' --nist 'AC-6, IA-2' --cis-macos 'N/A' --mscp 'os_sshd_permit_root_login_configure' \
             --recommendation 'Unable to query sshd effective configuration; verify manually with "sshd -T".'
         return
     fi
@@ -2401,14 +2557,14 @@ check_sshd_permit_root_login() {
             --status PASS --severity High --current 'PermitRootLogin no' \
             --recommended 'PermitRootLogin no' \
             --cis 'CIS 5.9' --nist 'AC-6, IA-2' --mitre 'T1078.001 (Default Accounts)' --iso27001 'A.8.5' \
-            --nis2 'Art.21(2)(i)' --cis-macos 'CIS-macOS 5.9' --mscp 'os_sshd_permit_root_login_disable' \
+            --nis2 'Art.21(2)(i)' --cis-macos 'N/A' --mscp 'os_sshd_permit_root_login_configure' \
             --recommendation 'No action required.'
     else
         add_audit_result --category 'SSH Server & Client Hardening' --control 'sshd Permit Root Login' \
             --status FAIL --severity High --current "PermitRootLogin ${value:-unknown}" \
             --recommended 'PermitRootLogin no' \
             --cis 'CIS 5.9' --nist 'AC-6, IA-2' --mitre 'T1078.001 (Default Accounts)' --iso27001 'A.8.5' \
-            --nis2 'Art.21(2)(i)' --cis-macos 'CIS-macOS 5.9' --mscp 'os_sshd_permit_root_login_disable' \
+            --nis2 'Art.21(2)(i)' --cis-macos 'N/A' --mscp 'os_sshd_permit_root_login_configure' \
             --recommendation 'Set "PermitRootLogin no" in /etc/ssh/sshd_config.'
     fi
 }
@@ -2420,7 +2576,7 @@ check_sshd_weak_ciphers() {
         add_audit_result --category 'SSH Server & Client Hardening' --control 'sshd Weak Ciphers' \
             --status WARN --severity Low --current 'sshd not available for query' \
             --recommended 'No weak (3des-cbc/arcfour/*-cbc) ciphers configured' \
-            --cis 'CIS 5.9' --nist 'SC-13' --cis-macos 'CIS-macOS 5.9' --mscp 'os_sshd_channel_timeout_configure' \
+            --cis 'CIS 5.9' --nist 'SC-13' --cis-macos 'N/A' --mscp 'os_sshd_channel_timeout_configure' \
             --recommendation 'Unable to query sshd effective configuration; verify manually with "sshd -T".'
         return
     fi
@@ -2433,7 +2589,7 @@ check_sshd_weak_ciphers() {
             --status PASS --severity Medium --current 'No explicit Ciphers directive (Apple default ciphers apply)' \
             --recommended 'No weak (3des-cbc/arcfour/*-cbc) ciphers configured' \
             --cis 'CIS 5.9' --nist 'SC-13' --mitre 'T1040 (Network Sniffing)' --iso27001 'A.8.24' \
-            --nis2 'Art.21(2)(h)' --cis-macos 'CIS-macOS 5.9' --mscp 'os_sshd_channel_timeout_configure' \
+            --nis2 'Art.21(2)(h)' --cis-macos 'N/A' --mscp 'os_sshd_channel_timeout_configure' \
             --recommendation 'No action required.'
         return
     fi
@@ -2444,14 +2600,14 @@ check_sshd_weak_ciphers() {
             --status WARN --severity Medium --current "$line" \
             --recommended 'No weak (3des-cbc/arcfour/*-cbc) ciphers configured' \
             --cis 'CIS 5.9' --nist 'SC-13' --mitre 'T1040 (Network Sniffing)' --iso27001 'A.8.24' \
-            --nis2 'Art.21(2)(h)' --cis-macos 'CIS-macOS 5.9' --mscp 'os_sshd_channel_timeout_configure' \
+            --nis2 'Art.21(2)(h)' --cis-macos 'N/A' --mscp 'os_sshd_channel_timeout_configure' \
             --recommendation 'Restrict to AES-GCM/ChaCha20 AEAD ciphers via "Ciphers" in /etc/ssh/sshd_config.'
     else
         add_audit_result --category 'SSH Server & Client Hardening' --control 'sshd Weak Ciphers' \
             --status PASS --severity Medium --current "$line" \
             --recommended 'No weak (3des-cbc/arcfour/*-cbc) ciphers configured' \
             --cis 'CIS 5.9' --nist 'SC-13' --mitre 'T1040 (Network Sniffing)' --iso27001 'A.8.24' \
-            --nis2 'Art.21(2)(h)' --cis-macos 'CIS-macOS 5.9' --mscp 'os_sshd_channel_timeout_configure' \
+            --nis2 'Art.21(2)(h)' --cis-macos 'N/A' --mscp 'os_sshd_channel_timeout_configure' \
             --recommendation 'No action required.'
     fi
 }
@@ -2460,7 +2616,7 @@ check_ssh_client_strict_host_key_checking() {
     if [[ -z "$CONSOLE_USER" ]]; then
         add_audit_result --category 'SSH Server & Client Hardening' --control 'SSH Client Strict Host Key Checking' \
             --status WARN --severity Low --current 'No console user detected' \
-            --recommended 'N/A' --cis-macos 'CIS-macOS 5.9' --mscp 'N/A' \
+            --recommended 'N/A' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'Re-run interactively at a console login session to evaluate the SSH client configuration.'
         return
     fi
@@ -2473,7 +2629,7 @@ check_ssh_client_strict_host_key_checking() {
     if [[ $RUN_AS_USER_STATUS -ne 0 || -z "$RUN_AS_USER_OUTPUT" ]]; then
         add_audit_result --category 'SSH Server & Client Hardening' --control 'SSH Client Strict Host Key Checking' \
             --status INFO --severity Informational --current 'No ~/.ssh/config present' \
-            --recommended 'N/A' --cis-macos 'CIS-macOS 5.9' --mscp 'N/A' \
+            --recommended 'N/A' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'Informational only. No client-side SSH config overrides are in effect.'
         return
     fi
@@ -2483,14 +2639,14 @@ check_ssh_client_strict_host_key_checking() {
             --status WARN --severity Low --current 'StrictHostKeyChecking no found in ~/.ssh/config' \
             --recommended 'StrictHostKeyChecking not overridden to "no"' \
             --cis 'CIS 5.9' --nist 'SC-8' --mitre 'T1557 (Adversary-in-the-Middle)' --iso27001 'A.8.24' \
-            --nis2 'Art.21(2)(h)' --cis-macos 'CIS-macOS 5.9' --mscp 'N/A' \
+            --nis2 'Art.21(2)(h)' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'Remove or correct that override — it disables protection against host-key-spoofing MITM attacks.'
     else
         add_audit_result --category 'SSH Server & Client Hardening' --control 'SSH Client Strict Host Key Checking' \
             --status PASS --severity Low --current 'No StrictHostKeyChecking override found' \
             --recommended 'StrictHostKeyChecking not overridden to "no"' \
             --cis 'CIS 5.9' --nist 'SC-8' --mitre 'T1557 (Adversary-in-the-Middle)' --iso27001 'A.8.24' \
-            --nis2 'Art.21(2)(h)' --cis-macos 'CIS-macOS 5.9' --mscp 'N/A' \
+            --nis2 'Art.21(2)(h)' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'No action required.'
     fi
 }
@@ -2508,7 +2664,7 @@ check_system_trust_settings_overrides() {
             --status PASS --severity Medium --current 'No admin-level trust setting overrides' \
             --recommended 'No admin-level trust setting overrides' \
             --cis 'CIS 3.10' --nist 'SC-17' --mitre 'T1553.004 (Install Root Certificate)' --iso27001 'A.8.24' \
-            --nis2 'Art.21(2)(h)' --nsa 'NSA/CISA PKI Guidance' --cis-macos 'CIS-macOS 5.4' --mscp 'N/A' \
+            --nis2 'Art.21(2)(h)' --nsa 'NSA/CISA PKI Guidance' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'No action required.'
         return
     fi
@@ -2520,7 +2676,7 @@ check_system_trust_settings_overrides() {
         --status WARN --severity Medium --current "$count admin-level trust setting override(s) found" \
         --recommended 'No admin-level trust setting overrides' \
         --cis 'CIS 3.10' --nist 'SC-17' --mitre 'T1553.004 (Install Root Certificate)' --iso27001 'A.8.24' \
-        --nis2 'Art.21(2)(h)' --nsa 'NSA/CISA PKI Guidance' --cis-macos 'CIS-macOS 5.4' --mscp 'N/A' \
+        --nis2 'Art.21(2)(h)' --nsa 'NSA/CISA PKI Guidance' --cis-macos 'N/A' --mscp 'N/A' \
         --recommendation 'Review each overridden root/intermediate CA trust setting — an unexpected trusted root is a MITM risk.'
 }
 
@@ -2528,7 +2684,7 @@ check_login_keychain_lock_on_sleep() {
     if [[ -z "$CONSOLE_USER" ]]; then
         add_audit_result --category 'Cryptography & Certificate Trust' --control 'Login Keychain Lock on Sleep' \
             --status WARN --severity Low --current 'No console user detected' \
-            --recommended 'N/A' --cis-macos 'CIS-macOS 5.4' --mscp 'N/A' \
+            --recommended 'N/A' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'Re-run interactively at a console login session to evaluate the login keychain settings.'
         return
     fi
@@ -2542,7 +2698,7 @@ check_login_keychain_lock_on_sleep() {
         # identically to a verified "flag missing" WARN below.
         add_audit_result --category 'Cryptography & Certificate Trust' --control 'Login Keychain Lock on Sleep' \
             --status WARN --severity Low --current "Unable to query keychain settings: $RUN_AS_USER_OUTPUT" \
-            --recommended 'N/A' --cis-macos 'CIS-macOS 5.4' --mscp 'N/A' \
+            --recommended 'N/A' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'Unable to determine login keychain settings; verify manually with "security show-keychain-info".'
         return
     fi
@@ -2551,13 +2707,13 @@ check_login_keychain_lock_on_sleep() {
         add_audit_result --category 'Cryptography & Certificate Trust' --control 'Login Keychain Lock on Sleep' \
             --status PASS --severity Medium --current "$RUN_AS_USER_OUTPUT" \
             --recommended 'lock-on-sleep enabled' \
-            --cis 'CIS 3.10' --nist 'SC-28' --iso27001 'A.8.24' --nis2 'Art.21(2)(h)' --cis-macos 'CIS-macOS 5.4' --mscp 'N/A' \
+            --cis 'CIS 3.10' --nist 'SC-28' --iso27001 'A.8.24' --nis2 'Art.21(2)(h)' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'No action required.'
     else
         add_audit_result --category 'Cryptography & Certificate Trust' --control 'Login Keychain Lock on Sleep' \
             --status WARN --severity Medium --current "$RUN_AS_USER_OUTPUT" \
             --recommended 'lock-on-sleep enabled' \
-            --cis 'CIS 3.10' --nist 'SC-28' --iso27001 'A.8.24' --nis2 'Art.21(2)(h)' --cis-macos 'CIS-macOS 5.4' --mscp 'N/A' \
+            --cis 'CIS 3.10' --nist 'SC-28' --iso27001 'A.8.24' --nis2 'Art.21(2)(h)' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'Enable "Lock keychain when sleeping" via Keychain Access > login keychain > Edit menu > Change Settings, or "security set-keychain-settings -l login.keychain-db".'
     fi
 }
@@ -2569,7 +2725,7 @@ check_fips_validated_crypto_note() {
     add_audit_result --category 'Cryptography & Certificate Trust' --control 'FIPS-Validated Cryptography' \
         --status INFO --severity Informational \
         --current "Apple's corecrypto module holds FIPS 140-3 validation on supported macOS releases" \
-        --recommended 'N/A' --cis-macos 'CIS-macOS 5.4' --mscp 'N/A' \
+        --recommended 'N/A' --cis-macos 'N/A' --mscp 'N/A' \
         --recommendation 'Informational only. If FIPS mode is a compliance requirement, confirm the specific validation certificate covers the OS build in use via Apple'"'"'s published FIPS compliance documentation.'
 }
 
@@ -2586,14 +2742,14 @@ check_audit_subsystem_enabled() {
             --status PASS --severity Medium --current 'auditd is running' \
             --recommended 'auditd is running' \
             --cis 'CIS 8.1' --nist 'AU-2, AU-12' --mitre 'T1562.008 (Disable Cloud Logs)' --iso27001 'A.8.15' \
-            --nis2 'Art.21(2)(f)' --nsa 'NSA/CISA Logging Guidance' --cis-macos 'CIS-macOS 3.1' --mscp 'os_auditd_enabled' \
+            --nis2 'Art.21(2)(f)' --nsa 'NSA/CISA Logging Guidance' --cis-macos 'CIS-macOS 3.1' --mscp 'audit_auditd_enabled' \
             --recommendation 'No action required.'
     else
         add_audit_result --category 'Audit, Logging & Telemetry' --control 'Audit Subsystem Enabled' \
             --status FAIL --severity Medium --current 'auditd is not running' \
             --recommended 'auditd is running' \
             --cis 'CIS 8.1' --nist 'AU-2, AU-12' --mitre 'T1562.008 (Disable Cloud Logs)' --iso27001 'A.8.15' \
-            --nis2 'Art.21(2)(f)' --nsa 'NSA/CISA Logging Guidance' --cis-macos 'CIS-macOS 3.1' --mscp 'os_auditd_enabled' \
+            --nis2 'Art.21(2)(f)' --nsa 'NSA/CISA Logging Guidance' --cis-macos 'CIS-macOS 3.1' --mscp 'audit_auditd_enabled' \
             --recommendation 'Investigate why the built-in BSM audit daemon isn'"'"'t running; it should start automatically at boot — "sudo launchctl bootstrap system /System/Library/LaunchDaemons/com.apple.auditd.plist".'
     fi
 }
@@ -2608,7 +2764,7 @@ _audit_control_flags_check() {
             --status WARN --severity Medium --current 'audit_control not found' \
             --recommended 'flags line includes the aa class' \
             --cis 'CIS 8.1' --nist 'AU-2' --mitre 'T1078' --iso27001 'A.8.15' \
-            --nis2 'Art.21(2)(f)' --cis-macos 'CIS-macOS 3.1' --mscp 'os_audit_control_configure' \
+            --nis2 'Art.21(2)(f)' --cis-macos 'CIS-macOS 3.2' --mscp 'audit_flags_aa_configure' \
             --recommendation 'Restore /etc/security/audit_control from a known-good source.'
         return
     fi
@@ -2630,14 +2786,14 @@ _audit_control_flags_check() {
             --status PASS --severity Medium --current "$flags_line" \
             --recommended 'flags line includes the aa class' \
             --cis 'CIS 8.1' --nist 'AU-2' --mitre 'T1078' --iso27001 'A.8.15' \
-            --nis2 'Art.21(2)(f)' --cis-macos 'CIS-macOS 3.1' --mscp 'os_audit_control_configure' \
+            --nis2 'Art.21(2)(f)' --cis-macos 'CIS-macOS 3.2' --mscp 'audit_flags_aa_configure' \
             --recommendation 'No action required.'
     else
         add_audit_result --category 'Audit, Logging & Telemetry' --control 'Audit Control Flags' \
             --status WARN --severity Medium --current "${flags_line:-No flags line found in $ac_path}" \
             --recommended 'flags line includes the aa class' \
             --cis 'CIS 8.1' --nist 'AU-2' --mitre 'T1078' --iso27001 'A.8.15' \
-            --nis2 'Art.21(2)(f)' --cis-macos 'CIS-macOS 3.1' --mscp 'os_audit_control_configure' \
+            --nis2 'Art.21(2)(f)' --cis-macos 'CIS-macOS 3.2' --mscp 'audit_flags_aa_configure' \
             --recommendation 'Add the aa class to /etc/security/audit_control flags for authentication-event coverage.'
     fi
 }
@@ -2660,13 +2816,13 @@ _diagnostics_autosubmit_check() {
         add_audit_result --category 'Audit, Logging & Telemetry' --control 'Diagnostics Auto-Submit' \
             --status WARN --severity Low --current 'AutoSubmit=1 (diagnostic data sent to Apple)' \
             --recommended 'AutoSubmit=0' \
-            --cis 'CIS 8.11' --nist 'SI-4' --iso27001 'A.8.16' --nis2 'Art.21(2)(f)' --cis-macos 'CIS-macOS 3.4' --mscp 'os_diagnostics_reports_disable' \
+            --cis 'CIS 8.11' --nist 'SI-4' --iso27001 'A.8.16' --nis2 'Art.21(2)(f)' --cis-macos 'CIS-macOS 2.6.3.1' --mscp 'system_settings_diagnostics_reports_disable' \
             --recommendation 'Disable in System Settings > Privacy & Security > Analytics & Improvements if sending device diagnostics off-network is against policy.'
     else
         add_audit_result --category 'Audit, Logging & Telemetry' --control 'Diagnostics Auto-Submit' \
             --status PASS --severity Low --current "AutoSubmit=$autosubmit" \
             --recommended 'AutoSubmit=0' \
-            --cis 'CIS 8.11' --nist 'SI-4' --iso27001 'A.8.16' --nis2 'Art.21(2)(f)' --cis-macos 'CIS-macOS 3.4' --mscp 'os_diagnostics_reports_disable' \
+            --cis 'CIS 8.11' --nist 'SI-4' --iso27001 'A.8.16' --nis2 'Art.21(2)(f)' --cis-macos 'CIS-macOS 2.6.3.1' --mscp 'system_settings_diagnostics_reports_disable' \
             --recommendation 'No action required.'
     fi
 }
@@ -2938,7 +3094,7 @@ check_recent_update_history() {
             --status WARN --severity Medium \
             --current 'Unable to determine last update date from local history — offline check only, does not query Apple servers' \
             --recommended 'Last update within 45 days' \
-            --cis 'CIS 7.3' --nist 'SI-2' --cis-macos 'CIS-macOS 1.1' --mscp 'os_software_update_enforce' \
+            --cis 'CIS 7.3' --nist 'SI-2' --cis-macos 'CIS-macOS 1.1' --mscp 'system_settings_softwareupdate_current' \
             --recommendation 'Unable to parse local update history; verify manually with "softwareupdate --history".'
         return
     fi
@@ -2952,14 +3108,14 @@ check_recent_update_history() {
             --status PASS --severity Medium --current "Last update: $date_token ($days_since day(s) ago)" \
             --recommended 'Last update within 45 days' \
             --cis 'CIS 7.3' --nist 'SI-2' --mitre 'T1210 (Exploitation of Remote Services)' --iso27001 'A.8.8' \
-            --nis2 'Art.21(2)(e)' --nsa 'NSA/CISA Patch Management Guidance' --cis-macos 'CIS-macOS 1.1' --mscp 'os_software_update_enforce' \
+            --nis2 'Art.21(2)(e)' --nsa 'NSA/CISA Patch Management Guidance' --cis-macos 'CIS-macOS 1.1' --mscp 'system_settings_softwareupdate_current' \
             --recommendation 'No action required.'
     else
         add_audit_result --category 'Software Update & Patch Compliance' --control 'Recent Update History' \
             --status WARN --severity Medium --current "Last update: $date_token ($days_since day(s) ago)" \
             --recommended 'Last update within 45 days' \
             --cis 'CIS 7.3' --nist 'SI-2' --mitre 'T1210 (Exploitation of Remote Services)' --iso27001 'A.8.8' \
-            --nis2 'Art.21(2)(e)' --nsa 'NSA/CISA Patch Management Guidance' --cis-macos 'CIS-macOS 1.1' --mscp 'os_software_update_enforce' \
+            --nis2 'Art.21(2)(e)' --nsa 'NSA/CISA Patch Management Guidance' --cis-macos 'CIS-macOS 1.1' --mscp 'system_settings_softwareupdate_current' \
             --recommendation 'Install pending updates via System Settings > General > Software Update.'
     fi
 }
@@ -3062,7 +3218,7 @@ check_rapid_security_response_state() {
     # than asserting a judgement, per honesty-over-false-precision.
     add_audit_result --category 'Software Update & Patch Compliance' --control 'Rapid Security Response State' \
         --status INFO --severity Informational --current "$ROOT_CMD_OUTPUT" \
-        --recommended 'N/A' --cis-macos 'CIS-macOS 1.1' --mscp 'N/A' \
+        --recommended 'N/A' --cis-macos 'CIS-macOS 1.5' --mscp 'N/A' \
         --recommendation 'Informational only.'
 }
 
@@ -3079,7 +3235,7 @@ check_mdm_enrollment_and_supervision() {
     add_audit_result --category 'MDM, Profiles & Supervision' --control 'MDM Enrollment & Supervision' \
         --status INFO --severity Informational --current "$ROOT_CMD_OUTPUT" \
         --recommended 'N/A' \
-        --cis 'CIS 12.5' --nist 'CM-8' --iso27001 'A.8.9' --nis2 'Art.21(2)(a)' --cis-macos 'CIS-macOS 5.10' --mscp 'N/A' \
+        --cis 'CIS 12.5' --nist 'CM-8' --iso27001 'A.8.9' --nis2 'Art.21(2)(a)' --cis-macos 'N/A' --mscp 'N/A' \
         --recommendation 'Informational only. Confirm this matches the expected fleet-management state for this device.'
 }
 
@@ -3100,7 +3256,7 @@ check_installed_profiles_inventory() {
     add_audit_result --category 'MDM, Profiles & Supervision' --control 'Installed Profiles Inventory' \
         --status INFO --severity Informational --current "${#identifiers[@]} configuration profile(s) installed" \
         --details "$joined" \
-        --recommended 'N/A' --cis-macos 'CIS-macOS 5.10' --mscp 'N/A' \
+        --recommended 'N/A' --cis-macos 'N/A' --mscp 'N/A' \
         --recommendation 'Informational only. Review the full profile list periodically for unrecognized or stale configuration profiles.'
 }
 
@@ -3374,7 +3530,7 @@ _persistence_scan_report() {
     fw=(--recommended 'Every third-party launch item runs a signed program or a reviewed script from a protected location'
         --cis 'CIS 2.5, 2.7' --nist 'CM-7(5), SI-4, SI-7'
         --mitre 'T1543.001 (Launch Agent), T1543.004 (Launch Daemon), T1647 (Plist File Modification)'
-        --iso27001 'A.8.19' --nis2 'Art.21(2)(d)' --cis-macos 'CIS-macOS 5.6' --mscp 'os_launch_items_review')
+        --iso27001 'A.8.19' --nis2 'Art.21(2)(d)' --cis-macos 'N/A' --mscp 'N/A')
 
     if [[ ${#PERSIST_STRONG[@]} -gt 0 ]]; then
         add_audit_result --category "$PERSIST_CATEGORY" --control "$control_label" \
@@ -3420,7 +3576,7 @@ check_user_launch_agents_integrity() {
         add_audit_result --category "$PERSIST_CATEGORY" --control 'User LaunchAgent Integrity' \
             --status WARN --severity Low --current 'No local user home directories found' \
             --recommended 'Scan completes against every local user account' \
-            --cis-macos 'CIS-macOS 5.6' --mscp 'os_launch_items_review' \
+            --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'Unable to enumerate local accounts with dscl; verify ~/Library/LaunchAgents manually for each user.'
         return
     fi
@@ -3439,8 +3595,9 @@ typeset -gi BTM_DUMP_STATUS=-1
 
 load_btm_dump() {
     if [[ $BTM_DUMP_STATUS -lt 0 ]]; then
-        BTM_DUMP=$(sfltool dumpbtm 2>&1)
-        BTM_DUMP_STATUS=$?
+        run_prefetched btm sfltool dumpbtm
+        BTM_DUMP="$ROOT_CMD_OUTPUT"
+        BTM_DUMP_STATUS=$ROOT_CMD_STATUS
     fi
     return $BTM_DUMP_STATUS
 }
@@ -3452,7 +3609,7 @@ check_login_items_inventory() {
     if [[ "$ROOT_CMD_STATUS" -ne 0 ]]; then
         add_audit_result --category 'Persistence Mechanisms & Auto-Runs' --control 'Login Items & Background Task Inventory' \
             --status WARN --severity Low --current "sfltool query failed: $ROOT_CMD_OUTPUT" \
-            --recommended 'N/A' --cis-macos 'CIS-macOS 5.6' --mscp 'N/A' \
+            --recommended 'N/A' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'Unable to query login items; verify manually with "sfltool dumpbtm" in Terminal.'
         return
     fi
@@ -3492,7 +3649,7 @@ check_login_items_inventory() {
     add_audit_result --category 'Persistence Mechanisms & Auto-Runs' --control 'Login Items & Background Task Inventory' \
         --status INFO --severity Informational --current "$count background/login item(s) registered" \
         --details "$joined" \
-        --recommended 'N/A' --cis-macos 'CIS-macOS 5.6' --mscp 'N/A' \
+        --recommended 'N/A' --cis-macos 'N/A' --mscp 'N/A' \
         --recommendation 'Informational only. Periodically review "sfltool dumpbtm" output and remove unrecognized login items in System Settings > General > Login Items.'
 }
 
@@ -4060,7 +4217,7 @@ check_btm_item_integrity() {
         strong weak \
         --recommended 'Every enabled login item and background task signed, present and outside staging directories' \
         --cis 'CIS 2.5' --nist 'CM-7(5), SI-7' --mitre 'T1547.015 (Login Items)' --iso27001 'A.8.19' \
-        --nis2 'Art.21(2)(d)' --cis-macos 'CIS-macOS 5.6' --mscp 'N/A'
+        --nis2 'Art.21(2)(d)' --cis-macos 'N/A' --mscp 'N/A'
 }
 
 # Full cross-source inventory of what starts automatically, classified as
@@ -4124,7 +4281,7 @@ check_autostart_inventory() {
         --status INFO --severity Informational \
         --current "$(( programs + scripts )) autostart item(s): $programs program(s), $scripts script(s)" \
         --details "${(F)${(@o)lines}}" \
-        --recommended 'N/A' --cis 'CIS 2.1, 2.7' --nist 'CM-8' --iso27001 'A.5.9' --cis-macos 'CIS-macOS 5.6' --mscp 'N/A' \
+        --recommended 'N/A' --cis 'CIS 2.1, 2.7' --nist 'CM-8' --iso27001 'A.5.9' --cis-macos 'N/A' --mscp 'N/A' \
         --recommendation 'Informational baseline of everything that starts automatically (launchd, login items, background tasks, cron, shell startup). Compare against a known-good machine; integrity problems are reported by the dedicated persistence checks.'
 }
 
@@ -4142,7 +4299,7 @@ _writable_dir_check() {
         add_audit_result --category 'Privilege Escalation: File & Directory Permissions' --control "$control_name" \
             --status WARN --severity Low --current "stat query failed or directory missing: $ROOT_CMD_OUTPUT" \
             --recommended 'No group/other write bit' \
-            --cis-macos 'CIS-macOS 5.6' --mscp 'N/A' \
+            --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation "Unable to verify permissions for $dir; check manually with \"stat -f '%Lp' $dir\"."
         return
     fi
@@ -4156,14 +4313,14 @@ _writable_dir_check() {
             --status FAIL --severity Critical --current "$dir mode $mode" \
             --recommended 'No group/other write bit' \
             --cis 'CIS 5.1' --nist 'AC-6, CM-6' --mitre 'T1574.010 (Services File Permissions Weakness)' --iso27001 'A.8.3' \
-            --nis2 'Art.21(2)(d)' --nsa 'NSA/CISA macOS Hardening Guidance' --cis-macos 'CIS-macOS 5.6' --mscp 'N/A' \
+            --nis2 'Art.21(2)(d)' --nsa 'NSA/CISA macOS Hardening Guidance' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation "sudo chmod go-w $dir — a world/group-writable LaunchDaemons or LaunchAgents directory lets any local user plant a persistent root-level launch item."
     else
         add_audit_result --category 'Privilege Escalation: File & Directory Permissions' --control "$control_name" \
             --status PASS --severity Critical --current "$dir mode $mode" \
             --recommended 'No group/other write bit' \
             --cis 'CIS 5.1' --nist 'AC-6, CM-6' --mitre 'T1574.010 (Services File Permissions Weakness)' --iso27001 'A.8.3' \
-            --nis2 'Art.21(2)(d)' --nsa 'NSA/CISA macOS Hardening Guidance' --cis-macos 'CIS-macOS 5.6' --mscp 'N/A' \
+            --nis2 'Art.21(2)(d)' --nsa 'NSA/CISA macOS Hardening Guidance' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'No action required.'
     fi
 }
@@ -4212,14 +4369,14 @@ _writable_path_scan() {
             --status FAIL --severity High --current "$joined" \
             --recommended 'No PATH directory writable by a non-root user' \
             --cis 'CIS 5.1' --nist 'AC-6, CM-6' --mitre 'T1574.007 (PATH Interception)' --iso27001 'A.8.3' \
-            --nis2 'Art.21(2)(d)' --cis-macos 'CIS-macOS 5.6' --mscp 'N/A' \
+            --nis2 'Art.21(2)(d)' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'Run "sudo chmod go-w <dir>" on each listed directory, or remove it from $PATH — any user-writable $PATH entry ahead of /usr/bin is a classic PATH-hijack vector.'
     else
         add_audit_result --category 'Privilege Escalation: File & Directory Permissions' --control 'Writable PATH Directories' \
             --status PASS --severity High --current "$scanned director(y/ies) scanned, none writable by non-root" \
             --recommended 'No PATH directory writable by a non-root user' \
             --cis 'CIS 5.1' --nist 'AC-6, CM-6' --mitre 'T1574.007 (PATH Interception)' --iso27001 'A.8.3' \
-            --nis2 'Art.21(2)(d)' --cis-macos 'CIS-macOS 5.6' --mscp 'N/A' \
+            --nis2 'Art.21(2)(d)' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'No action required.'
     fi
 }
@@ -4267,14 +4424,14 @@ _suid_sgid_scan() {
             --status WARN --severity High --current "$joined" \
             --recommended 'No SUID/SGID binaries outside /usr, /bin, /sbin, /System' \
             --cis 'CIS 5.1' --nist 'AC-6, CM-6' --mitre 'T1548.001 (Setuid and Setgid)' --iso27001 'A.8.3' \
-            --nis2 'Art.21(2)(d)' --cis-macos 'CIS-macOS 5.6' --mscp 'N/A' \
+            --nis2 'Art.21(2)(d)' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'Review each non-system SUID/SGID binary; confirm it is expected and from a trusted vendor.'
     else
         add_audit_result --category 'Privilege Escalation: File & Directory Permissions' --control 'SUID/SGID Binary Audit' \
             --status PASS --severity High --current "$total SUID/SGID binaries scanned" \
             --recommended 'No SUID/SGID binaries outside /usr, /bin, /sbin, /System' \
             --cis 'CIS 5.1' --nist 'AC-6, CM-6' --mitre 'T1548.001 (Setuid and Setgid)' --iso27001 'A.8.3' \
-            --nis2 'Art.21(2)(d)' --cis-macos 'CIS-macOS 5.6' --mscp 'N/A' \
+            --nis2 'Art.21(2)(d)' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'No action required.'
     fi
 }
@@ -4398,14 +4555,14 @@ check_dyld_insert_libraries_global_env() {
             --status FAIL --severity Critical --current "$ROOT_CMD_OUTPUT" \
             --recommended 'unset' \
             --cis 'CIS 2.7' --nist 'SI-7, CM-7' --mitre 'T1574.006 (Dynamic Linker Hijacking)' --iso27001 'A.8.19' \
-            --nis2 'Art.21(2)(d)' --nsa 'NSA/CISA macOS Hardening Guidance' --cis-macos 'CIS-macOS 5.6' --mscp 'os_dyld_insert_libraries_unset' \
+            --nis2 'Art.21(2)(d)' --nsa 'NSA/CISA macOS Hardening Guidance' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'sudo launchctl unsetenv DYLD_INSERT_LIBRARIES — a globally-set DYLD_INSERT_LIBRARIES forces code injection into every subsequently launched dynamically-linked process.'
     else
         add_audit_result --category 'Dylib Hijacking & Code Injection' --control 'DYLD_INSERT_LIBRARIES Global Env' \
             --status PASS --severity Critical --current 'unset' \
             --recommended 'unset' \
             --cis 'CIS 2.7' --nist 'SI-7, CM-7' --mitre 'T1574.006 (Dynamic Linker Hijacking)' --iso27001 'A.8.19' \
-            --nis2 'Art.21(2)(d)' --nsa 'NSA/CISA macOS Hardening Guidance' --cis-macos 'CIS-macOS 5.6' --mscp 'os_dyld_insert_libraries_unset' \
+            --nis2 'Art.21(2)(d)' --nsa 'NSA/CISA macOS Hardening Guidance' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'No action required.'
     fi
 }
@@ -4430,14 +4587,14 @@ _writable_dylib_dir_check() {
             --status FAIL --severity High --current "$dir mode $mode" \
             --recommended 'No group/other write bit' \
             --cis 'CIS 2.7' --nist 'SI-7, CM-7' --mitre 'T1574.006 (Dynamic Linker Hijacking)' --iso27001 'A.8.19' \
-            --nis2 'Art.21(2)(d)' --cis-macos 'CIS-macOS 5.6' --mscp 'N/A' \
+            --nis2 'Art.21(2)(d)' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation "sudo chmod go-w $dir — a writable systemwide library search path lets any local user plant a hijacked dylib for any process that searches it."
     else
         add_audit_result --category 'Dylib Hijacking & Code Injection' --control 'Writable Dylib Search Paths' \
             --status PASS --severity High --current "$dir mode $mode" \
             --recommended 'No group/other write bit' \
             --cis 'CIS 2.7' --nist 'SI-7, CM-7' --mitre 'T1574.006 (Dynamic Linker Hijacking)' --iso27001 'A.8.19' \
-            --nis2 'Art.21(2)(d)' --cis-macos 'CIS-macOS 5.6' --mscp 'N/A' \
+            --nis2 'Art.21(2)(d)' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'No action required.'
     fi
 }
@@ -4462,8 +4619,84 @@ check_hardened_runtime_spotcheck() {
     # setting — never manufacture a FAIL/WARN judgement from it.
     add_audit_result --category 'Dylib Hijacking & Code Injection' --control 'Hardened Runtime Spotcheck' \
         --status INFO --severity Informational --current "$current" \
-        --recommended 'N/A' --cis-macos 'CIS-macOS 5.6' --mscp 'N/A' \
+        --recommended 'N/A' --cis-macos 'N/A' --mscp 'N/A' \
         --recommendation 'Informational only.'
+}
+
+# Electron fuses: build-time switches compiled into the Electron framework
+# right after the sentinel "dL7pKGdnNz796PbbjQWNKmHXBZaB9tsX", then a
+# version byte, a length byte and one byte per fuse ('1' on, '0' off,
+# 'r' removed). With RunAsNode / NodeOptions / --inspect fuses on, anyone
+# who can run code as the user can make the app execute arbitrary
+# JavaScript that inherits the app's TCC grants (camera, mic, Full Disk
+# Access) — the CVE-2025-54871 class. Read with stock grep/dd/od only.
+typeset -ga ELECTRON_FUSE_NAMES
+ELECTRON_FUSE_NAMES=(RunAsNode EnableCookieEncryption EnableNodeOptionsEnvironmentVariable
+    EnableNodeCliInspectArguments EnableEmbeddedAsarIntegrityValidation OnlyLoadAppFromAsar)
+
+# Prints "name=on|off|removed" per fuse, or returns 1 when the framework
+# has no fuse wire (very old Electron) or can't be read.
+_electron_fuses() {
+    local framework="$1" offset="" len=0 i=0 b=""
+    local -a bytes
+    offset=$(LC_ALL=C grep -obUa 'dL7pKGdnNz796PbbjQWNKmHXBZaB9tsX' "$framework" 2>/dev/null | head -1 | cut -d: -f1)
+    [[ "$offset" == <-> ]] || return 1
+    bytes=($(dd if="$framework" bs=1 skip=$(( offset + 33 )) count=16 2>/dev/null | od -An -tu1))
+    len="${bytes[1]:-0}"
+    for (( i = 1; i <= len && i <= ${#ELECTRON_FUSE_NAMES[@]}; i++ )); do
+        b="${bytes[$((i + 1))]:-}"
+        case "$b" in
+            49) print -r -- "${ELECTRON_FUSE_NAMES[$i]}=on" ;;
+            48) print -r -- "${ELECTRON_FUSE_NAMES[$i]}=off" ;;
+            114) print -r -- "${ELECTRON_FUSE_NAMES[$i]}=removed" ;;
+            *) print -r -- "${ELECTRON_FUSE_NAMES[$i]}=unknown" ;;
+        esac
+    done
+}
+
+_electron_app_dirs() {
+    local entry="" home=""
+    print -rl -- /Applications/*.app(N/) /Applications/*/*.app(N/)
+    for entry in "${(@f)$(_local_user_homes 2>/dev/null)}"; do
+        [[ -z "$entry" ]] && continue
+        home="${entry#*$'\t'}"
+        print -rl -- "$home"/Applications/*.app(N/)
+    done
+}
+
+check_electron_node_fuses() {
+    local app="" framework="" fuses="" exposed=""
+    local -a apps vulnerable hardened
+    apps=("${(@f)$(_electron_app_dirs)}"); apps=(${apps:#})
+    for app in "${apps[@]}"; do
+        framework="$app/Contents/Frameworks/Electron Framework.framework/Electron Framework"
+        [[ -e "$framework" ]] || continue
+        fuses=$(_electron_fuses "$framework") || { vulnerable+=("${app:t}: no fuse wire (pre-fuses Electron, RunAsNode always available)"); continue; }
+        exposed=$(print -r -- "$fuses" | grep -E '^(RunAsNode|EnableNodeOptionsEnvironmentVariable|EnableNodeCliInspectArguments)=on$' | cut -d= -f1 | paste -sd ',' -)
+        if [[ -n "$exposed" ]]; then
+            vulnerable+=("${app:t}: ${exposed//,/, } on")
+        else
+            hardened+=("${app:t}")
+        fi
+    done
+
+    local -a fw
+    fw=(--recommended 'Electron apps ship with RunAsNode, NODE_OPTIONS and --inspect fuses disabled'
+        --cis 'CIS 2.5' --nist 'SI-7, AC-6' --mitre 'T1218 (System Binary Proxy Execution), T1548 (Abuse Elevation Control Mechanism)'
+        --iso27001 'A.8.19' --nis2 'Art.21(2)(e)' --cis-macos 'N/A' --mscp 'N/A')
+    if [[ ${#vulnerable[@]} -gt 0 ]]; then
+        add_audit_result --category 'Dylib Hijacking & Code Injection' --control 'Electron Apps with Node Execution Fuses Enabled' \
+            --status WARN --severity Medium --current "${#vulnerable[@]} of $(( ${#vulnerable[@]} + ${#hardened[@]} )) Electron app(s) can be driven as a Node.js runtime" \
+            --details "${(F)vulnerable}" "${fw[@]}" \
+            --recommendation 'Update the listed apps (vendors increasingly ship hardened fuses), and avoid granting them Full Disk Access, camera, microphone or Accessibility: local code can run inside them via ELECTRON_RUN_AS_NODE / --inspect and inherit those grants (CVE-2025-54871 class). Report unhardened builds to the vendor.'
+    elif [[ ${#hardened[@]} -gt 0 ]]; then
+        add_audit_result --category 'Dylib Hijacking & Code Injection' --control 'Electron Apps with Node Execution Fuses Enabled' \
+            --status PASS --severity Medium --current "${#hardened[@]} Electron app(s), all with Node execution fuses disabled" \
+            --details "${(F)hardened}" "${fw[@]}" --recommendation 'No action required.'
+    else
+        add_audit_result --category 'Dylib Hijacking & Code Injection' --control 'Electron Apps with Node Execution Fuses Enabled' \
+            --status PASS --severity Medium --current 'No Electron apps installed' "${fw[@]}" --recommendation 'No action required.'
+    fi
 }
 
 # ---- 27-credential-exposure.zsh ----
@@ -4482,7 +4715,7 @@ _ssh_key_perms_check() {
             --status PASS --severity High --current '0 key(s) checked' \
             --recommended 'All private keys mode 600' \
             --cis 'CIS 3.11' --nist 'IA-5, SC-28' --mitre 'T1552.004 (Private Keys)' --iso27001 'A.8.24' \
-            --nis2 'Art.21(2)(h)' --nsa 'NSA/CISA Credential Hardening Guidance' --cis-macos 'CIS-macOS 5.6' --mscp 'N/A' \
+            --nis2 'Art.21(2)(h)' --nsa 'NSA/CISA Credential Hardening Guidance' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'No action required.'
         return
     fi
@@ -4515,14 +4748,14 @@ _ssh_key_perms_check() {
             --status WARN --severity High --current "$joined" \
             --recommended 'All private keys mode 600' \
             --cis 'CIS 3.11' --nist 'IA-5, SC-28' --mitre 'T1552.004 (Private Keys)' --iso27001 'A.8.24' \
-            --nis2 'Art.21(2)(h)' --nsa 'NSA/CISA Credential Hardening Guidance' --cis-macos 'CIS-macOS 5.6' --mscp 'N/A' \
+            --nis2 'Art.21(2)(h)' --nsa 'NSA/CISA Credential Hardening Guidance' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'Run "chmod 600" on each listed private key.'
     else
         add_audit_result --category 'Credential Exposure & Secret Leaks' --control 'SSH Private Key Permissions' \
             --status PASS --severity High --current "$total key(s) checked" \
             --recommended 'All private keys mode 600' \
             --cis 'CIS 3.11' --nist 'IA-5, SC-28' --mitre 'T1552.004 (Private Keys)' --iso27001 'A.8.24' \
-            --nis2 'Art.21(2)(h)' --nsa 'NSA/CISA Credential Hardening Guidance' --cis-macos 'CIS-macOS 5.6' --mscp 'N/A' \
+            --nis2 'Art.21(2)(h)' --nsa 'NSA/CISA Credential Hardening Guidance' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'No action required.'
     fi
 }
@@ -4532,7 +4765,7 @@ check_ssh_private_key_permissions() {
     if [[ -z "$CONSOLE_USER" ]]; then
         add_audit_result --category 'Credential Exposure & Secret Leaks' --control 'SSH Private Key Permissions' \
             --status WARN --severity Low --current 'No console user detected' \
-            --recommended 'N/A' --cis-macos 'CIS-macOS 5.6' --mscp 'N/A' \
+            --recommended 'N/A' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'Re-run interactively at a console login session to evaluate SSH key permissions.'
         return
     fi
@@ -4558,14 +4791,14 @@ _cloud_cli_creds_check() {
             --status WARN --severity Medium --current "$joined" \
             --recommended 'No long-lived cloud CLI credential files' \
             --cis 'CIS 3.11' --nist 'IA-5' --mitre 'T1552.001 (Credentials in Files)' --iso27001 'A.8.24' \
-            --nis2 'Art.21(2)(h)' --cis-macos 'CIS-macOS 5.6' --mscp 'N/A' \
+            --nis2 'Art.21(2)(h)' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'Prefer short-lived SSO/OIDC tokens over long-lived static credential files where the CLI supports it; ensure file permissions are 600.'
     else
         add_audit_result --category 'Credential Exposure & Secret Leaks' --control 'Cloud CLI Credential Files' \
             --status PASS --severity Medium --current 'No cloud CLI credential files found' \
             --recommended 'No long-lived cloud CLI credential files' \
             --cis 'CIS 3.11' --nist 'IA-5' --mitre 'T1552.001 (Credentials in Files)' --iso27001 'A.8.24' \
-            --nis2 'Art.21(2)(h)' --cis-macos 'CIS-macOS 5.6' --mscp 'N/A' \
+            --nis2 'Art.21(2)(h)' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'No action required.'
     fi
 }
@@ -4574,7 +4807,7 @@ check_cloud_cli_credential_files() {
     if [[ -z "$CONSOLE_USER" ]]; then
         add_audit_result --category 'Credential Exposure & Secret Leaks' --control 'Cloud CLI Credential Files' \
             --status WARN --severity Low --current 'No console user detected' \
-            --recommended 'N/A' --cis-macos 'CIS-macOS 5.6' --mscp 'N/A' \
+            --recommended 'N/A' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'Re-run interactively at a console login session to evaluate cloud CLI credential files.'
         return
     fi
@@ -4624,14 +4857,14 @@ _shell_history_sweep_check() {
             --status WARN --severity High --current "$joined" \
             --recommended 'No secret-like patterns in recent shell history' \
             --cis 'CIS 3.11' --nist 'IA-5' --mitre 'T1552.001 (Credentials in Files)' --iso27001 'A.8.24' \
-            --nis2 'Art.21(2)(h)' --cis-macos 'CIS-macOS 5.6' --mscp 'N/A' \
+            --nis2 'Art.21(2)(h)' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'Rotate any credential that may have been typed into a shell prompt and clear it from history.'
     else
         add_audit_result --category 'Credential Exposure & Secret Leaks' --control 'Shell History Secret Sweep' \
             --status PASS --severity High --current 'No secret-like patterns found in recent shell history' \
             --recommended 'No secret-like patterns in recent shell history' \
             --cis 'CIS 3.11' --nist 'IA-5' --mitre 'T1552.001 (Credentials in Files)' --iso27001 'A.8.24' \
-            --nis2 'Art.21(2)(h)' --cis-macos 'CIS-macOS 5.6' --mscp 'N/A' \
+            --nis2 'Art.21(2)(h)' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'No action required.'
     fi
 }
@@ -4640,7 +4873,7 @@ check_shell_history_secret_sweep() {
     if [[ -z "$CONSOLE_USER" ]]; then
         add_audit_result --category 'Credential Exposure & Secret Leaks' --control 'Shell History Secret Sweep' \
             --status WARN --severity Low --current 'No console user detected' \
-            --recommended 'N/A' --cis-macos 'CIS-macOS 5.6' --mscp 'N/A' \
+            --recommended 'N/A' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'Re-run interactively at a console login session to evaluate shell history.'
         return
     fi
@@ -4672,14 +4905,14 @@ _sensitive_filename_sweep_check() {
             --status WARN --severity Medium --current "$joined" \
             --recommended 'No sensitive filenames in Desktop/Downloads' \
             --cis 'CIS 3.11' --nist 'IA-5' --mitre 'T1552.001 (Credentials in Files)' --iso27001 'A.8.24' \
-            --nis2 'Art.21(2)(h)' --cis-macos 'CIS-macOS 5.6' --mscp 'N/A' \
+            --nis2 'Art.21(2)(h)' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'Relocate genuine secrets into Keychain or a secrets manager; delete stray exports.'
     else
         add_audit_result --category 'Credential Exposure & Secret Leaks' --control 'Sensitive Filename Sweep' \
             --status PASS --severity Medium --current 'No sensitive filenames found in Desktop/Downloads' \
             --recommended 'No sensitive filenames in Desktop/Downloads' \
             --cis 'CIS 3.11' --nist 'IA-5' --mitre 'T1552.001 (Credentials in Files)' --iso27001 'A.8.24' \
-            --nis2 'Art.21(2)(h)' --cis-macos 'CIS-macOS 5.6' --mscp 'N/A' \
+            --nis2 'Art.21(2)(h)' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'No action required.'
     fi
 }
@@ -4688,7 +4921,7 @@ check_sensitive_filename_sweep() {
     if [[ -z "$CONSOLE_USER" ]]; then
         add_audit_result --category 'Credential Exposure & Secret Leaks' --control 'Sensitive Filename Sweep' \
             --status WARN --severity Low --current 'No console user detected' \
-            --recommended 'N/A' --cis-macos 'CIS-macOS 5.6' --mscp 'N/A' \
+            --recommended 'N/A' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'Re-run interactively at a console login session to evaluate sensitive filenames.'
         return
     fi
@@ -4711,7 +4944,7 @@ check_screensaver_password_required() {
         add_audit_result --category 'Screen Lock & Physical Access' --control 'Screensaver Password Requirement' \
             --status WARN --severity Low --current 'No console user detected' \
             --recommended 'askForPassword=1' \
-            --cis-macos 'CIS-macOS 2.10.1' --mscp 'os_screensaver_password_enforce' \
+            --cis-macos 'CIS-macOS 2.11.2' --mscp 'system_settings_screensaver_password_enforce' \
             --recommendation 'Re-run interactively at a console login session to evaluate the screensaver password requirement.'
         return
     fi
@@ -4722,13 +4955,13 @@ check_screensaver_password_required() {
         add_audit_result --category 'Screen Lock & Physical Access' --control 'Screensaver Password Requirement' \
             --status PASS --severity High --current 'askForPassword=1 (required)' --recommended 'askForPassword=1' \
             --cis 'CIS 4.2' --nist 'AC-11' --mitre 'T1078 (Valid Accounts)' --iso27001 'A.8.1' --nis2 'Art.21(2)(i)' \
-            --cis-macos 'CIS-macOS 2.10.1' --mscp 'os_screensaver_password_enforce' \
+            --cis-macos 'CIS-macOS 2.11.2' --mscp 'system_settings_screensaver_password_enforce' \
             --recommendation 'No action required.'
     else
         add_audit_result --category 'Screen Lock & Physical Access' --control 'Screensaver Password Requirement' \
             --status FAIL --severity High --current "askForPassword=$value (not required)" --recommended 'askForPassword=1' \
             --cis 'CIS 4.2' --nist 'AC-11' --mitre 'T1078 (Valid Accounts)' --iso27001 'A.8.1' --nis2 'Art.21(2)(i)' \
-            --cis-macos 'CIS-macOS 2.10.1' --mscp 'os_screensaver_password_enforce' \
+            --cis-macos 'CIS-macOS 2.11.2' --mscp 'system_settings_screensaver_password_enforce' \
             --recommendation 'Enable "Require password after screen saver begins" in System Settings > Lock Screen, or via MDM: set com.apple.screensaver askForPassword=1.'
     fi
 }
@@ -4738,7 +4971,7 @@ check_screensaver_grace_period() {
         add_audit_result --category 'Screen Lock & Physical Access' --control 'Screensaver Password Grace Period' \
             --status WARN --severity Low --current 'No console user detected' \
             --recommended '<= 5 seconds' \
-            --cis-macos 'CIS-macOS 2.10.2' --mscp 'os_screensaver_askforpassword_delay_enforce' \
+            --cis-macos 'CIS-macOS 2.11.2' --mscp 'system_settings_screensaver_ask_for_password_delay_enforce' \
             --recommendation 'Re-run interactively at a console login session to evaluate the screensaver grace period.'
         return
     fi
@@ -4748,12 +4981,12 @@ check_screensaver_grace_period() {
     if [[ "$value" -le 5 ]]; then
         add_audit_result --category 'Screen Lock & Physical Access' --control 'Screensaver Password Grace Period' \
             --status PASS --severity Medium --current "askForPasswordDelay=${value}s" --recommended '<= 5 seconds' \
-            --cis 'CIS 4.2' --nist 'AC-11' --cis-macos 'CIS-macOS 2.10.2' --mscp 'os_screensaver_askforpassword_delay_enforce' \
+            --cis 'CIS 4.2' --nist 'AC-11' --cis-macos 'CIS-macOS 2.11.2' --mscp 'system_settings_screensaver_ask_for_password_delay_enforce' \
             --recommendation 'No action required.'
     else
         add_audit_result --category 'Screen Lock & Physical Access' --control 'Screensaver Password Grace Period' \
             --status WARN --severity Medium --current "askForPasswordDelay=${value}s" --recommended '<= 5 seconds' \
-            --cis 'CIS 4.2' --nist 'AC-11' --cis-macos 'CIS-macOS 2.10.2' --mscp 'os_screensaver_askforpassword_delay_enforce' \
+            --cis 'CIS 4.2' --nist 'AC-11' --cis-macos 'CIS-macOS 2.11.2' --mscp 'system_settings_screensaver_ask_for_password_delay_enforce' \
             --recommendation 'Reduce the screen lock grace period to 5 seconds or less in System Settings > Lock Screen, or via MDM: set com.apple.screensaver askForPasswordDelay=0.'
     fi
 }
@@ -4766,13 +4999,13 @@ check_auto_login_disabled() {
         add_audit_result --category 'Screen Lock & Physical Access' --control 'Automatic Login Disabled' \
             --status PASS --severity Critical --current 'No autoLoginUser configured' --recommended 'No autoLoginUser configured' \
             --cis 'CIS 4.2' --nist 'AC-11, IA-2' --mitre 'T1078 (Valid Accounts)' --iso27001 'A.8.1' --nis2 'Art.21(2)(i)' \
-            --cis-macos 'CIS-macOS 2.10.3' --mscp 'os_autologin_disable' \
+            --cis-macos 'CIS-macOS 2.13.3' --mscp 'system_settings_automatic_login_disable' \
             --recommendation 'No action required.'
     else
         add_audit_result --category 'Screen Lock & Physical Access' --control 'Automatic Login Disabled' \
             --status FAIL --severity Critical --current "autoLoginUser=$value" --recommended 'No autoLoginUser configured' \
             --cis 'CIS 4.2' --nist 'AC-11, IA-2' --mitre 'T1078 (Valid Accounts)' --iso27001 'A.8.1' --nis2 'Art.21(2)(i)' \
-            --cis-macos 'CIS-macOS 2.10.3' --mscp 'os_autologin_disable' \
+            --cis-macos 'CIS-macOS 2.13.3' --mscp 'system_settings_automatic_login_disable' \
             --recommendation 'Disable automatic login in System Settings > Users & Groups > Login Options, or remove the key: sudo defaults delete /Library/Preferences/com.apple.loginwindow autoLoginUser.'
     fi
 }
@@ -4786,14 +5019,14 @@ check_login_window_hardening() {
             --status PASS --severity Medium --current 'SHOWFULLNAME=1' \
             --recommended 'SHOWFULLNAME=1' \
             --cis 'CIS 5.1' --nist 'IA-2' --mitre 'T1087 (Account Discovery)' --iso27001 'A.8.2' \
-            --nis2 'Art.21(2)(i)' --cis-macos 'N/A' --mscp 'N/A' \
+            --nis2 'Art.21(2)(i)' --cis-macos 'CIS-macOS 2.11.4' --mscp 'N/A' \
             --recommendation 'No action required.'
     else
         add_audit_result --category 'Screen Lock & Physical Access' --control 'Login Window Hardening' \
             --status WARN --severity Medium --current "SHOWFULLNAME=$show_full_name" \
             --recommended 'SHOWFULLNAME=1' \
             --cis 'CIS 5.1' --nist 'IA-2' --mitre 'T1087 (Account Discovery)' --iso27001 'A.8.2' \
-            --nis2 'Art.21(2)(i)' --cis-macos 'N/A' --mscp 'N/A' \
+            --nis2 'Art.21(2)(i)' --cis-macos 'CIS-macOS 2.11.4' --mscp 'N/A' \
             --recommendation 'Require a name-and-password login prompt instead of showing the account list: System Settings > Lock Screen, or "sudo defaults write /Library/Preferences/com.apple.loginwindow SHOWFULLNAME -bool true" — the account list reveals valid local usernames to anyone at the console.'
     fi
 }
@@ -4923,14 +5156,14 @@ check_usb_restriction_profile_presence() {
             --status INFO --severity Informational \
             --current 'A configuration profile referencing USB restricted mode is installed' \
             --recommended 'N/A' \
-            --cis 'CIS 4.8' --nist 'MP-7' --iso27001 'A.7.10' --nis2 'Art.21(2)(d)' --cis-macos 'CIS-macOS 2.6' --mscp 'N/A' \
+            --cis 'CIS 4.8' --nist 'MP-7' --iso27001 'A.7.10' --nis2 'Art.21(2)(d)' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'Informational only.'
     else
         add_audit_result --category 'Removable Media & Peripheral Control' --control 'USB Restriction Profile Presence' \
             --status WARN --severity Medium \
             --current 'No configuration profile appears to manage USB restricted mode' \
             --recommended 'A configuration profile referencing USB restricted mode is installed' \
-            --cis 'CIS 4.8' --nist 'MP-7' --iso27001 'A.7.10' --nis2 'Art.21(2)(d)' --cis-macos 'CIS-macOS 2.6' --mscp 'N/A' \
+            --cis 'CIS 4.8' --nist 'MP-7' --iso27001 'A.7.10' --nis2 'Art.21(2)(d)' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'This is a best-effort text match against installed profile identifiers, not full profile-payload inspection — confirm manually via MDM console if USB device control is required by policy.'
     fi
 }
@@ -4941,7 +5174,7 @@ check_thunderbolt_security_level() {
             --status INFO --severity Informational \
             --current 'Not applicable — Apple Silicon Mac (DMA protection is enforced independently of the legacy Thunderbolt security-level setting)' \
             --recommended 'N/A' \
-            --cis 'CIS 4.8' --nist 'SC-7' --iso27001 'A.7.10' --nis2 'Art.21(2)(d)' --cis-macos 'CIS-macOS 2.6' --mscp 'N/A' \
+            --cis 'CIS 4.8' --nist 'SC-7' --iso27001 'A.7.10' --nis2 'Art.21(2)(d)' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'No action required.'
         return
     fi
@@ -4954,7 +5187,7 @@ check_thunderbolt_security_level() {
         add_audit_result --category 'Removable Media & Peripheral Control' --control 'Thunderbolt Security Level' \
             --status INFO --severity Informational \
             --current 'No Thunderbolt controller detected or unable to query' \
-            --recommended 'N/A' --cis-macos 'CIS-macOS 2.6' --mscp 'N/A' \
+            --recommended 'N/A' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'Informational only.'
         return
     fi
@@ -4964,14 +5197,14 @@ check_thunderbolt_security_level() {
             --status FAIL --severity High --current "$line" \
             --recommended 'Security Level: User Authorization (or stricter)' \
             --cis 'CIS 4.8' --nist 'SC-7' --mitre 'T1200 (Hardware Additions)' --iso27001 'A.7.10' \
-            --nis2 'Art.21(2)(d)' --nsa 'NSA/CISA DMA Protection Guidance' --cis-macos 'CIS-macOS 2.6' --mscp 'N/A' \
+            --nis2 'Art.21(2)(d)' --nsa 'NSA/CISA DMA Protection Guidance' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'Set Thunderbolt security to "User Authorization" or stricter via the Thunderbolt pane (Intel Macs) or firmware boot security settings.'
     elif [[ "$line" == *"User Authorization"* ]]; then
         add_audit_result --category 'Removable Media & Peripheral Control' --control 'Thunderbolt Security Level' \
             --status PASS --severity High --current "$line" \
             --recommended 'Security Level: User Authorization (or stricter)' \
             --cis 'CIS 4.8' --nist 'SC-7' --mitre 'T1200 (Hardware Additions)' --iso27001 'A.7.10' \
-            --nis2 'Art.21(2)(d)' --nsa 'NSA/CISA DMA Protection Guidance' --cis-macos 'CIS-macOS 2.6' --mscp 'N/A' \
+            --nis2 'Art.21(2)(d)' --nsa 'NSA/CISA DMA Protection Guidance' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'No action required.'
     else
         # Fault isolation: an unrecognized security-level value must never
@@ -4979,7 +5212,7 @@ check_thunderbolt_security_level() {
         add_audit_result --category 'Removable Media & Peripheral Control' --control 'Thunderbolt Security Level' \
             --status WARN --severity Low --current "Unrecognized security level: $line" \
             --recommended 'Security Level: User Authorization (or stricter)' \
-            --cis-macos 'CIS-macOS 2.6' --mscp 'N/A' \
+            --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'Unable to classify the reported Thunderbolt security level; verify manually with "system_profiler SPThunderboltDataType".'
     fi
 }
@@ -4990,7 +5223,7 @@ check_thunderbolt_security_level() {
 
 check_wifi_current_network_security() {
     write_section_banner 'Wireless & Network Interface Security - Wi-Fi Current Network Security'
-    run_root system_profiler SPAirPortDataType
+    run_prefetched wifi system_profiler SPAirPortDataType   # ~8s; prefetched in main()
 
     local block security_line
     block=$(print -r -- "$ROOT_CMD_OUTPUT" | awk '/Current Network Information:/{flag=1} flag{print}')
@@ -5001,27 +5234,27 @@ check_wifi_current_network_security() {
     if [[ -z "$security_line" ]]; then
         add_audit_result --category 'Wireless & Network Interface Security' --control 'Wi-Fi Current Network Security' \
             --status INFO --severity Informational --current 'Not currently associated with a Wi-Fi network' \
-            --recommended 'N/A' --cis-macos 'CIS-macOS 2.9' --mscp 'N/A' \
+            --recommended 'N/A' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'Informational only.'
     elif [[ "$security_line" == *"WEP"* || "$security_line" == *"None"* || "$security_line" == *"Open"* ]]; then
         add_audit_result --category 'Wireless & Network Interface Security' --control 'Wi-Fi Current Network Security' \
             --status WARN --severity Medium --current "$security_line" \
             --recommended 'WPA2 or WPA3' \
             --cis 'CIS 12.6' --nist 'AC-18' --mitre 'T1040 (Network Sniffing)' --iso27001 'A.8.20' \
-            --nis2 'Art.21(2)(h)' --nsa 'NSA/CISA Wireless Security Guidance' --cis-macos 'CIS-macOS 2.9' --mscp 'N/A' \
+            --nis2 'Art.21(2)(h)' --nsa 'NSA/CISA Wireless Security Guidance' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'Reconfigure or avoid this network — WEP and open networks provide no meaningful confidentiality.'
     elif [[ "$security_line" == *"WPA2"* || "$security_line" == *"WPA3"* ]]; then
         add_audit_result --category 'Wireless & Network Interface Security' --control 'Wi-Fi Current Network Security' \
             --status PASS --severity Medium --current "$security_line" \
             --recommended 'WPA2 or WPA3' \
             --cis 'CIS 12.6' --nist 'AC-18' --mitre 'T1040 (Network Sniffing)' --iso27001 'A.8.20' \
-            --nis2 'Art.21(2)(h)' --nsa 'NSA/CISA Wireless Security Guidance' --cis-macos 'CIS-macOS 2.9' --mscp 'N/A' \
+            --nis2 'Art.21(2)(h)' --nsa 'NSA/CISA Wireless Security Guidance' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'No action required.'
     else
         add_audit_result --category 'Wireless & Network Interface Security' --control 'Wi-Fi Current Network Security' \
             --status WARN --severity Low --current "Unrecognized security value: $security_line" \
             --recommended 'WPA2 or WPA3' \
-            --cis-macos 'CIS-macOS 2.9' --mscp 'N/A' \
+            --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'Unable to classify the reported Wi-Fi security type; verify manually with "system_profiler SPAirPortDataType".'
     fi
 }
@@ -5034,12 +5267,12 @@ check_bluetooth_power_state() {
     if [[ "$power_state" == "1" ]]; then
         add_audit_result --category 'Wireless & Network Interface Security' --control 'Bluetooth Power State' \
             --status INFO --severity Informational --current 'Bluetooth powered on' \
-            --recommended 'N/A' --cis-macos 'CIS-macOS 2.9' --mscp 'N/A' \
+            --recommended 'N/A' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'Informational only.'
     else
         add_audit_result --category 'Wireless & Network Interface Security' --control 'Bluetooth Power State' \
             --status INFO --severity Informational --current 'Bluetooth powered off' \
-            --recommended 'N/A' --cis-macos 'CIS-macOS 2.9' --mscp 'N/A' \
+            --recommended 'N/A' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'Informational only.'
     fi
 }
@@ -5053,14 +5286,14 @@ check_airdrop_discovery_scope() {
             --status WARN --severity Medium --current "DiscoverableMode: $mode" \
             --recommended 'Contacts Only or No One' \
             --cis 'CIS 4.8' --nist 'AC-18' --mitre 'T1092 (Communication Through Removable Media)' --iso27001 'A.8.20' \
-            --nis2 'Art.21(2)(h)' --cis-macos 'CIS-macOS 2.9' --mscp 'N/A' \
+            --nis2 'Art.21(2)(h)' --cis-macos 'CIS-macOS 2.3.1.1' --mscp 'N/A' \
             --recommendation 'Set AirDrop to "Contacts Only" or "No One" via Control Center/System Settings unless open discovery is deliberately needed.'
     else
         add_audit_result --category 'Wireless & Network Interface Security' --control 'AirDrop Discovery Scope' \
             --status PASS --severity Medium --current "DiscoverableMode: $mode" \
             --recommended 'Contacts Only or No One' \
             --cis 'CIS 4.8' --nist 'AC-18' --mitre 'T1092 (Communication Through Removable Media)' --iso27001 'A.8.20' \
-            --nis2 'Art.21(2)(h)' --cis-macos 'CIS-macOS 2.9' --mscp 'N/A' \
+            --nis2 'Art.21(2)(h)' --cis-macos 'CIS-macOS 2.3.1.1' --mscp 'N/A' \
             --recommendation 'No action required.'
     fi
 }
@@ -5088,7 +5321,7 @@ check_network_interface_inventory() {
     # Always INFO: this is inventory, not a judgement.
     add_audit_result --category 'Wireless & Network Interface Security' --control 'Network Interface Inventory' \
         --status INFO --severity Informational --current "$count interface(s)" --details "$joined" \
-        --recommended 'N/A' --cis-macos 'CIS-macOS 2.9' --mscp 'N/A' \
+        --recommended 'N/A' --cis-macos 'N/A' --mscp 'N/A' \
         --recommendation 'Informational only.'
 }
 
@@ -5107,13 +5340,13 @@ check_icloud_keychain_sync_indicator() {
         add_audit_result --category 'iCloud & Cloud Sync Surface' --control 'iCloud Keychain Sync Indicator' \
             --status INFO --severity Informational \
             --current 'An iCloud account with Keychain sync appears to be configured' \
-            --recommended 'N/A' --cis-macos 'CIS-macOS 2.11' --mscp 'N/A' \
+            --recommended 'N/A' --cis-macos 'CIS-macOS 2.1.1.1' --mscp 'N/A' \
             --recommendation 'Informational only.'
     else
         add_audit_result --category 'iCloud & Cloud Sync Surface' --control 'iCloud Keychain Sync Indicator' \
             --status INFO --severity Informational \
             --current 'No iCloud Keychain sync indicator found (best-effort parse of an internal plist structure — verify manually in System Settings > Apple ID > iCloud if certainty is required)' \
-            --recommended 'N/A' --cis-macos 'CIS-macOS 2.11' --mscp 'N/A' \
+            --recommended 'N/A' --cis-macos 'CIS-macOS 2.1.1.1' --mscp 'N/A' \
             --recommendation 'Informational only.'
     fi
 }
@@ -5128,18 +5361,18 @@ check_activation_lock_status() {
         add_audit_result --category 'iCloud & Cloud Sync Surface' --control 'Activation Lock Status' \
             --status PASS --severity Medium --current "$line" \
             --recommended 'Activation Lock Status: Enabled' \
-            --cis 'CIS 4.8' --nist 'PE-20' --iso27001 'A.7.10' --nis2 'Art.21(2)(d)' --cis-macos 'CIS-macOS 2.11' --mscp 'N/A' \
+            --cis 'CIS 4.8' --nist 'PE-20' --iso27001 'A.7.10' --nis2 'Art.21(2)(d)' --cis-macos 'CIS-macOS 2.1.1.6' --mscp 'N/A' \
             --recommendation 'No action required — this is a theft-deterrence control.'
     elif [[ "$line" == *"Disabled"* ]]; then
         add_audit_result --category 'iCloud & Cloud Sync Surface' --control 'Activation Lock Status' \
             --status WARN --severity Medium --current "$line" \
             --recommended 'Activation Lock Status: Enabled' \
-            --cis 'CIS 4.8' --nist 'PE-20' --iso27001 'A.7.10' --nis2 'Art.21(2)(d)' --cis-macos 'CIS-macOS 2.11' --mscp 'N/A' \
+            --cis 'CIS 4.8' --nist 'PE-20' --iso27001 'A.7.10' --nis2 'Art.21(2)(d)' --cis-macos 'CIS-macOS 2.1.1.6' --mscp 'N/A' \
             --recommendation 'Consider enabling Find My Mac (System Settings > Apple ID > iCloud > Find My Mac) so Activation Lock engages.'
     else
         add_audit_result --category 'iCloud & Cloud Sync Surface' --control 'Activation Lock Status' \
             --status INFO --severity Informational --current 'Activation Lock Status not reported (older hardware without the feature)' \
-            --recommended 'N/A' --cis-macos 'CIS-macOS 2.11' --mscp 'N/A' \
+            --recommended 'N/A' --cis-macos 'CIS-macOS 2.1.1.6' --mscp 'N/A' \
             --recommendation 'Informational only.'
     fi
 }
@@ -5155,12 +5388,12 @@ _icloud_drive_present() {
     if [[ $RUN_AS_USER_STATUS -eq 0 ]]; then
         add_audit_result --category 'iCloud & Cloud Sync Surface' --control 'iCloud Drive Sync Indicator' \
             --status INFO --severity Informational --current 'iCloud Drive local sync folder present' \
-            --recommended 'N/A' --cis-macos 'CIS-macOS 2.11' --mscp 'N/A' \
+            --recommended 'N/A' --cis-macos 'CIS-macOS 2.1.1.2' --mscp 'N/A' \
             --recommendation 'Informational only.'
     else
         add_audit_result --category 'iCloud & Cloud Sync Surface' --control 'iCloud Drive Sync Indicator' \
             --status INFO --severity Informational --current 'iCloud Drive local sync folder absent' \
-            --recommended 'N/A' --cis-macos 'CIS-macOS 2.11' --mscp 'N/A' \
+            --recommended 'N/A' --cis-macos 'CIS-macOS 2.1.1.2' --mscp 'N/A' \
             --recommendation 'Informational only.'
     fi
 }
@@ -5169,7 +5402,7 @@ check_icloud_drive_sync_indicator() {
     if [[ -z "$CONSOLE_USER" ]]; then
         add_audit_result --category 'iCloud & Cloud Sync Surface' --control 'iCloud Drive Sync Indicator' \
             --status WARN --severity Low --current 'No console user detected' \
-            --recommended 'N/A' --cis-macos 'CIS-macOS 2.11' --mscp 'N/A' \
+            --recommended 'N/A' --cis-macos 'CIS-macOS 2.1.1.2' --mscp 'N/A' \
             --recommendation 'Re-run interactively at a console login session to evaluate iCloud Drive sync status.'
         return
     fi
@@ -5200,14 +5433,14 @@ check_safari_auto_open_safe_downloads() {
             --status FAIL --severity Medium --current 'AutoOpenSafeDownloads=1' \
             --recommended 'AutoOpenSafeDownloads=0' \
             --cis 'CIS 9.2' --nist 'CM-7' --mitre 'T1204.002 (Malicious File)' --iso27001 'A.8.19' \
-            --nis2 'Art.21(2)(d)' --cis-macos 'CIS-macOS 2.13' --mscp 'N/A' \
+            --nis2 'Art.21(2)(d)' --cis-macos 'CIS-macOS 6.3.1' --mscp 'N/A' \
             --recommendation 'Disable "Open safe files after downloading" in Safari > Settings > General — auto-opening downloaded archives/disk images is a long-standing abuse vector.'
     else
         add_audit_result --category 'Browser & Application Hardening' --control 'Safari Auto-Open Safe Downloads' \
             --status PASS --severity Medium --current "AutoOpenSafeDownloads=$auto_open" \
             --recommended 'AutoOpenSafeDownloads=0' \
             --cis 'CIS 9.2' --nist 'CM-7' --mitre 'T1204.002 (Malicious File)' --iso27001 'A.8.19' \
-            --nis2 'Art.21(2)(d)' --cis-macos 'CIS-macOS 2.13' --mscp 'N/A' \
+            --nis2 'Art.21(2)(d)' --cis-macos 'CIS-macOS 6.3.1' --mscp 'N/A' \
             --recommendation 'No action required.'
     fi
 }
@@ -5221,12 +5454,12 @@ check_safari_developer_menu_note() {
     if [[ "$develop_menu" == "1" ]]; then
         add_audit_result --category 'Browser & Application Hardening' --control 'Safari Developer Menu' \
             --status INFO --severity Informational --current 'Develop menu on' \
-            --recommended 'N/A' --cis-macos 'CIS-macOS 2.13' --mscp 'N/A' \
+            --recommended 'N/A' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'Informational only.'
     else
         add_audit_result --category 'Browser & Application Hardening' --control 'Safari Developer Menu' \
             --status INFO --severity Informational --current 'Develop menu off' \
-            --recommended 'N/A' --cis-macos 'CIS-macOS 2.13' --mscp 'N/A' \
+            --recommended 'N/A' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'Informational only.'
     fi
 }
@@ -5240,14 +5473,14 @@ check_safari_fraudulent_site_warning() {
             --status FAIL --severity Medium --current 'WarnAboutFraudulentWebsites=0' \
             --recommended 'WarnAboutFraudulentWebsites=1' \
             --cis 'CIS 9.2' --nist 'SC-7' --mitre 'T1566 (Phishing)' --iso27001 'A.8.23' \
-            --nis2 'Art.21(2)(d)' --cis-macos 'CIS-macOS 2.13' --mscp 'N/A' \
+            --nis2 'Art.21(2)(d)' --cis-macos 'CIS-macOS 6.3.3' --mscp 'N/A' \
             --recommendation 're-enable "Warn when visiting a fraudulent website" in Safari > Settings > Security.'
     else
         add_audit_result --category 'Browser & Application Hardening' --control 'Safari Fraudulent Site Warning' \
             --status PASS --severity Medium --current "WarnAboutFraudulentWebsites=$warn_setting" \
             --recommended 'WarnAboutFraudulentWebsites=1' \
             --cis 'CIS 9.2' --nist 'SC-7' --mitre 'T1566 (Phishing)' --iso27001 'A.8.23' \
-            --nis2 'Art.21(2)(d)' --cis-macos 'CIS-macOS 2.13' --mscp 'N/A' \
+            --nis2 'Art.21(2)(d)' --cis-macos 'CIS-macOS 6.3.3' --mscp 'N/A' \
             --recommendation 'No action required.'
     fi
 }
@@ -5310,7 +5543,7 @@ check_time_machine_configured_and_recent() {
             --status FAIL --severity High --current 'No Time Machine destination configured' \
             --recommended 'A Time Machine destination is configured, backed up within 7 days' \
             --cis 'CIS 11.2' --nist 'CP-9' --mitre 'T1490 (Inhibit System Recovery)' --iso27001 'A.8.13' \
-            --nis2 'Art.21(2)(c)' --nsa 'NSA/CISA Ransomware Resilience Guidance' --cis-macos 'CIS-macOS 1.5' --mscp 'N/A' \
+            --nis2 'Art.21(2)(c)' --nsa 'NSA/CISA Ransomware Resilience Guidance' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'Configure a Time Machine destination (System Settings > General > Time Machine) as baseline ransomware/data-loss recovery.'
         return
     fi
@@ -5330,7 +5563,7 @@ check_time_machine_configured_and_recent() {
             --status WARN --severity Medium --current 'Unable to determine latest backup date' \
             --recommended 'A Time Machine destination is configured, backed up within 7 days' \
             --cis 'CIS 11.2' --nist 'CP-9' --mitre 'T1490 (Inhibit System Recovery)' --iso27001 'A.8.13' \
-            --nis2 'Art.21(2)(c)' --nsa 'NSA/CISA Ransomware Resilience Guidance' --cis-macos 'CIS-macOS 1.5' --mscp 'N/A' \
+            --nis2 'Art.21(2)(c)' --nsa 'NSA/CISA Ransomware Resilience Guidance' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'Unable to parse the latest backup date; verify manually with "tmutil latestbackup".'
         return
     fi
@@ -5344,14 +5577,14 @@ check_time_machine_configured_and_recent() {
             --status PASS --severity High --current "Latest backup: $date_only ($days_since day(s) ago)" \
             --recommended 'A Time Machine destination is configured, backed up within 7 days' \
             --cis 'CIS 11.2' --nist 'CP-9' --mitre 'T1490 (Inhibit System Recovery)' --iso27001 'A.8.13' \
-            --nis2 'Art.21(2)(c)' --nsa 'NSA/CISA Ransomware Resilience Guidance' --cis-macos 'CIS-macOS 1.5' --mscp 'N/A' \
+            --nis2 'Art.21(2)(c)' --nsa 'NSA/CISA Ransomware Resilience Guidance' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'No action required.'
     else
         add_audit_result --category 'Ransomware Resilience & Recovery' --control 'Time Machine Configured & Recent' \
             --status WARN --severity Medium --current "$days_since day(s) since last backup" \
             --recommended 'A Time Machine destination is configured, backed up within 7 days' \
             --cis 'CIS 11.2' --nist 'CP-9' --mitre 'T1490 (Inhibit System Recovery)' --iso27001 'A.8.13' \
-            --nis2 'Art.21(2)(c)' --nsa 'NSA/CISA Ransomware Resilience Guidance' --cis-macos 'CIS-macOS 1.5' --mscp 'N/A' \
+            --nis2 'Art.21(2)(c)' --nsa 'NSA/CISA Ransomware Resilience Guidance' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'Investigate why backups have stalled.'
     fi
 }
@@ -5417,7 +5650,7 @@ check_local_apfs_snapshots() {
     # a substitute for an off-device backup.
     add_audit_result --category 'Ransomware Resilience & Recovery' --control 'Local APFS Snapshots' \
         --status INFO --severity Informational --current "$count local snapshot(s) found" \
-        --recommended 'N/A' --cis-macos 'CIS-macOS 1.5' --mscp 'N/A' \
+        --recommended 'N/A' --cis-macos 'N/A' --mscp 'N/A' \
         --recommendation 'Informational only. Local snapshots provide fast local rollback but are not a substitute for an off-device backup.'
 }
 
@@ -5458,7 +5691,7 @@ _applications_inventory_check() {
     add_audit_result --category 'Third-Party Software & Package Inventory' --control 'Installed Applications Inventory' \
         --status INFO --severity Informational --current "$total application(s) installed" \
         --details "$joined" \
-        --recommended 'N/A' --cis-macos 'CIS-macOS 1.6' --mscp 'N/A' \
+        --recommended 'N/A' --cis-macos 'CIS-macOS 3.6' --mscp 'N/A' \
         --recommendation 'Informational only.'
 }
 
@@ -5474,7 +5707,7 @@ _homebrew_prefix_check() {
     if [[ ! -d "$prefix" ]]; then
         add_audit_result --category 'Third-Party Software & Package Inventory' --control 'Homebrew Prefix Permissions' \
             --status INFO --severity Informational --current 'Homebrew not installed' \
-            --recommended 'N/A' --cis-macos 'CIS-macOS 1.6' --mscp 'N/A' \
+            --recommended 'N/A' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'Informational only.'
         return
     fi
@@ -5483,7 +5716,7 @@ _homebrew_prefix_check() {
     if [[ $ROOT_CMD_STATUS -ne 0 ]]; then
         add_audit_result --category 'Third-Party Software & Package Inventory' --control 'Homebrew Prefix Permissions' \
             --status WARN --severity Low --current "stat query failed: $ROOT_CMD_OUTPUT" \
-            --recommended 'No group/other write bit' --cis-macos 'CIS-macOS 1.6' --mscp 'N/A' \
+            --recommended 'No group/other write bit' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation "Unable to verify permissions for $prefix; check manually with \"stat -f '%Lp' $prefix\"."
         return
     fi
@@ -5497,14 +5730,14 @@ _homebrew_prefix_check() {
             --status FAIL --severity High --current "$prefix mode $mode" \
             --recommended 'No group/other write bit' \
             --cis 'CIS 2.7' --nist 'CM-7, AC-6' --mitre 'T1574.007 (PATH Interception)' --iso27001 'A.8.19' \
-            --nis2 'Art.21(2)(d)' --cis-macos 'CIS-macOS 1.6' --mscp 'N/A' \
+            --nis2 'Art.21(2)(d)' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation "sudo chmod -R go-w $prefix — a writable Homebrew prefix lets any local user hijack the next brew invocation or any binary on \$PATH under that prefix."
     else
         add_audit_result --category 'Third-Party Software & Package Inventory' --control 'Homebrew Prefix Permissions' \
             --status PASS --severity High --current "$prefix mode $mode" \
             --recommended 'No group/other write bit' \
             --cis 'CIS 2.7' --nist 'CM-7, AC-6' --mitre 'T1574.007 (PATH Interception)' --iso27001 'A.8.19' \
-            --nis2 'Art.21(2)(d)' --cis-macos 'CIS-macOS 1.6' --mscp 'N/A' \
+            --nis2 'Art.21(2)(d)' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'No action required.'
     fi
 }
@@ -5521,7 +5754,7 @@ _homebrew_package_inventory_check() {
     if [[ ! -d "$prefix" ]]; then
         add_audit_result --category 'Third-Party Software & Package Inventory' --control 'Homebrew Package Inventory' \
             --status INFO --severity Informational --current 'Homebrew not installed' \
-            --recommended 'N/A' --cis-macos 'CIS-macOS 1.6' --mscp 'N/A' \
+            --recommended 'N/A' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'Informational only.'
         return
     fi
@@ -5530,7 +5763,7 @@ _homebrew_package_inventory_check() {
         add_audit_result --category 'Third-Party Software & Package Inventory' --control 'Homebrew Package Inventory' \
             --status INFO --severity Informational \
             --current "0 Homebrew formula directory(ies) found under Cellar (best-effort count, not equivalent to 'brew list')" \
-            --recommended 'N/A' --cis-macos 'CIS-macOS 1.6' --mscp 'N/A' \
+            --recommended 'N/A' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'Informational only.'
         return
     fi
@@ -5551,7 +5784,7 @@ _homebrew_package_inventory_check() {
         --status INFO --severity Informational \
         --current "${#names[@]} Homebrew formula directory(ies) found under Cellar (best-effort count, not equivalent to 'brew list')" \
         --details "$joined" \
-        --recommended 'N/A' --cis-macos 'CIS-macOS 1.6' --mscp 'N/A' \
+        --recommended 'N/A' --cis-macos 'N/A' --mscp 'N/A' \
         --recommendation 'Informational only.'
 }
 
@@ -5594,7 +5827,7 @@ check_listening_ports_inventory() {
     add_audit_result --category 'System Services & Daemon Exposure' --control 'Listening Ports Inventory' \
         --status INFO --severity Informational --current "$count listening port(s) found" --details "$joined" \
         --recommended 'N/A' \
-        --cis 'CIS 12.4' --nist 'CA-9' --iso27001 'A.8.20' --nis2 'Art.21(2)(d)' --cis-macos 'CIS-macOS 5.7' --mscp 'N/A' \
+        --cis 'CIS 12.4' --nist 'CA-9' --iso27001 'A.8.20' --nis2 'Art.21(2)(d)' --cis-macos 'N/A' --mscp 'N/A' \
         --recommendation 'Informational only.'
 }
 
@@ -5625,7 +5858,7 @@ check_nonapple_running_launchd_services() {
     # Always INFO: this is inventory, not a judgement.
     add_audit_result --category 'System Services & Daemon Exposure' --control 'Non-Apple Running launchd Services' \
         --status INFO --severity Informational --current "$count non-Apple running service(s)" --details "$joined" \
-        --recommended 'N/A' --cis-macos 'CIS-macOS 5.7' --mscp 'N/A' \
+        --recommended 'N/A' --cis-macos 'N/A' --mscp 'N/A' \
         --recommendation 'Informational only.'
 }
 
@@ -5711,7 +5944,7 @@ check_boot_security_policy() {
             --current 'Not queryable from a running session — Startup Security Utility settings can only be verified by booting into macOS Recovery on Intel Macs with a T2 chip' \
             --recommended 'N/A' \
             --cis 'CIS 10.5' --nist 'SI-7' --mitre 'T1542.001 (System Firmware)' --iso27001 'A.8.24' \
-            --nis2 'Art.21(2)(d)' --nsa 'NSA/CISA Boot Integrity Guidance' --cis-macos 'CIS-macOS 5.1.1' --mscp 'os_secure_boot_level_full_enforce' \
+            --nis2 'Art.21(2)(d)' --nsa 'NSA/CISA Boot Integrity Guidance' --cis-macos 'N/A' --mscp 'os_secure_boot_verify' \
             --recommendation 'Informational only.'
         return
     fi
@@ -5738,7 +5971,7 @@ check_boot_security_policy() {
                 --status PASS --severity High --current 'Security Mode: Full' --details "$ROOT_CMD_OUTPUT" \
                 --recommended 'Full Security' \
                 --cis 'CIS 10.5' --nist 'SI-7' --mitre 'T1542.001 (System Firmware)' --iso27001 'A.8.24' \
-                --nis2 'Art.21(2)(d)' --nsa 'NSA/CISA Boot Integrity Guidance' --cis-macos 'CIS-macOS 5.1.1' --mscp 'os_secure_boot_level_full_enforce' \
+                --nis2 'Art.21(2)(d)' --nsa 'NSA/CISA Boot Integrity Guidance' --cis-macos 'N/A' --mscp 'os_secure_boot_verify' \
                 --recommendation 'No action required.'
             ;;
         Reduced)
@@ -5746,7 +5979,7 @@ check_boot_security_policy() {
                 --status WARN --severity Medium --current 'Security Mode: Reduced' --details "$ROOT_CMD_OUTPUT" \
                 --recommended 'Full Security' \
                 --cis 'CIS 10.5' --nist 'SI-7' --mitre 'T1542.001 (System Firmware)' --iso27001 'A.8.24' \
-                --nis2 'Art.21(2)(d)' --nsa 'NSA/CISA Boot Integrity Guidance' --cis-macos 'CIS-macOS 5.1.1' --mscp 'os_secure_boot_level_full_enforce' \
+                --nis2 'Art.21(2)(d)' --nsa 'NSA/CISA Boot Integrity Guidance' --cis-macos 'N/A' --mscp 'os_secure_boot_verify' \
                 --recommendation 'Consider Full Security unless a specific, documented need (e.g. running unsigned kexts) requires Reduced.'
             ;;
         Permissive)
@@ -5754,14 +5987,14 @@ check_boot_security_policy() {
                 --status FAIL --severity High --current 'Security Mode: Permissive' --details "$ROOT_CMD_OUTPUT" \
                 --recommended 'Full Security' \
                 --cis 'CIS 10.5' --nist 'SI-7' --mitre 'T1542.001 (System Firmware)' --iso27001 'A.8.24' \
-                --nis2 'Art.21(2)(d)' --nsa 'NSA/CISA Boot Integrity Guidance' --cis-macos 'CIS-macOS 5.1.1' --mscp 'os_secure_boot_level_full_enforce' \
+                --nis2 'Art.21(2)(d)' --nsa 'NSA/CISA Boot Integrity Guidance' --cis-macos 'N/A' --mscp 'os_secure_boot_verify' \
                 --recommendation 'This disables nearly all boot-chain integrity verification; restore via Startup Security Utility in Recovery unless deliberately required for development.'
             ;;
         *)
             add_audit_result --category 'Kernel & Boot Security' --control 'Boot Security Policy' \
                 --status WARN --severity Low --current 'Query failed or unrecognized output' --details "$ROOT_CMD_OUTPUT" \
                 --recommended 'Full Security' \
-                --cis-macos 'CIS-macOS 5.1.1' --mscp 'os_secure_boot_level_full_enforce' \
+                --cis-macos 'N/A' --mscp 'os_secure_boot_verify' \
                 --recommendation 'Unable to determine boot security policy; verify manually with "sudo bputil -d".'
             ;;
     esac
@@ -5775,20 +6008,20 @@ check_authenticated_root_status() {
             --status PASS --severity High --current "$ROOT_CMD_OUTPUT" \
             --recommended 'Authenticated Root status: enabled' \
             --cis 'CIS 10.5' --nist 'SI-7' --mitre 'T1542.001 (System Firmware)' --iso27001 'A.8.24' \
-            --nis2 'Art.21(2)(d)' --cis-macos 'CIS-macOS 5.1.1' --mscp 'os_sip_enable' \
+            --nis2 'Art.21(2)(d)' --cis-macos 'CIS-macOS 5.1.4' --mscp 'os_sip_enable' \
             --recommendation 'No action required.'
     elif [[ "$ROOT_CMD_OUTPUT" == *"disabled"* ]]; then
         add_audit_result --category 'Kernel & Boot Security' --control 'Authenticated Root Status' \
             --status FAIL --severity High --current "$ROOT_CMD_OUTPUT" \
             --recommended 'Authenticated Root status: enabled' \
             --cis 'CIS 10.5' --nist 'SI-7' --mitre 'T1542.001 (System Firmware)' --iso27001 'A.8.24' \
-            --nis2 'Art.21(2)(d)' --cis-macos 'CIS-macOS 5.1.1' --mscp 'os_sip_enable' \
+            --nis2 'Art.21(2)(d)' --cis-macos 'CIS-macOS 5.1.4' --mscp 'os_sip_enable' \
             --recommendation 'Re-enable via "csrutil authenticated-root enable" from Recovery — this protects the integrity of the signed system volume against offline tampering.'
     else
         add_audit_result --category 'Kernel & Boot Security' --control 'Authenticated Root Status' \
             --status WARN --severity Low --current "Query failed or unrecognized output: $ROOT_CMD_OUTPUT" \
             --recommended 'Authenticated Root status: enabled' \
-            --cis-macos 'CIS-macOS 5.1.1' --mscp 'os_sip_enable' \
+            --cis-macos 'CIS-macOS 5.1.4' --mscp 'os_sip_enable' \
             --recommendation 'Unable to determine authenticated root status; verify manually with "csrutil authenticated-root status".'
     fi
 }
@@ -5805,21 +6038,21 @@ check_nvram_boot_args() {
             --status PASS --severity Low --current 'No boot-args set' \
             --recommended 'No boot-args set' \
             --cis 'CIS 10.5' --nist 'SI-7, CM-6' --mitre 'T1542.001 (System Firmware)' --iso27001 'A.8.24' \
-            --nis2 'Art.21(2)(d)' --cis-macos 'CIS-macOS 5.1.1' --mscp 'N/A' \
+            --nis2 'Art.21(2)(d)' --cis-macos 'CIS-macOS 5.1.3' --mscp 'N/A' \
             --recommendation 'No action required.'
     elif [[ "$value" == *"amfi_get_out_of_my_way=1"* || "$value" == *"cs_enforcement_disable=1"* || "$value" == *"-arm64e_preview_abi"* ]]; then
         add_audit_result --category 'Kernel & Boot Security' --control 'NVRAM Boot-Args' \
             --status FAIL --severity Critical --current "$value" \
             --recommended 'No boot-args set' \
             --cis 'CIS 10.5' --nist 'SI-7, CM-6' --mitre 'T1542.001 (System Firmware)' --iso27001 'A.8.24' \
-            --nis2 'Art.21(2)(d)' --cis-macos 'CIS-macOS 5.1.1' --mscp 'N/A' \
+            --nis2 'Art.21(2)(d)' --cis-macos 'CIS-macOS 5.1.3' --mscp 'N/A' \
             --recommendation 'Clear the dangerous boot-arg immediately — these disable code-signing/AMFI enforcement at the kernel level; treat as a possible active-compromise indicator.'
     else
         add_audit_result --category 'Kernel & Boot Security' --control 'NVRAM Boot-Args' \
             --status WARN --severity Low --current "$value" \
             --recommended 'No boot-args set' \
             --cis 'CIS 10.5' --nist 'SI-7, CM-6' --mitre 'T1542.001 (System Firmware)' --iso27001 'A.8.24' \
-            --nis2 'Art.21(2)(d)' --cis-macos 'CIS-macOS 5.1.1' --mscp 'N/A' \
+            --nis2 'Art.21(2)(d)' --cis-macos 'CIS-macOS 5.1.3' --mscp 'N/A' \
             --recommendation 'Review the custom boot-arg for legitimacy.'
     fi
 }
@@ -5846,7 +6079,7 @@ check_thirdparty_kext_inventory() {
             --status PASS --severity Informational --current 'No non-Apple kernel extensions loaded' \
             --recommended 'No non-Apple kernel extensions loaded' \
             --cis 'CIS 2.5' --nist 'CM-7, SI-7' --mitre 'T1547.006 (Kernel Modules and Extensions)' --iso27001 'A.8.19' \
-            --nis2 'Art.21(2)(d)' --cis-macos 'CIS-macOS 5.1' --mscp 'N/A' \
+            --nis2 'Art.21(2)(d)' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'No action required.'
     else
         local joined
@@ -5856,7 +6089,7 @@ check_thirdparty_kext_inventory() {
             --details "$joined" \
             --recommended 'No non-Apple kernel extensions loaded' \
             --cis 'CIS 2.5' --nist 'CM-7, SI-7' --mitre 'T1547.006 (Kernel Modules and Extensions)' --iso27001 'A.8.19' \
-            --nis2 'Art.21(2)(d)' --cis-macos 'CIS-macOS 5.1' --mscp 'N/A' \
+            --nis2 'Art.21(2)(d)' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'Legacy kernel extensions run with full kernel privileges — migrate to a System Extension where the vendor supports it, and confirm each loaded kext is expected.'
     fi
 }
@@ -5877,12 +6110,12 @@ check_docker_desktop_presence() {
     if [[ $ROOT_CMD_STATUS -eq 0 ]]; then
         add_audit_result --category 'Virtualization & Container Escape Surface' --control 'Docker Desktop Presence' \
             --status INFO --severity Informational --current 'Docker Desktop is running' \
-            --recommended 'N/A' --cis-macos 'CIS-macOS 5.8' --mscp 'N/A' \
+            --recommended 'N/A' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'Informational only.'
     else
         add_audit_result --category 'Virtualization & Container Escape Surface' --control 'Docker Desktop Presence' \
             --status INFO --severity Informational --current 'Docker Desktop is not running' \
-            --recommended 'N/A' --cis-macos 'CIS-macOS 5.8' --mscp 'N/A' \
+            --recommended 'N/A' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'Informational only.'
     fi
 }
@@ -5912,7 +6145,7 @@ _vm_hypervisor_apps_check() {
     # Always INFO: this is inventory, not a judgement.
     add_audit_result --category 'Virtualization & Container Escape Surface' --control 'VM Hypervisor Apps Inventory' \
         --status INFO --severity Informational --current "$current" \
-        --recommended 'N/A' --cis-macos 'CIS-macOS 5.8' --mscp 'N/A' \
+        --recommended 'N/A' --cis-macos 'N/A' --mscp 'N/A' \
         --recommendation 'Informational only. Review each VM host'"'"'s shared-folder/clipboard configuration manually, since it cannot be safely enumerated without invoking the hypervisor'"'"'s own tooling.'
 }
 
@@ -5933,27 +6166,50 @@ check_screenshot_save_location_cloud_exposure() {
         add_audit_result --category 'Data Loss Prevention & Sensitive Data' --control 'Screenshot Save Location Cloud Exposure' \
             --status WARN --severity Low --current "$location" \
             --recommended 'A non-iCloud save location' \
-            --cis 'CIS 3.11' --nist 'SI-4' --iso27001 'A.8.12' --nis2 'Art.21(2)(h)' --cis-macos 'CIS-macOS 2.11' --mscp 'N/A' \
+            --cis 'CIS 3.11' --nist 'SI-4' --iso27001 'A.8.12' --nis2 'Art.21(2)(h)' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'Be aware screenshots may contain sensitive on-screen data and could sync to iCloud from this location; change the save location in Screenshot app preferences if that'"'"'s undesired.'
     else
         add_audit_result --category 'Data Loss Prevention & Sensitive Data' --control 'Screenshot Save Location Cloud Exposure' \
             --status PASS --severity Low --current "$location" \
             --recommended 'A non-iCloud save location' \
-            --cis 'CIS 3.11' --nist 'SI-4' --iso27001 'A.8.12' --nis2 'Art.21(2)(h)' --cis-macos 'CIS-macOS 2.11' --mscp 'N/A' \
+            --cis 'CIS 3.11' --nist 'SI-4' --iso27001 'A.8.12' --nis2 'Art.21(2)(h)' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'No action required.'
     fi
 }
 
-check_handoff_universal_clipboard_note() {
-    # No command: always INFO, per honesty-over-false-precision (same
-    # style as Task 16's FIPS check) — Handoff/Universal Clipboard
-    # exposure across a user's trusted-device set cannot be queried
-    # reliably from a single documented CLI key across macOS 15/26.
-    add_audit_result --category 'Data Loss Prevention & Sensitive Data' --control 'Handoff / Universal Clipboard' \
-        --status INFO --severity Informational \
-        --current 'Handoff/Universal Clipboard exposure across trusted devices cannot be reliably queried from the command line; review manually in System Settings > General > AirDrop & Handoff' \
-        --recommended 'N/A' --cis-macos 'CIS-macOS 2.11' --mscp 'N/A' \
-        --recommendation 'Informational only.'
+# Handoff / Universal Clipboard: enforced off by a Restrictions profile
+# (allowActivityContinuation=false, mSCP os_handoff_disable), or turned
+# off by the user (ByHost com.apple.coreservices.useractivityd, both
+# ActivityAdvertisingAllowed and ActivityReceivingAllowed false). Enabled
+# is the macOS default, so it is reported as INFO rather than a failure.
+check_handoff_universal_clipboard() {
+    local profile="" advertising="" receiving=""
+    profile=$(managed_pref_read com.apple.applicationaccess allowActivityContinuation)
+    if [[ -n "$CONSOLE_USER" ]]; then
+        run_as_user defaults -currentHost read com.apple.coreservices.useractivityd ActivityAdvertisingAllowed
+        [[ $RUN_AS_USER_STATUS -eq 0 ]] && advertising="$RUN_AS_USER_OUTPUT"
+        run_as_user defaults -currentHost read com.apple.coreservices.useractivityd ActivityReceivingAllowed
+        [[ $RUN_AS_USER_STATUS -eq 0 ]] && receiving="$RUN_AS_USER_OUTPUT"
+    fi
+    local -a fw
+    fw=(--recommended 'Handoff disabled where clipboard and app state must not cross devices'
+        --cis 'CIS 4.8' --nist 'AC-20, SC-7' --mitre 'T1115 (Clipboard Data)' --iso27001 'A.5.14'
+        --nis2 'Art.21(2)(d)' --cis-macos 'N/A' --mscp 'os_handoff_disable')
+    if [[ "$profile" == 0 ]]; then
+        add_audit_result --category 'Data Loss Prevention & Sensitive Data' --control 'Handoff / Universal Clipboard' \
+            --status PASS --severity Low --current 'Disabled by configuration profile (allowActivityContinuation=false)' "${fw[@]}" \
+            --recommendation 'No action required.'
+    elif [[ "$advertising" == 0 && "$receiving" == 0 ]]; then
+        add_audit_result --category 'Data Loss Prevention & Sensitive Data' --control 'Handoff / Universal Clipboard' \
+            --status PASS --severity Low --current "Turned off by ${CONSOLE_USER} (not enforced by a profile)" "${fw[@]}" \
+            --recommendation 'No action required; enforce with a Restrictions profile (allowActivityContinuation=false) to keep it off.'
+    else
+        add_audit_result --category 'Data Loss Prevention & Sensitive Data' --control 'Handoff / Universal Clipboard' \
+            --status INFO --severity Informational \
+            --current "Handoff enabled (macOS default${profile:+; profile allowActivityContinuation=$profile})" "${fw[@]}" \
+            --recommendation 'Clipboard contents and app activity sync to every device signed in to the same Apple Account. Where that is unacceptable, deploy a Restrictions profile with allowActivityContinuation=false.'
+        [[ "$profile" != 1 ]] && record_profile_fix com.apple.applicationaccess allowActivityContinuation 0
+    fi
 }
 
 # ---- 39-inventory.zsh ----
@@ -5977,7 +6233,7 @@ check_system_hardware_summary() {
     add_audit_result --category 'System Inventory & Asset Information' --control 'System Hardware Summary' \
         --status INFO --severity Informational \
         --current "Model Name: ${model_name:-Unknown}; Model Identifier: ${model_identifier:-Unknown}; Chip: ${chip:-Unknown}; Memory: ${ram:-Unknown}" \
-        --recommended 'N/A' --cis-macos 'CIS-macOS 1.1' --mscp 'N/A' \
+        --recommended 'N/A' --cis-macos 'N/A' --mscp 'N/A' \
         --recommendation 'Informational only.'
 }
 
@@ -5996,7 +6252,7 @@ check_os_version_and_build() {
     add_audit_result --category 'System Inventory & Asset Information' --control 'OS Version & Build' \
         --status INFO --severity Informational \
         --current "$product_name $product_version (Build $build_version)" \
-        --recommended 'N/A' --cis-macos 'CIS-macOS 1.1' --mscp 'N/A' \
+        --recommended 'N/A' --cis-macos 'N/A' --mscp 'N/A' \
         --recommendation 'Informational only.'
 }
 
@@ -6014,12 +6270,12 @@ check_disk_space_utilization() {
     if (( free_pct < 10 )); then
         add_audit_result --category 'System Inventory & Asset Information' --control 'Disk Space Utilization' \
             --status WARN --severity Low --current "$capacity used ($free_pct% free)" \
-            --recommended '>=10% free' --cis-macos 'CIS-macOS 1.1' --mscp 'N/A' \
+            --recommended '>=10% free' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'Free up disk space — low free space can block macOS updates and Time Machine snapshots.'
     else
         add_audit_result --category 'System Inventory & Asset Information' --control 'Disk Space Utilization' \
             --status PASS --severity Low --current "$capacity used ($free_pct% free)" \
-            --recommended '>=10% free' --cis-macos 'CIS-macOS 1.1' --mscp 'N/A' \
+            --recommended '>=10% free' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'No action required.'
     fi
 }
@@ -6042,7 +6298,7 @@ check_installed_application_count() {
     add_audit_result --category 'System Inventory & Asset Information' --control 'Installed Application Count' \
         --status INFO --severity Informational --current "${#names[@]} application(s)" \
         --details "$joined" \
-        --recommended 'N/A' --cis-macos 'CIS-macOS 1.1' --mscp 'N/A' \
+        --recommended 'N/A' --cis-macos 'N/A' --mscp 'N/A' \
         --recommendation 'Informational only.'
 }
 
@@ -6061,7 +6317,7 @@ check_uptime_and_last_boot() {
     if [[ -z "$sec_str" ]]; then
         add_audit_result --category 'System Inventory & Asset Information' --control 'Uptime & Last Boot' \
             --status INFO --severity Informational --current 'Unable to determine boot time' \
-            --recommended 'N/A' --cis-macos 'CIS-macOS 1.1' --mscp 'N/A' \
+            --recommended 'N/A' --cis-macos 'N/A' --mscp 'N/A' \
             --recommendation 'Informational only.'
         return
     fi
@@ -6076,7 +6332,7 @@ check_uptime_and_last_boot() {
     # Always INFO: this is inventory, not a judgement.
     add_audit_result --category 'System Inventory & Asset Information' --control 'Uptime & Last Boot' \
         --status INFO --severity Informational --current "Last boot: $boot_date; Uptime: ${days}d ${hours}h" \
-        --recommended 'N/A' --cis-macos 'CIS-macOS 1.1' --mscp 'N/A' \
+        --recommended 'N/A' --cis-macos 'N/A' --mscp 'N/A' \
         --recommendation 'Informational only.'
 }
 
@@ -7000,7 +7256,7 @@ get_remediation_snippet() {
         os_gatekeeper_enable)
             print -r -- 'sudo spctl --master-enable'
             ;;
-        os_filevault_enable)
+        system_settings_filevault_enforce)
             cat <<'EOF'
 echo "FileVault needs an interactive prompt or a pre-generated institutional recovery key; it cannot be silently enabled unattended."
 echo "Run interactively: sudo fdesetup enable"
@@ -7009,26 +7265,28 @@ EOF
         os_root_disable)
             print -r -- "sudo dscl . -create /Users/root Password '*'"
             ;;
-        os_guest_account_disable)
+        system_settings_guest_account_disable)
             print -r -- 'sudo defaults write /Library/Preferences/com.apple.loginwindow GuestEnabled -bool false'
             ;;
-        os_firewall_enable)
+        system_settings_firewall_enable)
             print -r -- 'sudo /usr/libexec/ApplicationFirewall/socketfilterfw --setglobalstate on'
             ;;
-        os_sshd_permit_root_login_disable)
+        os_sshd_permit_root_login_configure)
             cat <<'EOF'
 sudo cp /etc/ssh/sshd_config "/etc/ssh/sshd_config.bak.$(date +%Y%m%d%H%M%S)"
 sudo sed -i '' -E 's/^#?PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
 echo "sshd_config updated. Restart sshd (or reboot) for the change to take effect."
 EOF
             ;;
-        os_screensaver_password_enforce)
+        system_settings_screensaver_password_enforce)
             print -r -- 'sudo -u "$CONSOLE_USER" defaults write com.apple.screensaver askForPassword -bool true'
             ;;
-        os_autologin_disable)
+        system_settings_automatic_login_disable)
             print -r -- 'sudo defaults delete /Library/Preferences/com.apple.loginwindow autoLoginUser'
             ;;
-        os_dyld_insert_libraries_unset)
+        # Controls with no mSCP rule are keyed by control name (see
+        # _remediation_snippet_for). Never key a snippet on "N/A".
+        'control:DYLD_INSERT_LIBRARIES Global Env')
             print -r -- 'sudo launchctl unsetenv DYLD_INSERT_LIBRARIES'
             ;;
         # --- CIS Apple macOS 26 Tahoe additions. Only single-setting,
@@ -7082,6 +7340,20 @@ EOF
     esac
 }
 
+# Resolves the snippet for one finding: each mSCP rule ID in its
+# (possibly comma-separated) mSCP field, then the control name for
+# controls mSCP has no rule for. "N/A" never matches anything.
+_remediation_snippet_for() {
+    local mscp_field="$1" control="$2" id="" snippet=""
+    for id in ${(s:,:)mscp_field}; do
+        id="${id//[[:space:]]/}"
+        [[ -z "$id" || "$id" == N/A ]] && continue
+        snippet=$(get_remediation_snippet "$id")
+        [[ -n "$snippet" ]] && { print -r -- "$snippet"; return 0; }
+    done
+    get_remediation_snippet "control:$control"
+}
+
 generate_remediation_script() {
     local output_path="$1"
     local i total="${#AUDIT_STATUS[@]}"
@@ -7133,7 +7405,7 @@ generate_remediation_script() {
                 echo "# --------------------------------------------------------------------------"
 
                 local snippet="" control_esc="" reco_esc=""
-                snippet=$(get_remediation_snippet "${AUDIT_MSCP[$idx]}")
+                snippet=$(_remediation_snippet_for "${AUDIT_MSCP[$idx]}" "${AUDIT_CONTROL[$idx]}")
                 control_esc=$(_shell_single_quote_escape "${AUDIT_CONTROL[$idx]}")
 
                 if [[ -n "$snippet" ]]; then
@@ -7152,6 +7424,137 @@ generate_remediation_script() {
         fi
     } > "$output_path"
     chmod +x "$output_path"
+}
+
+# ---- 94-profile.zsh ----
+#
+# Hardening profile generator (--generate-profile). Turns every
+# profile-enforceable setting that came out WARN or FAIL this run
+# (recorded by record_profile_fix in 01-core.zsh) into one unsigned
+# .mobileconfig for review and upload to an MDM. It is written to disk
+# only — never installed: the auditor does not change system state.
+#
+# com.apple.applicationaccess keys use the native Restrictions payload;
+# every other preference domain goes into a Custom Settings
+# (com.apple.ManagedClient.preferences) payload, the MDM-standard way to
+# force arbitrary managed preferences.
+
+# Settings that take an integer even when the recommended value is 0/1.
+typeset -ga PROFILE_INTEGER_KEYS
+PROFILE_INTEGER_KEYS=(RetriesUntilHint idleTime enforcedSoftwareUpdateDelay 'Siri Data Sharing Opt-In Status'
+    'Search Queries Data Sharing Status' BlockStoragePolicy WebKitStorageBlockingPolicy
+    WebKitPreferences.storageBlockingPolicy)
+
+_plist_escape() {
+    local s="$1"
+    s="${s//&/&amp;}"; s="${s//</&lt;}"; s="${s//>/&gt;}"
+    print -r -- "$s"
+}
+
+# <key>…</key> plus a typed value element.
+_plist_kv() {
+    local key="$1" value="$2" indent="$3"
+    print -r -- "$indent<key>$(_plist_escape "$key")</key>"
+    if (( ${PROFILE_INTEGER_KEYS[(Ie)$key]} )) || [[ "$value" != [01] ]]; then
+        if [[ "$value" == <-> ]]; then
+            print -r -- "$indent<integer>$value</integer>"
+        else
+            print -r -- "$indent<string>$(_plist_escape "$value")</string>"
+        fi
+    elif [[ "$value" == 1 ]]; then
+        print -r -- "$indent<true/>"
+    else
+        print -r -- "$indent<false/>"
+    fi
+}
+
+_new_uuid() {
+    uuidgen 2>/dev/null || print -r -- "$(date +%s)-$RANDOM-$RANDOM"
+}
+
+# Prints the profile XML for the recorded fixes; returns 1 when there are none.
+render_hardening_profile() {
+    local i="" suite="" key="" value="" profile_uuid=""
+    local -a restriction_idx custom_suites
+    (( ${#PROFILE_FIX_KEYS[@]} > 0 )) || return 1
+    for (( i = 1; i <= ${#PROFILE_FIX_KEYS[@]}; i++ )); do
+        if [[ "${PROFILE_FIX_SUITES[$i]}" == com.apple.applicationaccess ]]; then
+            restriction_idx+=("$i")
+        else
+            (( ${custom_suites[(Ie)${PROFILE_FIX_SUITES[$i]}]} )) || custom_suites+=("${PROFILE_FIX_SUITES[$i]}")
+        fi
+    done
+    profile_uuid=$(_new_uuid)
+
+    cat <<EOH
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>PayloadContent</key>
+    <array>
+EOH
+    if (( ${#restriction_idx[@]} )); then
+        print -r -- '        <dict>'
+        print -r -- '            <key>PayloadType</key><string>com.apple.applicationaccess</string>'
+        print -r -- "            <key>PayloadIdentifier</key><string>com.endpointposturecheck.hardening.restrictions</string>"
+        print -r -- "            <key>PayloadUUID</key><string>$(_new_uuid)</string>"
+        print -r -- '            <key>PayloadVersion</key><integer>1</integer>'
+        print -r -- '            <key>PayloadDisplayName</key><string>Restrictions</string>'
+        for i in "${restriction_idx[@]}"; do
+            _plist_kv "${PROFILE_FIX_KEYS[$i]}" "${PROFILE_FIX_VALUES[$i]}" '            '
+        done
+        print -r -- '        </dict>'
+    fi
+    if (( ${#custom_suites[@]} )); then
+        print -r -- '        <dict>'
+        print -r -- '            <key>PayloadType</key><string>com.apple.ManagedClient.preferences</string>'
+        print -r -- "            <key>PayloadIdentifier</key><string>com.endpointposturecheck.hardening.custom</string>"
+        print -r -- "            <key>PayloadUUID</key><string>$(_new_uuid)</string>"
+        print -r -- '            <key>PayloadVersion</key><integer>1</integer>'
+        print -r -- '            <key>PayloadDisplayName</key><string>Custom Settings</string>'
+        print -r -- '            <key>PayloadContent</key>'
+        print -r -- '            <dict>'
+        for suite in "${custom_suites[@]}"; do
+            print -r -- "                <key>$(_plist_escape "$suite")</key>"
+            print -r -- '                <dict><key>Forced</key><array><dict><key>mcx_preference_settings</key><dict>'
+            for (( i = 1; i <= ${#PROFILE_FIX_KEYS[@]}; i++ )); do
+                [[ "${PROFILE_FIX_SUITES[$i]}" == "$suite" ]] || continue
+                _plist_kv "${PROFILE_FIX_KEYS[$i]}" "${PROFILE_FIX_VALUES[$i]}" '                    '
+            done
+            print -r -- '                </dict></dict></array></dict>'
+        done
+        print -r -- '            </dict>'
+        print -r -- '        </dict>'
+    fi
+    cat <<EOF2
+    </array>
+    <key>PayloadDisplayName</key>
+    <string>EndpointPostureCheck Hardening (${COMPUTER_NAME:-this Mac})</string>
+    <key>PayloadDescription</key>
+    <string>Generated by EndpointPostureCheck from the profile-enforceable WARN/FAIL findings of one audit run. Review every setting and test on a pilot Mac before deploying through your MDM. Unsigned.</string>
+    <key>PayloadIdentifier</key>
+    <string>com.endpointposturecheck.hardening.$profile_uuid</string>
+    <key>PayloadUUID</key>
+    <string>$profile_uuid</string>
+    <key>PayloadType</key>
+    <string>Configuration</string>
+    <key>PayloadScope</key>
+    <string>System</string>
+    <key>PayloadVersion</key>
+    <integer>1</integer>
+</dict>
+</plist>
+EOF2
+}
+
+generate_hardening_profile() {
+    local output_path="$1"
+    if ! render_hardening_profile > "$output_path"; then
+        command rm -f "$output_path"
+        return 1
+    fi
+    chmod 644 "$output_path"
 }
 
 # ---- 99-main.zsh ----
@@ -7206,10 +7609,12 @@ _resolve_output_paths() {
         HTML_OUTPUT_PATH="$(pwd)/$default_html_name"
         JSON_OUTPUT_PATH="$(pwd)/$default_json_name"
         REMEDIATION_OUTPUT_PATH="$(pwd)/Remediate-EndpointPostureCheck.sh"
+        PROFILE_OUTPUT_PATH="$(pwd)/EndpointPostureCheck-Hardening.mobileconfig"
     elif [[ -d "$REPORT_PATH" ]]; then
         HTML_OUTPUT_PATH="$REPORT_PATH/$default_html_name"
         JSON_OUTPUT_PATH="$REPORT_PATH/$default_json_name"
         REMEDIATION_OUTPUT_PATH="$REPORT_PATH/Remediate-EndpointPostureCheck.sh"
+        PROFILE_OUTPUT_PATH="$REPORT_PATH/EndpointPostureCheck-Hardening.mobileconfig"
     else
         HTML_OUTPUT_PATH="$REPORT_PATH"
         local parent_dir
@@ -7217,6 +7622,7 @@ _resolve_output_paths() {
         [[ ! -d "$parent_dir" ]] && mkdir -p "$parent_dir"
         JSON_OUTPUT_PATH="$parent_dir/$default_json_name"
         REMEDIATION_OUTPUT_PATH="$parent_dir/Remediate-EndpointPostureCheck.sh"
+        PROFILE_OUTPUT_PATH="$parent_dir/EndpointPostureCheck-Hardening.mobileconfig"
     fi
 }
 
@@ -7232,7 +7638,15 @@ main() {
     echo "Start Time  : $START_TIME_HUMAN"
     echo ''
 
+    # Slow, independent queries run in the background while the other
+    # checks execute (measured: sfltool dumpbtm 3-23s, Wi-Fi ~8s, the
+    # 7-day XProtect Remediator log a few seconds).
+    prefetch btm sfltool dumpbtm
+    prefetch wifi system_profiler SPAirPortDataType
+    prefetch xpr_log xpr_log_query
+
     _run_all_checks
+    prefetch_cleanup
 
     get_compliance_posture
     _print_audit_summary
@@ -7252,6 +7666,14 @@ main() {
         echo "[+] Remediation script written : $REMEDIATION_OUTPUT_PATH"
     fi
 
+    if [[ "${GENERATE_PROFILE:-0}" -eq 1 ]]; then
+        if generate_hardening_profile "$PROFILE_OUTPUT_PATH"; then
+            echo "[+] Hardening profile written  : $PROFILE_OUTPUT_PATH (${#PROFILE_FIX_KEYS[@]} setting(s); review before deploying)"
+        else
+            echo "[=] No profile-enforceable WARN/FAIL settings; no hardening profile written."
+        fi
+    fi
+
     echo ''
     echo "EndpointPostureCheck completed in $(( $(date +%s) - START_TIME_EPOCH )) second(s)."
     echo ''
@@ -7269,7 +7691,7 @@ AUDIT_CHECKS=(
     # Domain 4: Gatekeeper, Notarization & Application Control
     check_gatekeeper_status check_quarantine_enforcement_telemetry check_applications_quarantine_flag_survey
     # Domain 5: Malware Defense (XProtect / MRT / EDR)
-    check_xprotect_freshness check_mrt_freshness check_third_party_edr_presence check_endpoint_security_clients
+    check_xprotect_freshness check_xprotect_remediator_results check_mrt_freshness check_third_party_edr_presence check_endpoint_security_clients
     # Domain 6: TCC & Privacy Controls
     check_tcc_full_disk_access_grants check_tcc_screen_recording_grants check_tcc_accessibility_grants
     check_tcc_camera_microphone_grants check_tcc_database_permissions
@@ -7315,7 +7737,7 @@ AUDIT_CHECKS=(
     check_home_folders_secure check_world_writable_applications check_world_writable_system_folder
     check_world_writable_library_folder
     # Domain 17: Dylib Hijacking & Code Injection
-    check_dyld_insert_libraries_global_env check_writable_dylib_search_paths check_hardened_runtime_spotcheck
+    check_dyld_insert_libraries_global_env check_writable_dylib_search_paths check_hardened_runtime_spotcheck check_electron_node_fuses
     # Domain 18: Credential Exposure & Secret Leaks
     check_ssh_private_key_permissions check_cloud_cli_credential_files check_shell_history_secret_sweep check_sensitive_filename_sweep
     # Domain 19: Screen Lock & Physical Access
@@ -7346,7 +7768,7 @@ AUDIT_CHECKS=(
     # Domain 28: Virtualization & Container Escape Surface
     check_docker_desktop_presence check_vm_hypervisor_apps_inventory
     # Domain 29: Data Loss Prevention & Sensitive Data
-    check_screenshot_save_location_cloud_exposure check_handoff_universal_clipboard_note
+    check_screenshot_save_location_cloud_exposure check_handoff_universal_clipboard
     # Domain 31: Apple Intelligence, Siri & Analytics
     check_external_intelligence_disabled check_external_intelligence_sign_in_disabled check_writing_tools_disabled
     check_mail_summarization_disabled check_notes_transcription_disabled check_notes_summarization_disabled

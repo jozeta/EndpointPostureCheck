@@ -3,6 +3,7 @@
 *.json
 Remediate-*.ps1
 Remediate-EndpointPostureCheck.sh
+EndpointPostureCheck-Hardening.mobileconfig
 Reports/
 
 # Development-only folders (source, tests, planning docs) — not published

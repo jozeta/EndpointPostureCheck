@@ -5,7 +5,7 @@
 This repository contains two independent tools sharing one design philosophy (fault-isolated checks, weighted compliance scoring, a self-contained HTML dashboard, optional JSON export and generated remediation script):
 
 - [`Invoke-EndpointPostureCheck.ps1`](#endpointposturecheck-for-windows) — Windows 11 Enterprise, 142 checks across 34 domains.
-- [`Invoke-MacPostureCheck.sh`](#endpointposturecheck-for-macos) — macOS 15 (Sequoia) / 26 (Tahoe), 183 checks across 32 domains.
+- [`Invoke-MacPostureCheck.sh`](#endpointposturecheck-for-macos) — macOS 15 (Sequoia) / 26 (Tahoe), 185 checks across 32 domains.
 
 ---
 
@@ -223,7 +223,7 @@ This tool includes deep-inspection checks — LSASS/credential exposure, ACL/pri
 
 **A comprehensive, standalone zsh security posture auditor for macOS 15 (Sequoia) and 26 (Tahoe) endpoints.**
 
-`Invoke-MacPostureCheck.sh` runs **183 read-only security controls** across 32 hardening domains — from Secure Enclave/T2 platform integrity and System Integrity Protection through Gatekeeper, TCC privacy controls, FileVault, credential exposure, and ransomware resilience — and renders the results as a single-file, interactive HTML dashboard, in the same visual language as the Windows edition. Every finding is mapped to CIS Controls v8, NIST SP 800-53 Rev.5, MITRE ATT&CK, ISO/IEC 27001:2022, the NIS2 Directive, NSA/CISA guidance, the CIS Apple macOS Benchmark, and the macOS Security Compliance Project (mSCP) — two mappings the Windows edition doesn't carry, since they're macOS-specific authoritative baselines. Findings backed by a real item list (installed apps, listening ports, admin group members, TCC grants, and more) show a hover tooltip in the HTML dashboard with the full list, one item per line, instead of cluttering the table with a long inline value.
+`Invoke-MacPostureCheck.sh` runs **185 read-only security controls** across 32 hardening domains — from Secure Enclave/T2 platform integrity and System Integrity Protection through Gatekeeper, TCC privacy controls, FileVault, credential exposure, and ransomware resilience — and renders the results as a single-file, interactive HTML dashboard, in the same visual language as the Windows edition. Every finding is mapped to CIS Controls v8, NIST SP 800-53 Rev.5, MITRE ATT&CK, ISO/IEC 27001:2022, the NIS2 Directive, NSA/CISA guidance, the CIS Apple macOS Benchmark, and the macOS Security Compliance Project (mSCP) — two mappings the Windows edition doesn't carry, since they're macOS-specific authoritative baselines. Findings backed by a real item list (installed apps, listening ports, admin group members, TCC grants, and more) show a hover tooltip in the HTML dashboard with the full list, one item per line, instead of cluttering the table with a long inline value.
 
 It runs standalone with zero external dependencies: no Homebrew packages, no Python, nothing beyond the zsh shell and command-line tools Apple ships on every Mac.
 
@@ -245,7 +245,7 @@ It runs standalone with zero external dependencies: no Homebrew packages, no Pyt
 sudo ./Invoke-MacPostureCheck.sh
 
 # Full audit + JSON export + generated remediation script, written to a specific folder
-sudo ./Invoke-MacPostureCheck.sh --report-path ~/Reports --export-json --generate-remediation
+sudo ./Invoke-MacPostureCheck.sh --report-path ~/Reports --export-json --generate-remediation --generate-profile
 ```
 
 The script must be run with `sudo`. If it isn't, it exits immediately with a clear message rather than continuing with a partial, misleading result — checks that need a specific console user's preferences (screen lock, Safari settings, iCloud/AirDrop state, etc.) are still read correctly under `sudo` by dropping to that user for just those reads, not by running the whole audit unprivileged.
@@ -257,11 +257,12 @@ The script must be run with `sudo`. If it isn't, it exits immediately with a cle
 | `--report-path <dir\|file>` | Optional output location for the HTML dashboard. Accepts a directory (default filename is used) or a full file path. Defaults to the current working directory. |
 | `--export-json` | Exports the complete structured finding set, plus posture/summary metadata, to a JSON file alongside the HTML report. |
 | `--generate-remediation` | Generates `Remediate-EndpointPostureCheck.sh`, containing a remediation block for every `FAIL` finding from the current run. |
+| `--generate-profile` | Generates `EndpointPostureCheck-Hardening.mobileconfig` with the compliant value of every setting that a configuration profile can enforce and that came out `WARN` or `FAIL`. Written for review and upload to an MDM, never installed. |
 | `--help` | Show usage and exit. |
 
 ### Output Files
 
-Same three-file pattern as the Windows edition: `EndpointPostureCheck_<hostname>_<timestamp>.html` (always generated), `EndpointPostureCheck_<hostname>_<timestamp>.json` (with `--export-json`), `Remediate-EndpointPostureCheck.sh` (with `--generate-remediation`, supports `--dry-run`/`--force`, defaults to preview-only).
+Same three-file pattern as the Windows edition: `EndpointPostureCheck_<hostname>_<timestamp>.html` (always generated), `EndpointPostureCheck_<hostname>_<timestamp>.json` (with `--export-json`), `Remediate-EndpointPostureCheck.sh` (with `--generate-remediation`, supports `--dry-run`/`--force`, defaults to preview-only). With `--generate-profile` there is a fourth: `EndpointPostureCheck-Hardening.mobileconfig`, an unsigned profile with a Restrictions payload and a Custom Settings payload. Review every setting and test it on a pilot Mac before deploying.
 
 ### Understanding the Report
 
@@ -269,7 +270,7 @@ Identical `PASS`/`FAIL`/`WARN`/`INFO` status semantics, `Critical`/`High`/`Mediu
 
 ### Audit Domains
 
-183 checks organized across 32 domains:
+185 checks organized across 32 domains:
 
 | # | Domain |
 |---|---|
@@ -369,7 +370,7 @@ most likely to be asked for directly.
 
 ### Design Principles
 
-Same three principles as the Windows edition, carried over deliberately: **honesty over false precision** (several macOS checks — Handoff/Universal Clipboard exposure, FIPS crypto-module validation — say so explicitly rather than guessing, where macOS exposes no clean, documented CLI signal); **no duplicate/contradictory checks** (a few candidate checks were cut during design specifically to avoid two checks silently disagreeing about the same underlying setting); **performance-bounded scans** (shell-history and sensitive-filename sweeps are capped to recent/top-level content, never a full recursive disk walk).
+Same three principles as the Windows edition, carried over deliberately: **honesty over false precision** (several macOS checks — FIPS crypto-module validation, for example — say so explicitly rather than guessing, where macOS exposes no clean, documented CLI signal); **no duplicate/contradictory checks** (a few candidate checks were cut during design specifically to avoid two checks silently disagreeing about the same underlying setting); **performance-bounded scans** (shell-history and sensitive-filename sweeps are capped to recent/top-level content, never a full recursive disk walk).
 
 ---
 

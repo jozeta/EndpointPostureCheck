@@ -6,6 +6,22 @@ The project has no tagged releases yet, so changes are grouped by date. Entries 
 
 ## Unreleased
 
+- macOS: XProtect Remediator scan results (7-day unified log): any result other than NoThreatDetected
+  is a FAIL, since it means macOS found malware
+- macOS: Electron apps whose Node execution fuses are on (RunAsNode, NODE_OPTIONS, `--inspect`),
+  which lets local code run inside the app with its privacy permissions (CVE-2025-54871 class)
+- macOS: Handoff / Universal Clipboard is now a real check (profile or user setting) instead of a
+  "cannot be verified" note
+- macOS: `--generate-profile` writes `EndpointPostureCheck-Hardening.mobileconfig` with the compliant
+  value of every profile-enforceable WARN/FAIL setting, for review before deploying through an MDM
+- macOS: the three slowest queries (login items, Wi-Fi, XProtect log) now run in the background
+  while the other checks execute, with a 180 s timeout. A query that started in the background is
+  never started a second time (full run on the test Mac: 56 s to 41 s)
+- macOS: mSCP rule IDs corrected to real Tahoe rules (24 were not real IDs), and CIS-macOS
+  references renumbered to the CIS Apple macOS 26 Tahoe Benchmark v1.0.0
+- macOS: fixed a remediation-script bug where a renamed key would have attached the DYLD fix to
+  every finding without an mSCP rule
+
 - PSScriptAnalyzer clean-up: checks that fail quietly now say why with `-Verbose`; removed five values
   that were read but never used (including an unused Device Guard query)
 

@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Two independent, zero-dependency security posture auditors that share one design:
 
 - `Invoke-EndpointPostureCheck.ps1`: Windows 11 Enterprise, PowerShell, 142 checks / 34 domains.
-- `Invoke-MacPostureCheck.sh`: macOS 15/26, zsh, 183 checks / 32 domains.
+- `Invoke-MacPostureCheck.sh`: macOS 15/26, zsh, 185 checks / 32 domains.
 
 Each produces a self-contained HTML dashboard with weighted compliance scoring and framework
 mappings, plus optional JSON export and a generated remediation script.
@@ -30,9 +30,14 @@ reviewing the HTML report.
 ## Build (macOS edition)
 
 `build.sh` concatenates `src/*.zsh` (in filename order) into `Invoke-MacPostureCheck.sh` and
-stamps a "do not edit directly" header. **`src/` is not in the repo**, so the committed
-`Invoke-MacPostureCheck.sh` is currently the only source. Edit it directly unless `src/`
-is restored, and don't run `build.sh` without it (it exits with an error).
+stamps a "do not edit directly" header. **`src/` and the zsh tests are kept locally and are not
+in the repo** (gitignored, waived in `.claude-standards`). When `src/` is present, edit the
+modules there, run `./build.sh`, and run the zsh tests with `tests/run-tests.sh`. Commit the
+rebuilt `Invoke-MacPostureCheck.sh`.
+
+If `src/` is missing, it can be recovered without loss from the built script, since every module
+is marked `# ---- <name>.zsh ----`. Split on those markers, restore each module's shebang line,
+and drop the one blank line `build.sh` adds before each marker. Then rebuild and diff to confirm.
 
 ## Design rules (from README "Design Principles")
 
