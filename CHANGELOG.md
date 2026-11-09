@@ -6,6 +6,11 @@ The project has no tagged releases yet, so changes are grouped by date. Entries 
 
 ## Unreleased
 
+- macOS dashboard redesigned in the Låda Glass family look (frosted glass, dark main theme, light
+  following the system, theme switch): sidebar with a per-domain FAIL/WARN count that filters the
+  table, KPI cards that filter by status, score ring, item lists in a keyboard-accessible popover,
+  phone layout without horizontal scrolling, print styles. Låda Glass 1.1.1 is vendored in
+  `vendor/lada-glass/` and inlined at build time, so reports stay single offline files.
 - **Security (macOS):** a user-controlled value could run commands as root during an audit. The
   screen-lock fallback read `askForPasswordDelay` from the user's own preferences and compared it
   in a zsh arithmetic context, which executes `$(...)` inside an array subscript. Fixed by

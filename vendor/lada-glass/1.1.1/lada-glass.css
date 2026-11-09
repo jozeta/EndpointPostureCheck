@@ -1,0 +1,370 @@
+/* Låda Glass 1.1.1: the shared look of Johan's apps (tools/design).
+   Dark charcoal frosted glass is the main theme, light the alternative; compact density; custom
+   accents. Values come from Låda (tokens.json); no build step, no dependencies, works from file://.
+
+   Use:   <link rel="stylesheet" href="vendor/lada-glass/1.1.1/lada-glass.css">
+   Bootstrap apps: also <link rel="stylesheet" href="vendor/lada-glass/1.1.1/lada-glass-bootstrap.css"> after it.
+          <body class="lg lg-backdrop">  … components below …
+   Theme:  follows the system; force one with <html data-theme="dark|light">.
+   Accent: <html data-accent="arctic-teal" data-accent-2="aurora-green">, or set your own:
+           :root { --lg-accent-d: #…; --lg-accent-l: #…; }  (d = dark theme, l = light theme)
+   Density: compact by default; <html data-density="comfortable"> for more room.
+   Everything is prefixed lg- so it doesn't collide with an app's own CSS. */
+
+/* ---- tokens --------------------------------------------------------------------------------- */
+:root {
+  /* dark theme */
+  --lg-bg-d: #141619;
+  --lg-sidebar-d: #1B1E23;
+  --lg-surface-d: #1E2127;
+  --lg-elevated-d: #252930;
+  --lg-code-d: #0F1217;
+  --lg-text-d: #ECEEEF;
+  --lg-muted-d: #8E96A2;
+  --lg-border-d: #2C313A;
+  --lg-ok-d: #47B577;
+  --lg-warn-d: #E09B3D;
+  --lg-bad-d: #E05A5A;
+  --lg-ok-text-d: #50B97E;
+  --lg-warn-text-d: #E09B3D;
+  --lg-bad-text-d: #E78282;
+  --lg-on-accent-d: #0F1217;
+  --lg-backdrop-from-d: #11151B;
+  --lg-backdrop-to-d: #181B21;
+  /* light theme */
+  --lg-bg-l: #F7F6F3;
+  --lg-sidebar-l: #EFECE6;
+  --lg-surface-l: #FCFBF9;
+  --lg-elevated-l: #FFFFFF;
+  --lg-code-l: #F5F7FA;
+  --lg-text-l: #1A1D21;
+  --lg-muted-l: #5C646E;
+  --lg-border-l: #DFDDD7;
+  --lg-ok-l: #2C8C58;
+  --lg-warn-l: #B8741A;
+  --lg-bad-l: #B83B3B;
+  --lg-ok-text-l: #216A43;
+  --lg-warn-text-l: #845413;
+  --lg-bad-text-l: #A23434;
+  --lg-on-accent-l: #FFFFFF;
+  --lg-backdrop-from-l: #EAF0F5;
+  --lg-backdrop-to-l: #F3F5F8;
+  /* accents: fjord and frost-cyan by default */
+  --lg-accent-d: #5A93C4; --lg-accent-l: #2B5B84;
+  --lg-accent-2-d: #88C0D0; --lg-accent-2-l: #2A7288;
+  /* spacing (4-pt scale), radii, type, motion */
+  --lg-space-xxs: 2px; --lg-space-xs: 4px; --lg-space-s: 8px; --lg-space-m: 12px; --lg-space-l: 16px; --lg-space-xl: 24px; --lg-space-xxl: 32px;
+  --lg-radius-control: 6px; --lg-radius-card: 10px;
+  --lg-fs-body: 13px; --lg-fs-small: 11px; --lg-fs-label: 11px; --lg-fs-subtitle: 13px; --lg-fs-title: 18px; --lg-fs-kpi: 22px; --lg-fs-mono: 12px;
+  --lg-dur-quick: 140ms; --lg-dur-standard: 320ms; --lg-dur-data: 350ms; --lg-dur-slow: 550ms;
+  --lg-ease: cubic-bezier(.22, .61, .36, 1);
+  --lg-ease-out: cubic-bezier(0, 0, .2, 1);
+  --lg-touch: 44px;
+  --lg-scale: 0.65;          /* panel insets: compact */
+  --lg-row: 20px;
+  --lg-font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
+  --lg-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --lg-blur: blur(22px) saturate(150%);
+}
+:root[data-density="comfortable"], [data-density="comfortable"] { --lg-scale: 1; --lg-row: 28px; }
+
+/* accent presets (Låda's accent themes) */
+[data-accent="fjord"] { --lg-accent-d: #5A93C4; --lg-accent-l: #2B5B84; }
+[data-accent="arctic-teal"] { --lg-accent-d: #459AA3; --lg-accent-l: #216B73; }
+[data-accent="slate-steel"] { --lg-accent-d: #7D91A8; --lg-accent-l: #415164; }
+[data-accent="frost-cyan"] { --lg-accent-d: #88C0D0; --lg-accent-l: #2A7288; }
+[data-accent="aurora-green"] { --lg-accent-d: #A3BE8C; --lg-accent-l: #45763E; }
+[data-accent="aurora-violet"] { --lg-accent-d: #B48EAD; --lg-accent-l: #714D88; }
+[data-accent="lingonberry"] { --lg-accent-d: #D96E75; --lg-accent-l: #A83541; }
+[data-accent="cloudberry"] { --lg-accent-d: #E0915C; --lg-accent-l: #AD591D; }
+[data-accent="birch-gold"] { --lg-accent-d: #E1BC6D; --lg-accent-l: #8C6A16; }
+[data-accent="midnight-indigo"] { --lg-accent-d: #8D95E3; --lg-accent-l: #41479C; }
+[data-accent-2="fjord"] { --lg-accent-2-d: #5A93C4; --lg-accent-2-l: #2B5B84; }
+[data-accent-2="arctic-teal"] { --lg-accent-2-d: #459AA3; --lg-accent-2-l: #216B73; }
+[data-accent-2="slate-steel"] { --lg-accent-2-d: #7D91A8; --lg-accent-2-l: #415164; }
+[data-accent-2="frost-cyan"] { --lg-accent-2-d: #88C0D0; --lg-accent-2-l: #2A7288; }
+[data-accent-2="aurora-green"] { --lg-accent-2-d: #A3BE8C; --lg-accent-2-l: #45763E; }
+[data-accent-2="aurora-violet"] { --lg-accent-2-d: #B48EAD; --lg-accent-2-l: #714D88; }
+[data-accent-2="lingonberry"] { --lg-accent-2-d: #D96E75; --lg-accent-2-l: #A83541; }
+[data-accent-2="cloudberry"] { --lg-accent-2-d: #E0915C; --lg-accent-2-l: #AD591D; }
+[data-accent-2="birch-gold"] { --lg-accent-2-d: #E1BC6D; --lg-accent-2-l: #8C6A16; }
+[data-accent-2="midnight-indigo"] { --lg-accent-2-d: #8D95E3; --lg-accent-2-l: #41479C; }
+
+/* The active theme: dark unless the system asks for light; data-theme forces one (also on any
+   element, e.g. a preview showing both). */
+:root, [data-theme="dark"] {
+  --lg-bg: var(--lg-bg-d);
+  --lg-sidebar: var(--lg-sidebar-d);
+  --lg-surface: var(--lg-surface-d);
+  --lg-elevated: var(--lg-elevated-d);
+  --lg-code: var(--lg-code-d);
+  --lg-text: var(--lg-text-d);
+  --lg-muted: var(--lg-muted-d);
+  --lg-border: var(--lg-border-d);
+  --lg-ok: var(--lg-ok-d);
+  --lg-warn: var(--lg-warn-d);
+  --lg-bad: var(--lg-bad-d);
+  --lg-ok-text: var(--lg-ok-text-d);
+  --lg-warn-text: var(--lg-warn-text-d);
+  --lg-bad-text: var(--lg-bad-text-d);
+  --lg-on-accent: var(--lg-on-accent-d);
+  --lg-backdrop-from: var(--lg-backdrop-from-d);
+  --lg-backdrop-to: var(--lg-backdrop-to-d);
+  --lg-accent: var(--lg-accent-d);
+  --lg-accent-2: var(--lg-accent-2-d);
+  --lg-glass: rgba(30, 33, 39, 0.55);
+  --lg-glass-strong: rgba(30, 33, 39, 0.78);
+  --lg-line: rgba(255, 255, 255, .08);
+  --lg-line-2: rgba(255, 255, 255, .15);
+  --lg-field: rgba(255, 255, 255, .04);
+  --lg-edge: linear-gradient(rgba(255, 255, 255, .14), rgba(255, 255, 255, .04));
+  --lg-shadow: 0 4px 20px rgba(0, 0, 0, .28);
+  --lg-glow: .30; --lg-glow-2: .18; --lg-art: rgba(255, 255, 255, .07);
+  color-scheme: dark;
+}
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+  --lg-bg: var(--lg-bg-l);
+  --lg-sidebar: var(--lg-sidebar-l);
+  --lg-surface: var(--lg-surface-l);
+  --lg-elevated: var(--lg-elevated-l);
+  --lg-code: var(--lg-code-l);
+  --lg-text: var(--lg-text-l);
+  --lg-muted: var(--lg-muted-l);
+  --lg-border: var(--lg-border-l);
+  --lg-ok: var(--lg-ok-l);
+  --lg-warn: var(--lg-warn-l);
+  --lg-bad: var(--lg-bad-l);
+  --lg-ok-text: var(--lg-ok-text-l);
+  --lg-warn-text: var(--lg-warn-text-l);
+  --lg-bad-text: var(--lg-bad-text-l);
+  --lg-on-accent: var(--lg-on-accent-l);
+  --lg-backdrop-from: var(--lg-backdrop-from-l);
+  --lg-backdrop-to: var(--lg-backdrop-to-l);
+  --lg-accent: var(--lg-accent-l);
+  --lg-accent-2: var(--lg-accent-2-l);
+  --lg-glass: rgba(252, 251, 249, 0.6);
+  --lg-glass-strong: rgba(252, 251, 249, 0.82);
+  --lg-line: rgba(20, 24, 32, .09);
+  --lg-line-2: rgba(20, 24, 32, .16);
+  --lg-field: rgba(20, 24, 32, .03);
+  --lg-edge: linear-gradient(rgba(255, 255, 255, .85), rgba(0, 0, 0, .06));
+  --lg-shadow: 0 4px 20px rgba(0, 0, 0, .07);
+  --lg-glow: .26; --lg-glow-2: .22; --lg-art: rgba(30, 40, 60, .10);
+  color-scheme: light;
+  }
+}
+[data-theme="light"] {
+  --lg-bg: var(--lg-bg-l);
+  --lg-sidebar: var(--lg-sidebar-l);
+  --lg-surface: var(--lg-surface-l);
+  --lg-elevated: var(--lg-elevated-l);
+  --lg-code: var(--lg-code-l);
+  --lg-text: var(--lg-text-l);
+  --lg-muted: var(--lg-muted-l);
+  --lg-border: var(--lg-border-l);
+  --lg-ok: var(--lg-ok-l);
+  --lg-warn: var(--lg-warn-l);
+  --lg-bad: var(--lg-bad-l);
+  --lg-ok-text: var(--lg-ok-text-l);
+  --lg-warn-text: var(--lg-warn-text-l);
+  --lg-bad-text: var(--lg-bad-text-l);
+  --lg-on-accent: var(--lg-on-accent-l);
+  --lg-backdrop-from: var(--lg-backdrop-from-l);
+  --lg-backdrop-to: var(--lg-backdrop-to-l);
+  --lg-accent: var(--lg-accent-l);
+  --lg-accent-2: var(--lg-accent-2-l);
+  --lg-glass: rgba(252, 251, 249, 0.6);
+  --lg-glass-strong: rgba(252, 251, 249, 0.82);
+  --lg-line: rgba(20, 24, 32, .09);
+  --lg-line-2: rgba(20, 24, 32, .16);
+  --lg-field: rgba(20, 24, 32, .03);
+  --lg-edge: linear-gradient(rgba(255, 255, 255, .85), rgba(0, 0, 0, .06));
+  --lg-shadow: 0 4px 20px rgba(0, 0, 0, .07);
+  --lg-glow: .26; --lg-glow-2: .22; --lg-art: rgba(30, 40, 60, .10);
+  color-scheme: light;
+}
+/* ---- base ------------------------------------------------------------------------------------ */
+.lg { font-family: var(--lg-font); font-size: var(--lg-fs-body); line-height: 1.45; color: var(--lg-text);
+      background: var(--lg-bg); -webkit-font-smoothing: antialiased; text-size-adjust: 100%; }
+.lg *, .lg *::before, .lg *::after { box-sizing: border-box; }
+.lg :where(a) { color: var(--lg-accent); text-underline-offset: 2px; }  /* low specificity: .lg-btn* on a link wins */
+.lg :focus-visible { outline: 2px solid var(--lg-accent); outline-offset: 2px; border-radius: var(--lg-radius-control); }
+.lg ::selection { background: color-mix(in srgb, var(--lg-accent) 35%, transparent); }
+.lg img, .lg svg { max-width: 100%; }
+
+/* The calm backdrop the glass frosts: a soft gradient with two glows in the accent colours. */
+.lg-backdrop { min-height: 100vh; background:
+    radial-gradient(700px circle at 0 0, color-mix(in srgb, var(--lg-accent) calc(var(--lg-glow) * 100%), transparent), transparent 70%),
+    radial-gradient(600px circle at 100% 100%, color-mix(in srgb, var(--lg-accent-2) calc(var(--lg-glow-2) * 100%), transparent), transparent 70%),
+    linear-gradient(135deg, var(--lg-backdrop-from), var(--lg-backdrop-to));
+  background-attachment: fixed; }
+.lg-art { position: fixed; inset: auto -80px -80px auto; width: 420px; height: 420px; color: var(--lg-art);
+          pointer-events: none; z-index: 0; }
+
+/* ---- text ------------------------------------------------------------------------------------- */
+.lg-title { font-size: var(--lg-fs-title); font-weight: 600; letter-spacing: -.01em; margin: 0 0 var(--lg-space-xs); }
+.lg-subtitle { font-size: var(--lg-fs-subtitle); font-weight: 500; margin: 0 0 var(--lg-space-xs); }
+.lg-label { font-size: var(--lg-fs-label); font-weight: 600; letter-spacing: .08em; text-transform: uppercase;
+            color: var(--lg-muted); margin: 0 0 var(--lg-space-s); }
+.lg-muted { color: var(--lg-muted); }
+.lg-small { font-size: var(--lg-fs-small); }
+.lg-mono, .lg code { font-family: var(--lg-mono); font-size: var(--lg-fs-mono); }
+.lg-code { font-family: var(--lg-mono); font-size: var(--lg-fs-mono); background: var(--lg-code); color: var(--lg-text);
+           border: 1px solid var(--lg-line); border-radius: var(--lg-radius-control); padding: var(--lg-space-s) var(--lg-space-m);
+           overflow-x: auto; }
+
+/* ---- glass surfaces ------------------------------------------------------------------------------ */
+.lg-glass, .lg-card, .lg-sidebar, .lg-toast, .lg-popup, .lg-empty {
+  position: relative; background: var(--lg-glass); -webkit-backdrop-filter: var(--lg-blur); backdrop-filter: var(--lg-blur);
+  border-radius: var(--lg-radius-card); box-shadow: var(--lg-shadow); }
+/* the fine light edge (a gradient border) */
+.lg-glass::after, .lg-card::after, .lg-sidebar::after, .lg-toast::after, .lg-popup::after, .lg-empty::after {
+  content: ""; position: absolute; inset: 0; border-radius: inherit; padding: 1px; pointer-events: none;
+  background: var(--lg-edge); -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor; mask-composite: exclude; }
+.lg-card { padding: calc(var(--lg-space-l) * var(--lg-scale) + 2px); }
+.lg-card.lg-hover { transition: transform var(--lg-dur-quick) var(--lg-ease-out), box-shadow var(--lg-dur-quick) var(--lg-ease-out); }
+.lg-card.lg-hover:hover { transform: translateY(-1px); box-shadow: var(--lg-shadow), 0 0 0 1px color-mix(in srgb, var(--lg-accent) 45%, transparent); }
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .lg-glass, .lg-card, .lg-sidebar, .lg-toast, .lg-popup, .lg-empty { background: var(--lg-surface); }
+}
+
+/* ---- layout: app shell, stack, row, responsive grid ----------------------------------------------- */
+.lg-app { position: relative; z-index: 1; display: grid; grid-template-columns: 200px minmax(0, 1fr);
+          gap: var(--lg-space-m); padding: var(--lg-space-m); min-height: 100vh; align-items: start; }
+.lg-sidebar { position: sticky; top: var(--lg-space-m); padding: var(--lg-space-s); background: var(--lg-glass-strong); }
+.lg-brand { display: flex; align-items: center; gap: var(--lg-space-s); font-weight: 600; padding: var(--lg-space-xs) var(--lg-space-s) var(--lg-space-m); }
+.lg-nav { display: grid; gap: var(--lg-space-xxs); }
+.lg-nav a { display: flex; align-items: center; gap: var(--lg-space-s); padding: 5px var(--lg-space-s); border-radius: var(--lg-radius-control);
+            color: var(--lg-muted); text-decoration: none; min-height: 28px; white-space: nowrap;
+            transition: background var(--lg-dur-quick) var(--lg-ease-out), color var(--lg-dur-quick) var(--lg-ease-out); }
+.lg-nav a:hover { background: var(--lg-field); color: var(--lg-text); }
+.lg-nav a[aria-current="page"] { background: color-mix(in srgb, var(--lg-accent) 16%, transparent); color: var(--lg-text); }
+.lg-nav a[aria-current="page"] .lg-icon { color: var(--lg-accent); }
+.lg-main { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--lg-space-m); }
+.lg-header { display: flex; align-items: center; justify-content: space-between; gap: var(--lg-space-m); flex-wrap: wrap; }
+.lg-stack { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--lg-space-m); }
+.lg-row { display: flex; gap: var(--lg-space-s); flex-wrap: wrap; align-items: center; }
+.lg-grid { display: grid; gap: var(--lg-space-m); grid-template-columns: repeat(auto-fit, minmax(min(100%, var(--lg-col, 200px)), 1fr)); }
+/* Phones: the sidebar becomes a top bar whose menu scrolls sideways (never the page). */
+@media (max-width: 760px) {
+  .lg-app { grid-template-columns: minmax(0, 1fr); padding: var(--lg-space-s); gap: var(--lg-space-s); }
+  .lg-sidebar { position: static; display: flex; align-items: center; gap: var(--lg-space-s); min-width: 0; }
+  .lg-brand { padding: var(--lg-space-xs); }
+  .lg-nav { display: flex; overflow-x: auto; scrollbar-width: none; min-width: 0; }
+  .lg-sidebar .lg-label { display: none; }
+}
+
+/* ---- controls ------------------------------------------------------------------------------------ */
+.lg-btn { display: inline-flex; align-items: center; justify-content: center; gap: var(--lg-space-xs);
+          font: inherit; font-weight: 600; line-height: 1.2; padding: 6px 12px; min-height: 28px; cursor: pointer;
+          border-radius: var(--lg-radius-control); border: 1px solid var(--lg-line-2); background: var(--lg-field); color: var(--lg-text);
+          text-decoration: none;
+          transition: transform var(--lg-dur-quick) var(--lg-ease-out), filter var(--lg-dur-quick), background var(--lg-dur-quick), border-color var(--lg-dur-quick); }
+.lg-btn:hover { border-color: color-mix(in srgb, var(--lg-accent) 55%, var(--lg-line-2)); }
+.lg-btn:active { transform: scale(.98); }
+.lg-btn:disabled, .lg-btn[aria-disabled="true"] { opacity: .5; cursor: not-allowed; transform: none; }
+.lg-btn-primary { background: var(--lg-accent); border-color: transparent; color: var(--lg-on-accent); }
+.lg-btn-primary:hover { filter: brightness(1.07); border-color: transparent; }
+.lg-btn-ghost { background: transparent; border-color: transparent; color: var(--lg-accent); }
+.lg-btn-danger { background: color-mix(in srgb, var(--lg-bad) 15%, transparent); border-color: transparent; color: var(--lg-bad-text); }
+.lg-btn-icon { padding: 5px; min-width: 28px; }
+
+.lg-input { font: inherit; color: var(--lg-text); background: var(--lg-field); border: 1px solid var(--lg-line-2);
+            border-radius: var(--lg-radius-control); padding: 5px 9px; min-height: 28px; width: 100%; max-width: 100%;
+            transition: border-color var(--lg-dur-quick), box-shadow var(--lg-dur-quick); }
+.lg-input::placeholder { color: var(--lg-muted); opacity: 1; }
+.lg-input:focus { outline: none; border-color: var(--lg-accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--lg-accent) 25%, transparent); }
+textarea.lg-input { min-height: 72px; resize: vertical; }
+.lg-field { display: grid; gap: var(--lg-space-xs); }
+.lg-field > label { font-weight: 500; }
+
+.lg-tabs { display: inline-flex; gap: 2px; padding: 3px; background: var(--lg-field); border: 1px solid var(--lg-line);
+           border-radius: var(--lg-radius-control); max-width: 100%; overflow-x: auto; }
+.lg-tab { font: inherit; border: 0; background: transparent; color: var(--lg-muted); padding: 4px 11px; border-radius: 4px; cursor: pointer;
+          white-space: nowrap; transition: background var(--lg-dur-quick), color var(--lg-dur-quick); }
+.lg-tab:hover { color: var(--lg-text); }
+.lg-tab[aria-selected="true"] { background: var(--lg-glass-strong); color: var(--lg-text); box-shadow: 0 1px 3px rgba(0, 0, 0, .15); }
+
+.lg-toggle { appearance: none; -webkit-appearance: none; width: 34px; height: 20px; border-radius: 999px; margin: 0; cursor: pointer;
+             background: var(--lg-line-2); position: relative; flex: none; transition: background var(--lg-dur-quick) var(--lg-ease-out); }
+.lg-toggle::after { content: ""; position: absolute; left: 3px; top: 3px; width: 14px; height: 14px; border-radius: 50%; background: #fff;
+                    box-shadow: 0 1px 2px rgba(0, 0, 0, .3); transition: transform var(--lg-dur-quick) var(--lg-ease-out); }
+.lg-toggle:checked { background: var(--lg-accent); }
+.lg-toggle:checked::after { transform: translateX(14px); }
+
+.lg-chip { display: inline-flex; align-items: center; gap: 5px; font-size: var(--lg-fs-small); font-weight: 500; line-height: 1.5;
+           padding: 1px 8px; border-radius: 999px; color: var(--lg-muted); background: color-mix(in srgb, var(--lg-muted) 15%, transparent); }
+.lg-chip::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.lg-chip.lg-ok   { color: var(--lg-ok-text);   background: color-mix(in srgb, var(--lg-ok) 15%, transparent); }
+.lg-chip.lg-warn { color: var(--lg-warn-text); background: color-mix(in srgb, var(--lg-warn) 15%, transparent); }
+.lg-chip.lg-bad  { color: var(--lg-bad-text);  background: color-mix(in srgb, var(--lg-bad) 15%, transparent); }
+.lg-chip.lg-ok::before { background: var(--lg-ok); } .lg-chip.lg-warn::before { background: var(--lg-warn); } .lg-chip.lg-bad::before { background: var(--lg-bad); }
+.lg-chip.lg-plain::before { display: none; }
+
+/* ---- data ------------------------------------------------------------------------------------- */
+.lg-kpi .lg-kpi-value { font-size: var(--lg-fs-kpi); font-weight: 650; letter-spacing: -.02em; line-height: 1.1; margin-top: var(--lg-space-xs);
+                        font-variant-numeric: tabular-nums; }
+.lg-table-wrap { overflow-x: auto; max-width: 100%; }
+.lg-table { width: 100%; border-collapse: collapse; }
+.lg-table th { text-align: left; font-size: var(--lg-fs-label); font-weight: 600; letter-spacing: .07em; text-transform: uppercase;
+               color: var(--lg-muted); padding: 5px 8px; border-bottom: 1px solid var(--lg-line); white-space: nowrap; }
+.lg-table td { padding: 5px 8px; border-bottom: 1px solid var(--lg-line); height: var(--lg-row); }
+.lg-table tr:last-child td { border-bottom: 0; }
+.lg-table tbody tr { transition: background var(--lg-dur-quick); }
+.lg-table tbody tr:hover { background: color-mix(in srgb, var(--lg-text) 5%, transparent); }
+.lg-num { text-align: right; font-variant-numeric: tabular-nums; }
+
+/* ---- feedback ----------------------------------------------------------------------------------- */
+.lg-toast { display: flex; gap: var(--lg-space-s); align-items: flex-start; padding: var(--lg-space-s) var(--lg-space-m);
+            border-left: 3px solid var(--lg-accent); max-width: 420px; }
+.lg-toast.lg-ok { border-left-color: var(--lg-ok); } .lg-toast.lg-warn { border-left-color: var(--lg-warn); } .lg-toast.lg-bad { border-left-color: var(--lg-bad); }
+.lg-toast strong { display: block; }
+.lg-empty { text-align: center; padding: var(--lg-space-xl) var(--lg-space-m); color: var(--lg-muted); }
+.lg-empty > svg { width: 88px; height: 88px; color: var(--lg-art); display: block; margin: 0 auto var(--lg-space-s); }
+.lg-empty strong { color: var(--lg-text); display: block; margin-bottom: var(--lg-space-xxs); }
+
+/* ---- browser-extension popup ----------------------------------------------------------------------- */
+.lg-popup { width: 360px; max-width: 100%; padding: calc(var(--lg-space-l) * var(--lg-scale) + 4px); }
+.lg-mark { width: 28px; height: 28px; border-radius: 8px; display: grid; place-items: center; flex: none;
+           background: color-mix(in srgb, var(--lg-accent) 22%, transparent); color: var(--lg-accent); }
+
+/* ---- icons ------------------------------------------------------------------------------------- */
+.lg-icon { width: 16px; height: 16px; flex: none; fill: none; stroke: currentColor; stroke-width: 1.7;
+           stroke-linecap: round; stroke-linejoin: round; vertical-align: -3px; }
+.lg-icon-l { width: 20px; height: 20px; }
+
+/* ---- motion ------------------------------------------------------------------------------------- */
+/* Quick micro-animations (hover, press) use --lg-dur-quick; larger changes are slow and smooth. Content
+   never depends on them: .lg-enter only moves, it never starts invisible. */
+.lg-enter { animation: lg-rise var(--lg-dur-slow) var(--lg-ease) both; }
+@keyframes lg-rise { from { transform: translateY(8px); } to { transform: none; } }
+.lg-fade { transition: opacity var(--lg-dur-slow) var(--lg-ease), transform var(--lg-dur-slow) var(--lg-ease); }
+
+/* ---- touch: 44 px targets on touch screens, compact look on desktop ------------------------------------- */
+@media (pointer: coarse) {
+  .lg-btn, .lg-input, .lg-nav a, .lg-tab { min-height: var(--lg-touch); }
+  .lg-btn-icon { min-width: var(--lg-touch); }
+  .lg-toggle { width: 44px; height: 26px; } .lg-toggle::after { width: 20px; height: 20px; } .lg-toggle:checked::after { transform: translateX(18px); }
+}
+
+/* ---- accessibility preferences ------------------------------------------------------------------- */
+@media (prefers-reduced-motion: reduce) {
+  .lg, .lg *, .lg *::before, .lg *::after { animation: none !important; transition-duration: 1ms !important; scroll-behavior: auto !important; }
+}
+@media (prefers-reduced-transparency: reduce) {
+  .lg-glass, .lg-card, .lg-sidebar, .lg-toast, .lg-popup, .lg-empty { background: var(--lg-surface); -webkit-backdrop-filter: none; backdrop-filter: none; }
+  .lg-backdrop { background: var(--lg-bg); }
+}
+@media (forced-colors: active) {
+  .lg-glass, .lg-card, .lg-sidebar, .lg-toast, .lg-popup, .lg-empty { border: 1px solid CanvasText; }
+  .lg-toggle { border: 1px solid CanvasText; }
+}
+@media print {
+  .lg-backdrop { background: none; }
+  .lg-glass, .lg-card, .lg-sidebar, .lg-toast, .lg-popup, .lg-empty { background: none; box-shadow: none; border: 1px solid #999; }
+}
+
+/* An inlined icon sprite (icons/sprite.svg) takes no space. */
+.lg-sprite { position: absolute; width: 0; height: 0; overflow: hidden; }
