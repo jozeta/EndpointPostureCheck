@@ -6,6 +6,22 @@ The project has no tagged releases yet, so changes are grouped by date. Entries 
 
 ## Unreleased
 
+- New attack-path and privilege-escalation checks on both platforms, each in its existing domain.
+  - macOS (198 checks): TCC grants to terminals/interpreters or not pinned to a code signature;
+    sudo environment (env_reset, env_keep of DYLD_/LD_/PYTHONPATH/..., SETENV) and sudoers file
+    ownership; authorization-database admin rights set to allow; PAM integrity (sufficient
+    pam_permit, user-writable third-party modules such as a Homebrew pam_reattach); container
+    engine sockets and Docker's unauthenticated TCP 2375 API; risky sshd options; third-party
+    services listening on the network; secrets in root's and other users' shell/database
+    histories (counts only); system-wide DisableLibraryValidation; disabled download quarantine;
+    legacy VNC passwords.
+  - Windows (161 checks): LocalAccountTokenFilterPolicy and RDP Restricted Admin (pass-the-hash);
+    CredSSP delegation to wildcard/NTLM-only targets and the encryption-oracle downgrade; Kerberos
+    encryption types (DES/RC4); AMSI provider integrity and AmsiEnable=0; uncommon registry load
+    points (AppCertDlls, port monitors, time providers, netsh helpers, password filters, Winlogon
+    Notify, BootExecute, SilentProcessExit); service descriptors that let users reconfigure a
+    service; WebClient/WebDAV relay exposure; OpenSSH Server options and administrator-key ACLs;
+    Point and Print driver installation (PrintNightmare); LM hash storage and DisableDomainCreds.
 - Windows: four macOS-parity features (151 checks, 35 domains).
   - `-BaselinePath <earlier.json>`: compares with an earlier `-ExportJson` run. New items in the
     tracked inventories are a scored WARN; controls that got worse or better are reported as INFO.

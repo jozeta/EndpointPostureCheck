@@ -8187,7 +8187,7 @@ function Test-AutostartInventory {
 $Script:BaselineTrackedControls = @(
     'Autostart Inventory (Run Keys, Startup, Tasks & Services)', 'Local Administrators Group Membership',
     'Local User & Administrator Roster', 'WMI Permanent Event Subscriptions', 'Defender Exclusions - Full Inventory',
-    'Browser Extensions Inventory', 'PowerShell Profile Scripts'
+    'Browser Extensions Inventory', 'PowerShell Profile Scripts', 'Uncommon Registry Load Points'
 )
 $Script:BaselineInfoControls = @('Installed Application Inventory', 'Active Inbound Firewall Rules Inventory')
 
@@ -8292,6 +8292,535 @@ function Compare-WithBaseline {
         -CurrentValue "$($regressions.Count) control(s) worse, $($improvements.Count) better since $since" -Details ($changes -join "`n") `
         -RecommendedValue 'N/A' -Recommendation 'Informational. Controls that got worse are already scored in this run; review why they changed.'
     $Script:BaselineSummary = "$($newItems.Count) new tracked item(s), $($regressions.Count) control(s) worse, $($improvements.Count) better (baseline: $since)"
+}
+
+#endregion
+
+#region ============================== 36. ATTACK PATHS & PRIVILEGE ESCALATION (EXTENDED) ==============================
+# Settings and registry points used for lateral movement, credential theft, privilege
+# escalation and quiet persistence. Each finding reports into the existing domain it belongs
+# to and evaluates something no other check scores.
+
+function Resolve-RegisteredDllPath {
+    <#
+        Turns a DLL reference from the registry into a full path: expands environment
+        variables, strips quotes and arguments, and resolves a bare file name to System32.
+    #>
+    param([Parameter(Mandatory = $false)] [AllowEmptyString()] [string]$Reference)
+    if ([string]::IsNullOrWhiteSpace($Reference)) { return '' }
+    $p = [Environment]::ExpandEnvironmentVariables($Reference.Trim())
+    if ($p.StartsWith('"')) { $end = $p.IndexOf('"', 1); if ($end -gt 0) { $p = $p.Substring(1, $end - 1) } }
+    elseif ($p -match '^(.+?\.(dll|exe|sys|cpl|ocx))\b') { $p = $Matches[1] }
+    if (-not [System.IO.Path]::IsPathRooted($p)) { $p = Join-Path (Join-Path $env:windir 'System32') $p }
+    return $p
+}
+
+function Get-BinaryTrust {
+    <#
+        'microsoft' (valid Authenticode, Microsoft signer), 'signed: <publisher>', 'unsigned or
+        invalid signature', or 'missing'. Catalog-signed system files report as Microsoft.
+    #>
+    param([Parameter(Mandatory = $true)] [string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return 'missing' }
+    try {
+        $sig = Get-AuthenticodeSignature -LiteralPath $Path -ErrorAction Stop
+        if ($sig.Status -ne 'Valid') { return 'unsigned or invalid signature' }
+        $subject = [string]$sig.SignerCertificate.Subject
+        if ($subject -match 'O=Microsoft Corporation') { return 'microsoft' }
+        $cn = if ($subject -match 'CN=("?)([^,"]+)\1') { $Matches[2] } else { $subject }
+        return "signed: $cn"
+    } catch { return 'unsigned or invalid signature' }
+}
+
+function Test-LocalAccountRemoteUacPolicy {
+    <#
+        LocalAccountTokenFilterPolicy = 1 gives local administrator accounts a full, unfiltered
+        token over the network, so a stolen local admin hash works for remote admin (pass-the-
+        hash, T1550.002). DisableRestrictedAdmin = 0 enables RDP Restricted Admin mode, which
+        accepts an NTLM hash instead of a password for RDP logons. Both are off by default.
+    #>
+    Write-SectionBanner 'Lateral Movement - Remote UAC & Restricted Admin'
+    $fw = @{
+        Category = 'Network Authentication & Credential Exposure'; CIS_Control = 'CIS 5.4, 6.5'; NIST_Control = 'AC-6, IA-2'
+        MITRE_Technique = 'T1550.002 (Pass the Hash)'; ISO27001_Control = 'A.8.5'; NIS2_Article = 'Art.21(2)(j)'
+        NSA_Guidance = 'NSA CSI: Mitigating Pass-the-Hash'
+    }
+    try {
+        $latfp = Get-RegistryValueSafe -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -Name 'LocalAccountTokenFilterPolicy' -DefaultValue 0
+        if ([int]$latfp -eq 1) {
+            Add-AuditResult @fw -Control 'Remote UAC for Local Accounts (LocalAccountTokenFilterPolicy)' -Status 'FAIL' -Severity 'High' `
+                -CurrentValue 'LocalAccountTokenFilterPolicy = 1 (local admins get a full token over the network)' -RecommendedValue '0 or not set (Apply UAC restrictions to local accounts on network logons)' `
+                -Recommendation 'Set HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\LocalAccountTokenFilterPolicy to 0 (or enable the MS Security Guide policy "Apply UAC restrictions to local accounts on network logons"). With it at 1, any reused local administrator password or hash gives full remote admin.'
+        } else {
+            Add-AuditResult @fw -Control 'Remote UAC for Local Accounts (LocalAccountTokenFilterPolicy)' -Status 'PASS' -Severity 'High' `
+                -CurrentValue "LocalAccountTokenFilterPolicy = $latfp" -RecommendedValue '0 or not set' -Recommendation 'No action required.'
+        }
+        $restricted = Get-RegistryValueSafe -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' -Name 'DisableRestrictedAdmin' -DefaultValue $null
+        if ($null -ne $restricted -and [int]$restricted -eq 0) {
+            Add-AuditResult @fw -Control 'RDP Restricted Admin Mode (Pass-the-Hash to RDP)' -Status 'WARN' -Severity 'Medium' `
+                -CurrentValue 'DisableRestrictedAdmin = 0 (Restricted Admin enabled: RDP accepts an NTLM hash)' -RecommendedValue 'Not set or 1; use Remote Credential Guard instead' `
+                -Recommendation 'Remove DisableRestrictedAdmin or set it to 1 unless Restricted Admin is a deliberate, documented choice for admin jump hosts. Prefer Remote Credential Guard, which protects credentials without accepting hashes.'
+        } else {
+            Add-AuditResult @fw -Control 'RDP Restricted Admin Mode (Pass-the-Hash to RDP)' -Status 'PASS' -Severity 'Medium' `
+                -CurrentValue $(if ($null -eq $restricted) { 'Not set (Restricted Admin off, default)' } else { "DisableRestrictedAdmin = $restricted" }) `
+                -RecommendedValue 'Not set or 1' -Recommendation 'No action required.'
+        }
+    } catch {
+        Add-AuditResult -Category 'Network Authentication & Credential Exposure' -Control 'Remote UAC for Local Accounts (LocalAccountTokenFilterPolicy)' -Status 'WARN' -Severity 'Low' `
+            -CurrentValue 'Query failed' -Recommendation "Unable to read remote UAC settings: $($_.Exception.Message)"
+    }
+}
+
+function Test-CredentialDelegationPolicy {
+    <#
+        CredSSP credential delegation: "Allow delegating default credentials" to wildcard
+        targets (or with NTLM-only servers) sends the signed-in user's plaintext credentials to
+        any matching server, where they can be harvested (T1003, T1557). AllowEncryptionOracle =
+        2 ("Vulnerable") re-enables the CVE-2018-0886 CredSSP downgrade. Not configured by default.
+    #>
+    $fw = @{
+        Category = 'Network Authentication & Credential Exposure'; Control = 'CredSSP Credential Delegation'
+        CIS_Control = 'CIS 5.2, 6.5'; NIST_Control = 'IA-5, SC-8'; MITRE_Technique = 'T1003 (OS Credential Dumping), T1557 (Adversary-in-the-Middle)'
+        ISO27001_Control = 'A.8.5'; NIS2_Article = 'Art.21(2)(j)'; RecommendedValue = 'No default/fresh credential delegation to wildcard or NTLM-only targets; encryption oracle not Vulnerable'
+    }
+    try {
+        $base = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\CredentialsDelegation'
+        $issues = [System.Collections.Generic.List[string]]::new()
+        foreach ($setting in @('AllowDefaultCredentials', 'AllowDefCredentialsWhenNTLMOnly', 'AllowFreshCredentials', 'AllowFreshCredentialsWhenNTLMOnly', 'AllowSavedCredentials', 'AllowSavedCredentialsWhenNTLMOnly')) {
+            if ([int](Get-RegistryValueSafe -Path $base -Name $setting -DefaultValue 0) -ne 1) { continue }
+            $targets = @()
+            try {
+                $listKey = Get-Item -LiteralPath (Join-Path $base $setting) -ErrorAction Stop
+                $targets = @($listKey.Property | Where-Object { $_ -notlike 'PS*' } | ForEach-Object { [string]$listKey.GetValue($_) })
+            } catch { $targets = @() }
+            $wild = @($targets | Where-Object { $_ -match '^\s*\*\s*$' -or $_ -match '/\*\s*$' -or $_ -match '^\s*[^/]+/\*' })
+            if ($setting -like '*WhenNTLMOnly') {
+                $issues.Add("$setting enabled for: $($targets -join ', ') (credentials go to servers that cannot prove their identity)")
+            } elseif ($wild.Count -gt 0 -and $setting -ne 'AllowSavedCredentials') {
+                $issues.Add("$setting enabled for wildcard target(s): $($wild -join ', ')")
+            }
+        }
+        $oracle = Get-RegistryValueSafe -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\CredSSP\Parameters' -Name 'AllowEncryptionOracle' -DefaultValue $null
+        if ($null -ne $oracle -and [int]$oracle -eq 2) { $issues.Add('AllowEncryptionOracle = 2 (Vulnerable: CVE-2018-0886 downgrade allowed)') }
+        if ($issues.Count -gt 0) {
+            Add-AuditResult @fw -Status 'FAIL' -Severity 'High' -CurrentValue "$($issues.Count) risky CredSSP delegation setting(s)" -Details ($issues -join "`n") `
+                -Recommendation 'Limit "Allow delegating default/fresh credentials" to specific named servers (TERMSRV/server.domain), never wildcards or NTLM-only variants, and set "Encryption Oracle Remediation" to Force Updated Clients. Prefer Remote Credential Guard for RDP.'
+        } else {
+            Add-AuditResult @fw -Status 'PASS' -Severity 'High' -CurrentValue 'No wildcard or NTLM-only credential delegation; encryption oracle not Vulnerable' -Recommendation 'No action required.'
+        }
+    } catch {
+        Add-AuditResult -Category 'Network Authentication & Credential Exposure' -Control 'CredSSP Credential Delegation' -Status 'WARN' -Severity 'Low' `
+            -CurrentValue 'Query failed' -Recommendation "Unable to read credential delegation policy: $($_.Exception.Message)"
+    }
+}
+
+function Test-KerberosEncryptionTypes {
+    <#
+        "Network security: Configure encryption types allowed for Kerberos" (CIS 2.3.11.4):
+        AES only (0x7FFFFFF8 = AES128 + AES256 + future types). DES is broken; RC4 tickets
+        are what Kerberoasting cracks offline (T1558.003). Not configured counts as WARN (the
+        CIS recommendation is to set it), DES as FAIL High, RC4 as FAIL Medium.
+    #>
+    $fw = @{
+        Category = 'Network Authentication & Credential Exposure'; Control = 'Kerberos Allowed Encryption Types'
+        CIS_Control = 'CIS 3.10'; NIST_Control = 'SC-13, IA-5'; MITRE_Technique = 'T1558.003 (Kerberoasting), T1558.004 (AS-REP Roasting)'
+        ISO27001_Control = 'A.8.24'; NIS2_Article = 'Art.21(2)(h)'; RecommendedValue = 'AES128 + AES256 + Future (2147483640), no DES or RC4'
+    }
+    try {
+        $value = Get-RegistryValueSafe -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Kerberos\Parameters' -Name 'SupportedEncryptionTypes' -DefaultValue $null
+        if ($null -eq $value) {
+            Add-AuditResult @fw -Status 'WARN' -Severity 'Medium' -CurrentValue 'Not configured (the OS and domain decide; RC4 may still be used)' `
+                -Recommendation 'Configure "Network security: Configure encryption types allowed for Kerberos" to AES128_HMAC_SHA1, AES256_HMAC_SHA1 and Future encryption types.'
+            return
+        }
+        $bits = [long]$value
+        $names = [System.Collections.Generic.List[string]]::new()
+        if ($bits -band 0x1) { $names.Add('DES-CBC-CRC') }
+        if ($bits -band 0x2) { $names.Add('DES-CBC-MD5') }
+        if ($bits -band 0x4) { $names.Add('RC4-HMAC') }
+        if ($bits -band 0x8) { $names.Add('AES128') }
+        if ($bits -band 0x10) { $names.Add('AES256') }
+        $current = "$value ($($names -join ', '))"
+        if ($bits -band 0x3) {
+            Add-AuditResult @fw -Status 'FAIL' -Severity 'High' -CurrentValue $current -Recommendation 'Remove the DES encryption types: DES Kerberos keys are cracked in hours. Set the policy to AES only.'
+        } elseif ($bits -band 0x4) {
+            Add-AuditResult @fw -Status 'FAIL' -Severity 'Medium' -CurrentValue $current -Recommendation 'Remove RC4-HMAC so service tickets are AES only; RC4 tickets are what Kerberoasting cracks offline. Check that service accounts have AES keys (password changed since the domain reached 2008 functional level) first.'
+        } elseif (-not ($bits -band 0x18)) {
+            Add-AuditResult @fw -Status 'WARN' -Severity 'Medium' -CurrentValue $current -Recommendation 'No AES type is allowed; Kerberos will fail or fall back. Set AES128 + AES256 + Future.'
+        } else {
+            Add-AuditResult @fw -Status 'PASS' -Severity 'Medium' -CurrentValue $current -Recommendation 'No action required.'
+        }
+    } catch {
+        Add-AuditResult -Category 'Network Authentication & Credential Exposure' -Control 'Kerberos Allowed Encryption Types' -Status 'WARN' -Severity 'Low' `
+            -CurrentValue 'Query failed' -Recommendation "Unable to read Kerberos encryption types: $($_.Exception.Message)"
+    }
+}
+
+function Test-AmsiProviderIntegrity {
+    <#
+        AMSI providers are DLLs loaded into every PowerShell, script host and Office process to
+        scan content. A missing or unsigned provider, a provider in a user-writable folder, or
+        AmsiEnable = 0 for Windows Script Host silently removes script scanning (T1562.001) or
+        injects attacker code into those processes.
+    #>
+    Write-SectionBanner 'Defense Evasion - AMSI Provider Integrity'
+    $fw = @{
+        Category = 'Next-Gen Antivirus & EDR'; Control = 'AMSI Provider Integrity'
+        CIS_Control = 'CIS 10.1'; NIST_Control = 'SI-3, SI-7'; MITRE_Technique = 'T1562.001 (Disable or Modify Tools)'
+        ISO27001_Control = 'A.8.7'; NIS2_Article = 'Art.21(2)(b)'; RecommendedValue = 'At least one validly signed AMSI provider; AMSI not disabled for script hosts'
+    }
+    try {
+        $issues = [System.Collections.Generic.List[string]]::new()
+        $providers = [System.Collections.Generic.List[string]]::new()
+        foreach ($p in @(Get-ChildItem -LiteralPath 'HKLM:\SOFTWARE\Microsoft\AMSI\Providers' -ErrorAction SilentlyContinue)) {
+            $clsid = $p.PSChildName
+            $dll = ''
+            try { $dll = [string](Get-Item -LiteralPath "HKLM:\SOFTWARE\Classes\CLSID\$clsid\InprocServer32" -ErrorAction Stop).GetValue('') } catch { $dll = '' }
+            $path = Resolve-RegisteredDllPath $dll
+            $trust = if ($path) { Get-BinaryTrust -Path $path } else { 'missing' }
+            $providers.Add("$clsid -> $path ($trust)")
+            if ($trust -in @('missing', 'unsigned or invalid signature')) { $issues.Add("Provider $clsid -> $path is $trust") }
+            elseif ($path -and (Test-LowPrivilegeWriteAccess -Path (Split-Path -Path $path -Parent)).IsVulnerable) { $issues.Add("Provider $clsid -> $path is in a folder writable by non-admins") }
+        }
+        if ($providers.Count -eq 0) { $issues.Add('No AMSI provider registered: script content is not scanned by any antimalware engine') }
+        $wsh = Get-RegistryValueSafe -Path 'HKLM:\SOFTWARE\Microsoft\Windows Script\Settings' -Name 'AmsiEnable' -DefaultValue $null
+        if ($null -ne $wsh -and [int]$wsh -eq 0) { $issues.Add('AmsiEnable = 0 for Windows Script Host (machine): JScript/VBScript are not scanned') }
+        foreach ($sidKey in @(Get-ChildItem -LiteralPath 'Registry::HKEY_USERS' -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -match '^S-1-5-21-[\d-]+$' })) {
+            $u = Get-RegistryValueSafe -Path "Registry::HKEY_USERS\$($sidKey.PSChildName)\SOFTWARE\Microsoft\Windows Script\Settings" -Name 'AmsiEnable' -DefaultValue $null
+            if ($null -ne $u -and [int]$u -eq 0) { $issues.Add("AmsiEnable = 0 for Windows Script Host (user $($sidKey.PSChildName))") }
+        }
+        if ($issues.Count -gt 0) {
+            Add-AuditResult @fw -Status 'FAIL' -Severity 'High' -CurrentValue "$($issues.Count) AMSI integrity issue(s)" -Details ((@($issues) + @('') + @($providers)) -join "`n") `
+                -Recommendation 'Remove AmsiEnable = 0 values, and investigate any AMSI provider that is missing, unsigned or in a user-writable folder: a rogue provider DLL runs inside every PowerShell and script-host process. Re-register the security product''s provider by repairing or reinstalling it.'
+        } else {
+            Add-AuditResult @fw -Status 'PASS' -Severity 'High' -CurrentValue "$($providers.Count) signed AMSI provider(s); AMSI not disabled" -Details ($providers -join "`n") -Recommendation 'No action required.'
+        }
+    } catch {
+        Add-AuditResult -Category 'Next-Gen Antivirus & EDR' -Control 'AMSI Provider Integrity' -Status 'WARN' -Severity 'Low' `
+            -CurrentValue 'Query failed' -Recommendation "Unable to check AMSI providers: $($_.Exception.Message)"
+    }
+}
+
+function Test-UncommonRegistryPersistencePoints {
+    <#
+        Registry points that load a DLL into a privileged process and are rarely used by
+        legitimate software: AppCertDlls (every CreateProcess caller, T1546.009), port monitors
+        (spoolsv as SYSTEM, T1547.010), time providers (svchost as LocalService, T1547.003),
+        netsh helpers (T1546.007), LSA notification packages / password filters (see every
+        password change in plaintext, T1556.002), Winlogon Notify (T1547.004), BootExecute
+        (runs before Windows starts) and SilentProcessExit monitors (T1546.012). Microsoft
+        DLLs in System32 are expected; anything else is listed, and a missing or unsigned DLL
+        or an entry in a mechanism that is empty by default is a failure.
+    #>
+    Write-SectionBanner 'Persistence - Uncommon Registry Load Points'
+    try {
+        $items = [System.Collections.Generic.List[string]]::new()
+        $bad = [System.Collections.Generic.List[string]]::new()
+        $system32 = (Join-Path $env:windir 'System32').TrimEnd('\') + '\'
+        $syswow = (Join-Path $env:windir 'SysWOW64').TrimEnd('\') + '\'
+
+        $checkDll = {
+            param([string]$Mechanism, [string]$Name, [string]$Reference, [bool]$EmptyByDefault)
+            $path = Resolve-RegisteredDllPath $Reference
+            $trust = if ($path) { Get-BinaryTrust -Path $path } else { 'missing' }
+            $inSystem = $path.StartsWith($system32, [System.StringComparison]::OrdinalIgnoreCase) -or $path.StartsWith($syswow, [System.StringComparison]::OrdinalIgnoreCase)
+            if ($trust -eq 'microsoft' -and $inSystem -and -not $EmptyByDefault) { return }
+            $line = "${Mechanism}: $Name -> $path ($trust)"
+            $items.Add($line)
+            if ($EmptyByDefault -or $trust -in @('missing', 'unsigned or invalid signature')) { $bad.Add($line) }
+        }
+
+        # AppCertDlls: the key does not exist on a clean install.
+        $appCert = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\AppCertDlls'
+        if (Test-Path -LiteralPath $appCert) {
+            $k = Get-Item -LiteralPath $appCert
+            foreach ($n in @($k.Property)) { & $checkDll 'AppCertDlls' $n ([string]$k.GetValue($n)) $true }
+        }
+        # Port monitors (loaded by the spooler as SYSTEM).
+        foreach ($m in @(Get-ChildItem -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\Print\Monitors' -ErrorAction SilentlyContinue)) {
+            $driver = [string]$m.GetValue('Driver')
+            if ($driver) { & $checkDll 'Port monitor' $m.PSChildName $driver $false }
+        }
+        # Time providers.
+        foreach ($tp in @(Get-ChildItem -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Services\W32Time\TimeProviders' -ErrorAction SilentlyContinue)) {
+            $dll = [string]$tp.GetValue('DllName')
+            if ($dll) { & $checkDll 'Time provider' $tp.PSChildName $dll $false }
+        }
+        # Netsh helper DLLs.
+        $netsh = Get-Item -LiteralPath 'HKLM:\SOFTWARE\Microsoft\NetSh' -ErrorAction SilentlyContinue
+        if ($netsh) { foreach ($n in @($netsh.Property)) { & $checkDll 'Netsh helper' $n ([string]$netsh.GetValue($n)) $false } }
+        # LSA notification packages (password filters): stock is scecli (plus rassfm on some builds).
+        $notif = @(Get-RegistryValueSafe -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' -Name 'Notification Packages' -DefaultValue @())
+        foreach ($n in $notif) {
+            if ([string]::IsNullOrWhiteSpace($n) -or $n -in @('scecli', 'rassfm')) { continue }
+            & $checkDll 'LSA password filter' $n "$n.dll" $false
+            if (-not ($items | Where-Object { $_ -like "LSA password filter: $n ->*" })) { $items.Add("LSA password filter: $n (Microsoft-signed, review)") }
+        }
+        # Winlogon Notify packages (legacy; absent on current Windows).
+        foreach ($wn in @(Get-ChildItem -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon\Notify' -ErrorAction SilentlyContinue)) {
+            $dll = [string]$wn.GetValue('DllName')
+            & $checkDll 'Winlogon Notify' $wn.PSChildName $dll $true
+        }
+        # BootExecute: stock value is "autocheck autochk *".
+        $boot = @(Get-RegistryValueSafe -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name 'BootExecute' -DefaultValue @())
+        foreach ($b in $boot) {
+            if ([string]::IsNullOrWhiteSpace($b) -or $b -match '^autocheck autochk (/q /v )?\*$') { continue }
+            $line = "BootExecute: $b"
+            $items.Add($line); $bad.Add($line)
+        }
+        # SilentProcessExit monitors: start a program whenever the named process exits.
+        foreach ($spe in @(Get-ChildItem -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SilentProcessExit' -ErrorAction SilentlyContinue)) {
+            $mon = [string]$spe.GetValue('MonitorProcess')
+            if ($mon) { $line = "SilentProcessExit: $($spe.PSChildName) -> $mon"; $items.Add($line); $bad.Add($line) }
+        }
+
+        $common = @{
+            Category = 'Persistence & Post-Exploitation Vectors'; Control = 'Uncommon Registry Load Points'
+            RecommendedValue = 'Only Microsoft DLLs from System32; AppCertDlls, Winlogon Notify, SilentProcessExit and extra BootExecute entries absent'
+            CIS_Control = 'CIS 4.8'; NIST_Control = 'CM-7, SI-7'
+            MITRE_Technique = 'T1546.009 (AppCert DLLs), T1547.010 (Port Monitors), T1547.003 (Time Providers), T1546.007 (Netsh Helper DLL), T1556.002 (Password Filter DLL), T1546.012 (Image File Execution Options Injection)'
+            ISO27001_Control = 'A.8.19'; NIS2_Article = 'Art.21(2)(i)'
+        }
+        if ($bad.Count -gt 0) {
+            Add-AuditResult @common -Status 'FAIL' -Severity 'High' -CurrentValue "$($bad.Count) suspicious load point(s)$(if ($items.Count -gt $bad.Count) { ", $($items.Count - $bad.Count) third-party" })" `
+                -Details ((@($bad) + @('') + @($items | Where-Object { $bad -notcontains $_ })) -join "`n") `
+                -Recommendation 'Investigate every listed entry: these mechanisms load code into SYSTEM processes (spooler, LSA, Winlogon, svchost) or every new process, and are favoured for stealthy persistence and credential capture. Remove entries that no installed, signed product accounts for, then check for the dropped DLL elsewhere.'
+        } elseif ($items.Count -gt 0) {
+            Add-AuditResult @common -Status 'WARN' -Severity 'Medium' -CurrentValue "$($items.Count) third-party signed load point(s)" -Details ($items -join "`n") `
+                -Recommendation 'Confirm each listed third-party DLL belongs to installed, approved software (printer drivers, VPN clients and time-sync tools register some of these legitimately).'
+        } else {
+            Add-AuditResult @common -Status 'PASS' -Severity 'High' -CurrentValue 'Only Microsoft System32 DLLs; no AppCertDlls, Notify, SilentProcessExit or extra BootExecute entries' -Recommendation 'No action required.'
+        }
+    } catch {
+        Add-AuditResult -Category 'Persistence & Post-Exploitation Vectors' -Control 'Uncommon Registry Load Points' -Status 'WARN' -Severity 'Low' `
+            -CurrentValue 'Query failed' -Recommendation "Unable to check registry load points: $($_.Exception.Message)"
+    }
+}
+
+function Test-ServiceConfigurationPermission {
+    <#
+        Services whose security descriptor lets Everyone, Authenticated Users, Users or
+        Interactive change the configuration (SERVICE_CHANGE_CONFIG, WRITE_DAC, WRITE_OWNER,
+        GENERIC_WRITE/ALL). "sc config <svc> binPath= ..." then runs any command as the
+        service account, usually SYSTEM (T1543.003). Read from each service's Security registry
+        value, which only exists when the default descriptor was changed, so no process is
+        started per service.
+    #>
+    Write-SectionBanner 'Privilege Escalation - Service Configuration Permissions'
+    try {
+        $lowSids = @('S-1-1-0', 'S-1-5-11', 'S-1-5-32-545', 'S-1-5-4')
+        $dangerMask = 0x0002 -bor 0x40000 -bor 0x80000 -bor 0x10000000 -bor 0x40000000
+        $weak = [System.Collections.Generic.List[string]]::new()
+        $checked = 0
+        foreach ($svc in @(Get-ChildItem -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Services' -ErrorAction SilentlyContinue)) {
+            $bytes = $null
+            try { $bytes = (Get-Item -LiteralPath (Join-Path $svc.PSPath 'Security') -ErrorAction Stop).GetValue('Security') } catch { continue }
+            if ($bytes -isnot [byte[]]) { continue }
+            $checked++
+            try { $sd = [System.Security.AccessControl.RawSecurityDescriptor]::new($bytes, 0) } catch { continue }
+            if ($null -eq $sd.DiscretionaryAcl) { $weak.Add("$($svc.PSChildName): NULL DACL (anyone has full control)"); continue }
+            foreach ($ace in $sd.DiscretionaryAcl) {
+                if ($ace.AceType -ne [System.Security.AccessControl.AceType]::AccessAllowed) { continue }
+                $sid = $ace.SecurityIdentifier.Value
+                if ($lowSids -notcontains $sid -or -not ($ace.AccessMask -band $dangerMask)) { continue }
+                $who = $sid
+                try { $who = $ace.SecurityIdentifier.Translate([System.Security.Principal.NTAccount]).Value } catch { Write-Verbose "Unresolved SID $sid" }
+                $weak.Add("$($svc.PSChildName): $who has 0x$('{0:X}' -f $ace.AccessMask)")
+            }
+        }
+        $common = @{
+            Category = 'Privilege Escalation - Service & File Permissions'; Control = 'Service Permissions Allowing Reconfiguration'
+            RecommendedValue = 'Only Administrators/SYSTEM can change service configuration or permissions'
+            CIS_Control = 'CIS 4.1, 5.4'; NIST_Control = 'AC-6, CM-5'; MITRE_Technique = 'T1543.003 (Windows Service), T1574.011 (Services Registry Permissions Weakness)'
+            ISO27001_Control = 'A.8.2'; NIS2_Article = 'Art.21(2)(i)'
+        }
+        if ($weak.Count -gt 0) {
+            Add-AuditResult @common -Status 'FAIL' -Severity 'Critical' -CurrentValue "$($weak.Count) service permission grant(s) let standard users reconfigure a service" -Details (($weak | Sort-Object) -join "`n") `
+                -Recommendation 'Reset the listed service descriptors (sc.exe sdset <service> with the vendor default, or reinstall the product) so standard users keep only start/stop/query rights. A user who can change a service''s binary path runs code as that service''s account, usually SYSTEM.'
+        } else {
+            Add-AuditResult @common -Status 'PASS' -Severity 'Critical' -CurrentValue "$checked service(s) with a custom descriptor; none grant reconfiguration to standard users" -Recommendation 'No action required.'
+        }
+    } catch {
+        Add-AuditResult -Category 'Privilege Escalation - Service & File Permissions' -Control 'Service Permissions Allowing Reconfiguration' -Status 'WARN' -Severity 'Low' `
+            -CurrentValue 'Query failed' -Recommendation "Unable to read service permissions: $($_.Exception.Message)"
+    }
+}
+
+function Test-WebClientServiceExposure {
+    <#
+        The WebClient (WebDAV) service lets an attacker coerce this machine into HTTP NTLM
+        authentication that can be relayed to LDAP or AD CS (T1187, T1557.001), a common step
+        in local privilege escalation and domain takeover chains. It is manual (trigger-start)
+        by default on Windows clients, which is reported as INFO; running or automatic is a WARN.
+    #>
+    $fw = @{
+        Category = 'Network Authentication & Credential Exposure'; Control = 'WebClient (WebDAV) Service'
+        RecommendedValue = 'Disabled where WebDAV is not needed'; CIS_Control = 'CIS 4.8'; NIST_Control = 'CM-7'
+        MITRE_Technique = 'T1187 (Forced Authentication), T1557.001 (LLMNR/NBT-NS Poisoning and SMB Relay)'; ISO27001_Control = 'A.8.20'; NIS2_Article = 'Art.21(2)(e)'
+    }
+    try {
+        $svc = Get-CimInstance -ClassName Win32_Service -Filter "Name='WebClient'" -ErrorAction Stop
+        if (-not $svc) {
+            Add-AuditResult @fw -Status 'PASS' -Severity 'Medium' -CurrentValue 'WebClient service not installed' -Recommendation 'No action required.'
+        } elseif ($svc.StartMode -eq 'Disabled') {
+            Add-AuditResult @fw -Status 'PASS' -Severity 'Medium' -CurrentValue 'Disabled' -Recommendation 'No action required.'
+        } elseif ($svc.State -eq 'Running' -or $svc.StartMode -eq 'Auto') {
+            Add-AuditResult @fw -Status 'WARN' -Severity 'Medium' -CurrentValue "$($svc.State), start mode $($svc.StartMode)" `
+                -Recommendation 'Disable the WebClient service (Set-Service WebClient -StartupType Disabled; Stop-Service WebClient) unless users need to map WebDAV folders. While it runs, any process can make this machine authenticate over HTTP to an attacker, who relays it.'
+        } else {
+            Add-AuditResult @fw -Status 'INFO' -Severity 'Informational' -CurrentValue "$($svc.State), start mode $($svc.StartMode) (Windows default: trigger-started on demand)" `
+                -Recommendation 'Default state, not scored. Consider disabling WebClient on machines that do not use WebDAV: a standard user can trigger it and enable NTLM relay attacks against this host.'
+        }
+    } catch {
+        Add-AuditResult -Category 'Network Authentication & Credential Exposure' -Control 'WebClient (WebDAV) Service' -Status 'WARN' -Severity 'Low' `
+            -CurrentValue 'Query failed' -Recommendation "Unable to query the WebClient service: $($_.Exception.Message)"
+    }
+}
+
+function Test-OpenSSHServerSecurity {
+    <#
+        Windows OpenSSH Server: global sshd_config options (password logins, empty
+        passwords, user environment), and write access to sshd_config and
+        administrators_authorized_keys. A low-privilege write grant on the administrators key
+        file lets any user add a key that logs in as any administrator.
+    #>
+    Write-SectionBanner 'Remote Access - OpenSSH Server'
+    $fwCfg = @{
+        Category = 'Network Architecture & Protocol Hardening'; Control = 'OpenSSH Server Configuration'
+        RecommendedValue = 'PasswordAuthentication no, PermitEmptyPasswords no, PermitUserEnvironment no'
+        CIS_Control = 'CIS 4.8, 5.2'; NIST_Control = 'AC-17, IA-2'; MITRE_Technique = 'T1021.004 (SSH), T1110 (Brute Force)'
+        ISO27001_Control = 'A.8.20'; NIS2_Article = 'Art.21(2)(j)'
+    }
+    $fwAcl = @{
+        Category = 'Network Architecture & Protocol Hardening'; Control = 'OpenSSH Administrator Keys & Config Permissions'
+        RecommendedValue = 'Only Administrators and SYSTEM can write sshd_config and administrators_authorized_keys'
+        CIS_Control = 'CIS 5.4'; NIST_Control = 'AC-6, CM-5'; MITRE_Technique = 'T1098.004 (SSH Authorized Keys)'
+        ISO27001_Control = 'A.8.2'; NIS2_Article = 'Art.21(2)(i)'
+    }
+    try {
+        $svc = Get-CimInstance -ClassName Win32_Service -Filter "Name='sshd'" -ErrorAction SilentlyContinue
+        if (-not $svc) {
+            Add-AuditResult @fwCfg -Status 'PASS' -Severity 'Medium' -CurrentValue 'OpenSSH Server not installed' -Recommendation 'No action required.'
+            return
+        }
+        $sshDir = Join-Path $env:ProgramData 'ssh'
+        $cfgPath = Join-Path $sshDir 'sshd_config'
+        $keysPath = Join-Path $sshDir 'administrators_authorized_keys'
+
+        # Global options only: everything before the first Match block.
+        $opts = @{}
+        if (Test-Path -LiteralPath $cfgPath -PathType Leaf) {
+            foreach ($line in (Get-Content -LiteralPath $cfgPath -TotalCount 2000 -ErrorAction SilentlyContinue)) {
+                $t = $line.Trim()
+                if (-not $t -or $t.StartsWith('#')) { continue }
+                if ($t -match '^(?i)match\s') { break }
+                if ($t -match '^(\S+)\s+(.+)$') { $k = $Matches[1].ToLowerInvariant(); if (-not $opts.ContainsKey($k)) { $opts[$k] = $Matches[2].Trim() } }
+            }
+        }
+        $issues = [System.Collections.Generic.List[string]]::new()
+        $pw = if ($opts.ContainsKey('passwordauthentication')) { $opts['passwordauthentication'] } else { 'yes (default)' }
+        if ($pw -notmatch '^(?i)no$') { $issues.Add("PasswordAuthentication $pw: passwords can be brute-forced over SSH") }
+        if ($opts['permitemptypasswords'] -match '^(?i)yes$') { $issues.Add('PermitEmptyPasswords yes') }
+        if ($opts['permituserenvironment'] -and $opts['permituserenvironment'] -notmatch '^(?i)no$') { $issues.Add("PermitUserEnvironment $($opts['permituserenvironment'])") }
+        $state = "service $($svc.State), start mode $($svc.StartMode)"
+        if ($issues.Count -gt 0) {
+            $sev = if ($svc.State -eq 'Running') { 'Medium' } else { 'Low' }
+            Add-AuditResult @fwCfg -Status 'WARN' -Severity $sev -CurrentValue "$($issues.Count) weak option(s); $state" -Details ($issues -join "`n") `
+                -Recommendation "Set PasswordAuthentication no (key-based logins only), PermitEmptyPasswords no and PermitUserEnvironment no in $cfgPath, then Restart-Service sshd."
+        } else {
+            Add-AuditResult @fwCfg -Status 'PASS' -Severity 'Medium' -CurrentValue "Key-based logins only; $state" -Recommendation 'No action required.'
+        }
+
+        $writable = [System.Collections.Generic.List[string]]::new()
+        foreach ($p in @($sshDir, $cfgPath, $keysPath)) {
+            if (-not (Test-Path -LiteralPath $p)) { continue }
+            $check = Test-LowPrivilegeWriteAccess -Path $p
+            if ($check.IsVulnerable) { $writable.Add("$p`: $($check.Principals -join '; ')") }
+        }
+        $keyCount = 0
+        if (Test-Path -LiteralPath $keysPath -PathType Leaf) {
+            $keyCount = @(Get-Content -LiteralPath $keysPath -ErrorAction SilentlyContinue | Where-Object { $_.Trim() -and -not $_.Trim().StartsWith('#') }).Count
+        }
+        if ($writable.Count -gt 0) {
+            Add-AuditResult @fwAcl -Status 'FAIL' -Severity 'Critical' -CurrentValue "$($writable.Count) SSH file(s) writable by non-admins; $keyCount administrator key(s)" -Details ($writable -join "`n") `
+                -Recommendation "Reset the ACLs: icacls $keysPath /inheritance:r /grant Administrators:F /grant SYSTEM:F (same for sshd_config). Anyone who can write administrators_authorized_keys can log in as any administrator."
+        } else {
+            Add-AuditResult @fwAcl -Status 'PASS' -Severity 'Critical' -CurrentValue "Admin-only write access; $keyCount administrator key(s) configured" -Recommendation 'No action required. Review the administrator keys periodically.'
+        }
+    } catch {
+        Add-AuditResult -Category 'Network Architecture & Protocol Hardening' -Control 'OpenSSH Server Configuration' -Status 'WARN' -Severity 'Low' `
+            -CurrentValue 'Query failed' -Recommendation "Unable to audit OpenSSH Server: $($_.Exception.Message)"
+    }
+}
+
+function Test-PointAndPrintRestriction {
+    <#
+        PrintNightmare (CVE-2021-34527) class: when RestrictDriverInstallationToAdministrators
+        is explicitly 0, standard users can install printer drivers (code that runs as SYSTEM),
+        and with NoWarningNoElevationOnInstall = 1 or UpdatePromptSettings = 2 they do so
+        silently. Not set means the secure default (admins only) since the August 2021 update.
+    #>
+    $fw = @{
+        Category = 'Attack Surface Reduction & Exploit Prevention'; Control = 'Point and Print Driver Installation'
+        RecommendedValue = 'RestrictDriverInstallationToAdministrators not set or 1'
+        CIS_Control = 'CIS 4.8'; NIST_Control = 'CM-7, AC-6'; MITRE_Technique = 'T1068 (Exploitation for Privilege Escalation), T1547.012 (Print Processors)'
+        ISO27001_Control = 'A.8.8'; NIS2_Article = 'Art.21(2)(e)'
+    }
+    try {
+        $pp = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Printers\PointAndPrint'
+        $restrict = Get-RegistryValueSafe -Path $pp -Name 'RestrictDriverInstallationToAdministrators' -DefaultValue $null
+        $noWarn = Get-RegistryValueSafe -Path $pp -Name 'NoWarningNoElevationOnInstall' -DefaultValue 0
+        $update = Get-RegistryValueSafe -Path $pp -Name 'UpdatePromptSettings' -DefaultValue 0
+        $state = "RestrictDriverInstallationToAdministrators=$(if ($null -eq $restrict) { 'not set' } else { $restrict }); NoWarningNoElevationOnInstall=$noWarn; UpdatePromptSettings=$update"
+        if ($null -ne $restrict -and [int]$restrict -eq 0) {
+            if ([int]$noWarn -eq 1 -or [int]$update -eq 2) {
+                Add-AuditResult @fw -Status 'FAIL' -Severity 'Critical' -CurrentValue $state `
+                    -Recommendation 'Set RestrictDriverInstallationToAdministrators to 1 (or remove it). As configured, any user can silently install a printer driver, which runs as SYSTEM (PrintNightmare).'
+            } else {
+                Add-AuditResult @fw -Status 'WARN' -Severity 'High' -CurrentValue $state `
+                    -Recommendation 'Set RestrictDriverInstallationToAdministrators to 1 (or remove it) so only administrators can install printer drivers.'
+            }
+        } else {
+            Add-AuditResult @fw -Status 'PASS' -Severity 'Critical' -CurrentValue $state -Recommendation 'No action required.'
+        }
+    } catch {
+        Add-AuditResult -Category 'Attack Surface Reduction & Exploit Prevention' -Control 'Point and Print Driver Installation' -Status 'WARN' -Severity 'Low' `
+            -CurrentValue 'Query failed' -Recommendation "Unable to read Point and Print policy: $($_.Exception.Message)"
+    }
+}
+
+function Test-StoredCredentialHashPolicy {
+    <#
+        NoLMHash = 0 stores the weak LAN Manager hash of new passwords (cracked in minutes);
+        it is 1 by default. DisableDomainCreds (CIS 2.3.10.4, "Do not allow storage of
+        passwords and credentials for network authentication") keeps Credential Manager from
+        caching domain passwords; not configured counts as WARN per the CIS recommendation.
+    #>
+    $fw = @{
+        Category = 'Network Authentication & Credential Exposure'; CIS_Control = 'CIS 3.11, 5.2'; NIST_Control = 'IA-5(1)'
+        MITRE_Technique = 'T1003.002 (Security Account Manager), T1555.004 (Windows Credential Manager)'; ISO27001_Control = 'A.8.5'; NIS2_Article = 'Art.21(2)(j)'
+    }
+    try {
+        $lsa = 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'
+        $noLm = Get-RegistryValueSafe -Path $lsa -Name 'NoLMHash' -DefaultValue 1
+        if ([int]$noLm -eq 0) {
+            Add-AuditResult @fw -Control 'LM Hash Storage' -Status 'FAIL' -Severity 'High' -CurrentValue 'NoLMHash = 0 (LAN Manager hashes stored)' -RecommendedValue 'NoLMHash = 1 (default)' `
+                -Recommendation 'Set "Network security: Do not store LAN Manager hash value on next password change" to Enabled (NoLMHash = 1), then have users change their passwords so the old LM hashes are dropped.'
+        } else {
+            Add-AuditResult @fw -Control 'LM Hash Storage' -Status 'PASS' -Severity 'High' -CurrentValue "NoLMHash = $noLm" -RecommendedValue 'NoLMHash = 1 (default)' -Recommendation 'No action required.'
+        }
+        $ddc = Get-RegistryValueSafe -Path $lsa -Name 'DisableDomainCreds' -DefaultValue $null
+        if ($null -ne $ddc -and [int]$ddc -eq 1) {
+            Add-AuditResult @fw -Control 'Network Credential Storage (DisableDomainCreds)' -Status 'PASS' -Severity 'Medium' -CurrentValue 'DisableDomainCreds = 1' -RecommendedValue 'Enabled (1)' -Recommendation 'No action required.'
+        } else {
+            Add-AuditResult @fw -Control 'Network Credential Storage (DisableDomainCreds)' -Status 'WARN' -Severity 'Medium' `
+                -CurrentValue $(if ($null -eq $ddc) { 'Not configured (domain passwords may be saved in Credential Manager)' } else { "DisableDomainCreds = $ddc" }) -RecommendedValue 'Enabled (1)' `
+                -Recommendation 'Enable "Network access: Do not allow storage of passwords and credentials for network authentication" (CIS 2.3.10.4) so saved domain passwords cannot be extracted from Credential Manager.'
+        }
+    } catch {
+        Add-AuditResult -Category 'Network Authentication & Credential Exposure' -Control 'LM Hash Storage' -Status 'WARN' -Severity 'Low' `
+            -CurrentValue 'Query failed' -Recommendation "Unable to read credential storage policy: $($_.Exception.Message)"
+    }
 }
 
 #endregion
@@ -10346,6 +10875,11 @@ $auditChecks = @(
     'Test-NTLMAndAnonymousAccessHardening',
     'Test-SMBInsecureGuestLogon',
     'Test-RestrictNTLMUsage',
+    'Test-LocalAccountRemoteUacPolicy',
+    'Test-CredentialDelegationPolicy',
+    'Test-KerberosEncryptionTypes',
+    'Test-StoredCredentialHashPolicy',
+    'Test-WebClientServiceExposure',
     'Test-UserRightsAssignment',
     'Test-PrivilegedGroupMembership',
     'Test-InteractiveLogonHardening',
@@ -10366,6 +10900,7 @@ $auditChecks = @(
     'Test-UnquotedServicePathsWritable',
     'Test-ServiceExecutableACLs',
     'Test-ServiceRegistryKeyACLs',
+    'Test-ServiceConfigurationPermission',
     'Test-WritablePathDirectories',
     'Test-CriticalDirectoryPermissions',
     'Test-LSASSAccessAuditing',
@@ -10385,6 +10920,7 @@ $auditChecks = @(
     'Test-AccessibilityBinaryIntegrity',
     'Test-StartupFolderPermissions',
     'Test-WMIEventSubscriptionPersistence',
+    'Test-UncommonRegistryPersistencePoints',
     'Test-AutostartInventory',
     'Test-PowerShellProfilePersistence',
     'Test-EventLogChannelACLTampering',
@@ -10430,13 +10966,16 @@ $auditChecks = @(
     'Test-ControlledFolderAccess',
     'Test-DefenderNetworkProtection',
     'Test-DefenderExclusions',
+    'Test-AmsiProviderIntegrity',
     'Test-SMBShareSecurity',
     'Test-FirewallRuleBroadAllowRules',
     'Test-RDPSecurityLayerAndTLS',
+    'Test-OpenSSHServerSecurity',
     'Test-PasswordNeverExpiresAccounts',
     'Test-RemoteDesktopUsersGroupMembership',
     'Test-SEHOPMitigation',
     'Test-PrintSpoolerRPCHardening',
+    'Test-PointAndPrintRestriction',
     'Test-BitLockerEncryptionType',
     'Test-BitLockerAutoUnlockExposure',
     'Test-SecureBootCertificateStatus',

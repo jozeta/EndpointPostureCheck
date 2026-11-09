@@ -1,5 +1,5 @@
 #!/usr/bin/env zsh
-# EndpointPostureCheck for macOS — built 2026-11-09 22:35:38 from src/*.zsh. Do not edit directly.
+# EndpointPostureCheck for macOS — built 2026-11-09 23:27:29 from src/*.zsh. Do not edit directly.
 
 # ---- 00-header.zsh ----
 #
@@ -6981,6 +6981,504 @@ check_wake_for_network_access_disabled() {
     fi
 }
 
+# ---- 42-attack-paths.zsh ----
+#
+# Attack paths and privilege escalation (macOS): settings and files an attacker with a
+# foothold uses to gain root, bypass TCC/Gatekeeper, or keep access. Each check reports into
+# the existing domain it belongs to; none re-evaluates a setting another check already scores.
+#
+# Values read from files or preferences are never used in arithmetic (zsh evaluates command
+# substitution inside arithmetic subscripts): file modes are validated as digits and then
+# matched as strings.
+
+# Prints "owner mode" (mode in octal, e.g. "root 644") for a path, or nothing.
+_owner_mode() {
+    stat -f '%Su %Lp' "$1" 2>/dev/null
+}
+
+# True when an octal mode string grants write to group or others ("664", "777", "1777").
+_mode_group_or_other_writable() {
+    local mode="$1"
+    [[ "$mode" == <-> ]] || return 1
+    local go="${mode[-2,-1]}"
+    [[ "${go[1]}" == [2367] || "${go[2]}" == [2367] ]]
+}
+
+# True when a path is writable by someone other than root: not owned by root, or group/other
+# writable. Missing paths are not writable.
+_writable_by_non_root() {
+    local om="" owner="" mode=""
+    om=$(_owner_mode "$1") || return 1
+    [[ -z "$om" ]] && return 1
+    owner="${om%% *}"; mode="${om##* }"
+    [[ "$owner" != root ]] && return 0
+    _mode_group_or_other_writable "$mode"
+}
+
+# ---------------------------------------------------------------- TCC
+
+# Apps that run whatever script or command they are given: a TCC grant to one of them is a
+# grant to every script started from it.
+typeset -ga TCC_SCRIPT_HOSTS
+TCC_SCRIPT_HOSTS=(
+    com.apple.Terminal com.googlecode.iterm2 dev.warp.Warp-Stable com.github.wez.wezterm net.kovidgoyal.kitty
+    io.alacritty com.mitchellh.ghostty co.zeit.hyper com.microsoft.VSCode com.apple.ScriptEditor2
+    /bin/bash /bin/zsh /bin/sh /usr/bin/osascript /usr/bin/python3 /usr/bin/perl /usr/bin/ruby
+)
+typeset -gA TCC_SERVICE_LABELS
+TCC_SERVICE_LABELS=(
+    kTCCServiceSystemPolicyAllFiles 'Full Disk Access' kTCCServiceAccessibility 'Accessibility'
+    kTCCServiceScreenCapture 'Screen Recording' kTCCServicePostEvent 'Input Monitoring (post events)'
+    kTCCServiceListenEvent 'Input Monitoring'
+)
+
+check_tcc_grants_to_script_hosts() {
+    local db="${1:-/Library/Application Support/com.apple.TCC/TCC.db}"
+    local -a fw
+    fw=(--recommended 'Powerful TCC grants go to code-signed apps, pinned by a code requirement, not to script hosts'
+        --cis 'CIS 3.3, 6.1' --nist 'AC-6, CM-7' --mitre 'T1548 (Abuse Elevation Control Mechanism), T1059 (Command and Scripting Interpreter)'
+        --iso27001 'A.8.2' --nis2 'Art.21(2)(i)' --cis-macos 'N/A' --mscp 'N/A')
+    run_root sqlite3 -separator $'\x1f' "$db" "SELECT service, client, client_type, csreq IS NULL FROM access WHERE auth_value=2 AND service IN ('kTCCServiceSystemPolicyAllFiles','kTCCServiceAccessibility','kTCCServiceScreenCapture','kTCCServicePostEvent','kTCCServiceListenEvent');"
+    if [[ "$ROOT_CMD_OUTPUT" == *"authorization denied"* || $ROOT_CMD_STATUS -ne 0 ]]; then
+        add_audit_result --category 'TCC & Privacy Controls' --control 'TCC Grants to Script Hosts & Unpinned Clients' \
+            --status INFO --severity Informational --current 'TCC database not readable from this process' "${fw[@]}" \
+            --recommendation 'Grant Full Disk Access to the terminal running this audit to evaluate which apps hold Full Disk Access, Accessibility, Screen Recording and Input Monitoring.'
+        return
+    fi
+    local line="" service="" client="" ctype="" nocsreq="" label=""
+    local -a pinned_risk hosts
+    for line in "${(@f)ROOT_CMD_OUTPUT}"; do
+        [[ -z "$line" ]] && continue
+        IFS=$'\x1f' read -r service client ctype nocsreq <<< "$line"
+        label="${TCC_SERVICE_LABELS[$service]:-$service}"
+        if [[ "$nocsreq" == 1 ]]; then
+            pinned_risk+=("$client ($label): no code requirement, so whatever sits at that path or bundle ID inherits the grant")
+        elif [[ "$ctype" == 1 ]] && _writable_by_non_root "$client"; then
+            pinned_risk+=("$client ($label): binary is writable by a non-root user")
+        fi
+        if (( ${TCC_SCRIPT_HOSTS[(Ie)$client]} )) || [[ "$ctype" == 1 && "$client" == (/opt/homebrew/*|/usr/local/*) ]]; then
+            hosts+=("$client ($label): every script or command started from it inherits $label")
+        fi
+    done
+    if (( ${#pinned_risk[@]} )); then
+        add_audit_result --category 'TCC & Privacy Controls' --control 'TCC Grants to Script Hosts & Unpinned Clients' \
+            --status WARN --severity Medium --current "${#pinned_risk[@]} grant(s) not pinned to a code signature${hosts:+, ${#hosts[@]} to script hosts}" \
+            --details "${(F)pinned_risk}${hosts:+$NL${(F)hosts}}" "${fw[@]}" \
+            --recommendation 'Remove the listed grants in System Settings > Privacy & Security and re-grant only to the signed app that needs it. A grant without a code requirement, or to a binary a user can replace, can be taken over by planting a different program at that path.'
+    elif (( ${#hosts[@]} )); then
+        add_audit_result --category 'TCC & Privacy Controls' --control 'TCC Grants to Script Hosts & Unpinned Clients' \
+            --status WARN --severity Low --current "${#hosts[@]} powerful grant(s) to terminals or interpreters" \
+            --details "${(F)hosts}" "${fw[@]}" \
+            --recommendation 'A terminal or interpreter with Full Disk Access or Accessibility passes that access to every script, package install hook and tool it runs. Keep such grants to admin workstations that need them, and remove them where they were only granted once for a task.'
+    else
+        add_audit_result --category 'TCC & Privacy Controls' --control 'TCC Grants to Script Hosts & Unpinned Clients' \
+            --status PASS --severity Medium --current 'No powerful grants to script hosts or unpinned clients' "${fw[@]}" \
+            --recommendation 'No action required.'
+    fi
+}
+
+# ---------------------------------------------------------------- sudo
+
+# Environment variables that make the program sudo runs load attacker code.
+typeset -ga SUDO_DANGEROUS_ENV
+SUDO_DANGEROUS_ENV=(DYLD_ LD_PRELOAD LD_LIBRARY_PATH PYTHONPATH PYTHONSTARTUP PYTHONHOME PERL5LIB PERL5OPT
+    RUBYLIB RUBYOPT NODE_OPTIONS NODE_PATH BASH_ENV ENV SHELLOPTS PS4 GIT_EXEC_PATH)
+
+check_sudo_environment_and_dropins() {
+    local -a findings files unreadable
+    local f="" line="" trimmed="" om="" v=""
+    run_root find /etc/sudoers.d -maxdepth 1 -type f
+    files=(/etc/sudoers "${(@f)ROOT_CMD_OUTPUT}"); files=(${files:#})
+    for f in "${files[@]}"; do
+        [[ "$f" == /etc/sudoers* ]] || continue
+        om=$(_owner_mode "$f")
+        if [[ -n "$om" ]] && { [[ "${om%% *}" != root ]] || _mode_group_or_other_writable "${om##* }"; }; then
+            findings+=("$f is writable by a non-root user ($om): anyone who can edit it can grant themselves root")
+        fi
+        run_root cat "$f"
+        if [[ $ROOT_CMD_STATUS -ne 0 ]]; then unreadable+=("$f"); continue; fi
+        for line in "${(@f)ROOT_CMD_OUTPUT}"; do
+            trimmed="${line#"${line%%[![:space:]]*}"}"
+            [[ -z "$trimmed" || "$trimmed" == \#* ]] && continue
+            [[ "$trimmed" == *'!env_reset'* ]] && findings+=("$f: env_reset disabled, the caller's whole environment reaches root")
+            [[ "$trimmed" == Defaults*setenv* && "$trimmed" != *'!setenv'* ]] && findings+=("$f: setenv lets callers pass any variable to root")
+            [[ "$trimmed" == *SETENV:* ]] && findings+=("$f: SETENV tag lets the caller pass any variable: $trimmed")
+            if [[ "$trimmed" == *env_keep* ]]; then
+                for v in "${SUDO_DANGEROUS_ENV[@]}"; do
+                    [[ "$trimmed" == *"$v"* ]] && { findings+=("$f: env_keep keeps $v (makes the root program load attacker code)"); break; }
+                done
+            fi
+        done
+    done
+    local -a fw
+    fw=(--recommended 'sudo resets the environment, keeps no loader/interpreter variables, and only root can edit sudoers files'
+        --cis 'CIS 5.4' --nist 'AC-6, CM-6' --mitre 'T1548.003 (Sudo and Sudo Caching), T1574.006 (Dynamic Linker Hijacking)'
+        --iso27001 'A.8.2' --nis2 'Art.21(2)(i)' --cis-macos 'N/A' --mscp 'N/A')
+    if (( ${#unreadable[@]} )) && (( ${#findings[@]} == 0 )); then
+        add_audit_result --category 'Identity, Accounts & Privilege Management' --control 'Sudo Environment & Drop-in Permissions' \
+            --status WARN --severity Low --current "Could not read ${#unreadable[@]} sudoers file(s)" --details "${(F)unreadable}" "${fw[@]}" \
+            --recommendation 'Run the audit with sudo so the sudoers files can be read.'
+    elif (( ${#findings[@]} )); then
+        add_audit_result --category 'Identity, Accounts & Privilege Management' --control 'Sudo Environment & Drop-in Permissions' \
+            --status FAIL --severity High --current "${#findings[@]} issue(s) in sudoers" --details "${(F)findings}" "${fw[@]}" \
+            --recommendation 'Edit with "sudo visudo" (or "sudo visudo -f /etc/sudoers.d/<file>"): keep env_reset on, remove loader/interpreter variables (DYLD_*, LD_*, PYTHONPATH, PERL5LIB, NODE_OPTIONS, BASH_ENV ...) from env_keep, drop SETENV/setenv, and make every sudoers file root:wheel 0440.'
+    else
+        add_audit_result --category 'Identity, Accounts & Privilege Management' --control 'Sudo Environment & Drop-in Permissions' \
+            --status PASS --severity High --current "${#files[@]} sudoers file(s): environment reset, no dangerous variables kept, root-only" "${fw[@]}" \
+            --recommendation 'No action required.'
+    fi
+}
+
+# ---------------------------------------------------------------- authorization database
+
+# Rights and the rules they build on whose stock definitions always require an admin
+# password. "allow" (or a rule that is allow, or authenticate-user false) removes that.
+typeset -ga AUTHDB_RIGHTS
+AUTHDB_RIGHTS=(system.privilege.admin system.preferences system.preferences.security system.preferences.accounts
+    system.services.directory.configure authenticate-admin-nonshared authenticate-admin admin)
+
+check_authorization_db_weakened_rights() {
+    local right="" xml="" cls="" rule="" auth_user="" read_ok=0
+    local -a weak
+    for right in "${AUTHDB_RIGHTS[@]}"; do
+        run_root security authorizationdb read "$right"
+        [[ $ROOT_CMD_STATUS -eq 0 && "$ROOT_CMD_OUTPUT" == *'<plist'* ]] || continue
+        read_ok=$((read_ok + 1))
+        # run_root merges stderr, where security prints "YES (0)" after the plist.
+        xml="<?xml${ROOT_CMD_OUTPUT#*<\?xml}"; xml="${xml%%</plist>*}</plist>"
+        cls=$(print -r -- "$xml" | plutil -extract class raw -o - - 2>/dev/null)
+        rule=$(print -r -- "$xml" | plutil -extract rule json -o - - 2>/dev/null)
+        auth_user=$(print -r -- "$xml" | plutil -extract authenticate-user raw -o - - 2>/dev/null)
+        if [[ "$cls" == allow ]]; then weak+=("$right: class allow (no authentication)")
+        elif [[ "$rule" == *'"allow"'* ]]; then weak+=("$right: rule allow (no authentication)")
+        elif [[ "$cls" == user && "$auth_user" == false ]]; then weak+=("$right: authenticate-user false (group membership alone is enough)")
+        fi
+    done
+    local -a fw
+    fw=(--recommended 'Admin rights in the authorization database require authentication (stock rules)'
+        --cis 'CIS 5.4' --nist 'AC-3, AC-6' --mitre 'T1548 (Abuse Elevation Control Mechanism), T1556 (Modify Authentication Process)'
+        --iso27001 'A.8.2' --nis2 'Art.21(2)(i)' --cis-macos 'N/A' --mscp 'N/A')
+    if (( read_ok == 0 )); then
+        add_audit_result --category 'Identity, Accounts & Privilege Management' --control 'Authorization Database Admin Rights' \
+            --status WARN --severity Low --current 'Could not read the authorization database' "${fw[@]}" \
+            --recommendation 'Verify manually: "security authorizationdb read system.privilege.admin" should use authenticate-admin-nonshared.'
+    elif (( ${#weak[@]} )); then
+        add_audit_result --category 'Identity, Accounts & Privilege Management' --control 'Authorization Database Admin Rights' \
+            --status FAIL --severity High --current "${#weak[@]} admin right(s) no longer require authentication" --details "${(F)weak}" "${fw[@]}" \
+            --recommendation 'Restore the stock definition, e.g. "sudo security authorizationdb write system.privilege.admin authenticate-admin-nonshared". A right set to allow lets any process perform that admin action without a password; it is a known persistence and escalation trick.'
+    else
+        add_audit_result --category 'Identity, Accounts & Privilege Management' --control 'Authorization Database Admin Rights' \
+            --status PASS --severity High --current "$read_ok admin right(s) checked; all require authentication" "${fw[@]}" \
+            --recommendation 'No action required.'
+    fi
+}
+
+# ---------------------------------------------------------------- PAM
+
+typeset -ga PAM_SENSITIVE_SERVICES
+PAM_SENSITIVE_SERVICES=(sudo sudo_local su login authorization screensaver sshd passwd chkpasswd)
+
+check_pam_configuration_integrity() {
+    local dir="${1:-/etc/pam.d}" f="" line="" trimmed="" svc="" module="" control="" modpath="" i=0
+    local -a words fails warns
+    for f in "$dir"/*(N.); do
+        svc="${f:t}"
+        [[ "$svc" == *.template ]] && continue
+        for line in "${(@f)$(<"$f")}"; do
+            trimmed="${line#"${line%%[![:space:]]*}"}"
+            [[ -z "$trimmed" || "$trimmed" == \#* ]] && continue
+            words=(${=trimmed})
+            (( ${#words[@]} >= 3 )) || continue
+            control="${words[2]}"; module="${words[3]}"
+            if [[ "$control" == \[* ]]; then   # [value=action ...] spans several words
+                i=2
+                while (( i <= ${#words[@]} )) && [[ "${words[$i]}" != *\] ]]; do i=$((i + 1)); done
+                module="${words[$((i + 1))]:-}"
+            fi
+            [[ -z "$module" ]] && continue
+            # include/substack name another PAM service (checked as its own file), not a module.
+            [[ "$control" == (include|substack) ]] && continue
+            # Not "path": in zsh that name is tied to $PATH.
+            if [[ "$module" == /* ]]; then modpath="$module"; else modpath="/usr/lib/pam/$module"; fi
+            # "sufficient" (or a [success=...] control) pam_permit short-circuits the stack: any
+            # password works. Stock macOS uses only "required" pam_permit (e.g. passwd auth),
+            # which cannot bypass the real password module and is not flagged.
+            if [[ "$module" == pam_permit.so* && "${words[1]}" == auth && "$control" == (sufficient|\[*) ]] &&
+               [[ ${PAM_SENSITIVE_SERVICES[(Ie)$svc]} != 0 ]]; then
+                fails+=("$svc: auth $control $module (accepts any password)")
+            elif [[ "$modpath" != /usr/lib/pam/* ]]; then
+                if _writable_by_non_root "$modpath" || _writable_by_non_root "${modpath:h}"; then
+                    fails+=("$svc: $module is writable by a non-root user and loads into ${svc} as root")
+                else
+                    warns+=("$svc: $module (outside /usr/lib/pam)")
+                fi
+            elif [[ ! -e "$modpath" && ! -e "$modpath.2" ]]; then
+                warns+=("$svc: $module not found in /usr/lib/pam")
+            fi
+        done
+    done
+    local -a fw
+    fw=(--recommended 'PAM stacks use only Apple modules from /usr/lib/pam; no pam_permit in authentication'
+        --cis 'CIS 5.4' --nist 'IA-2, SI-7' --mitre 'T1556.003 (Pluggable Authentication Modules)'
+        --iso27001 'A.8.5' --nis2 'Art.21(2)(j)' --cis-macos 'N/A' --mscp 'N/A')
+    if (( ${#fails[@]} )); then
+        add_audit_result --category 'Identity, Accounts & Privilege Management' --control 'PAM Configuration Integrity' \
+            --status FAIL --severity High --current "${#fails[@]} PAM entry(ies) bypass or expose authentication" \
+            --details "${(F)fails}${warns:+$NL${(F)warns}}" "${fw[@]}" \
+            --recommendation 'Remove pam_permit from authentication stacks, and make sure every third-party module and its folder is root-owned and not writable by users (a Homebrew-installed module such as pam_reattach under /opt/homebrew is user-writable: replacing it gives root on the next sudo).'
+    elif (( ${#warns[@]} )); then
+        add_audit_result --category 'Identity, Accounts & Privilege Management' --control 'PAM Configuration Integrity' \
+            --status WARN --severity Medium --current "${#warns[@]} third-party or missing PAM module(s)" --details "${(F)warns}" "${fw[@]}" \
+            --recommendation 'Confirm each listed module is expected (e.g. pam_tid.so for Touch ID in sudo_local is Apple; others should be known products), root-owned and not user-writable.'
+    else
+        add_audit_result --category 'Identity, Accounts & Privilege Management' --control 'PAM Configuration Integrity' \
+            --status PASS --severity High --current 'Only Apple PAM modules, no pam_permit in authentication' "${fw[@]}" \
+            --recommendation 'No action required.'
+    fi
+}
+
+# ---------------------------------------------------------------- containers
+
+check_container_runtime_exposure() {
+    local entry="" home="" sock="" om="" target="" f=""
+    local -a issues found
+    local -a socks
+    socks=(/var/run/docker.sock)
+    for entry in "${(@f)$(_local_user_homes)}"; do
+        [[ -z "$entry" ]] && continue
+        home="${entry#*$'\t'}"
+        socks+=("$home/.docker/run/docker.sock" "$home/.colima/default/docker.sock" "$home/.orbstack/run/docker.sock"
+                "$home/.rd/docker.sock" "$home/.lima/default/sock/docker.sock")
+        for f in "$home/Library/Group Containers/group.com.docker/settings.json" "$home/Library/Group Containers/group.com.docker/settings-store.json"; do
+            [[ -f "$f" ]] || continue
+            if grep -Eqi '"exposeDockerAPIOnTCP2375"[[:space:]]*:[[:space:]]*true' "$f" 2>/dev/null; then
+                issues+=("${home:t}: Docker Desktop exposes the daemon on tcp://localhost:2375 without TLS (any local process or web page via DNS rebinding can run containers)")
+            fi
+        done
+    done
+    for sock in "${socks[@]}"; do
+        [[ -S "$sock" || -L "$sock" ]] || continue
+        target="$sock"
+        [[ -L "$sock" ]] && target="${sock:A}"
+        [[ -S "$target" ]] || continue
+        found+=("$sock")
+        om=$(_owner_mode "$target")
+        _mode_group_or_other_writable "${om##* }" && issues+=("$sock -> $target ($om): other local users can drive the container engine as ${om%% *}")
+    done
+    local -a fw
+    fw=(--recommended 'Container engine sockets usable only by their owner; no unauthenticated TCP API'
+        --cis 'CIS 4.1' --nist 'AC-6, CM-7' --mitre 'T1610 (Deploy Container), T1611 (Escape to Host)'
+        --iso27001 'A.8.20' --nis2 'Art.21(2)(e)' --cis-macos 'N/A' --mscp 'N/A')
+    if (( ${#issues[@]} )); then
+        add_audit_result --category 'Virtualization & Container Escape Surface' --control 'Container Engine Socket & API Exposure' \
+            --status WARN --severity High --current "${#issues[@]} exposed container engine endpoint(s)" --details "${(F)issues}" "${fw[@]}" \
+            --recommendation 'Turn off "Expose daemon on tcp://localhost:2375 without TLS" in Docker Desktop settings, and keep engine sockets owner-only (chmod 600 or 700 on the folder). Whoever can talk to the engine can mount the shared folders and run anything there.'
+    else
+        add_audit_result --category 'Virtualization & Container Escape Surface' --control 'Container Engine Socket & API Exposure' \
+            --status PASS --severity High --current "${#found[@]} container engine socket(s), none exposed to other users or TCP" \
+            --details "${(F)found}" "${fw[@]}" --recommendation 'No action required.'
+    fi
+}
+
+# ---------------------------------------------------------------- SSH server
+
+check_sshd_risky_options() {
+    _sshd_query
+    local cfg="$ROOT_CMD_OUTPUT" key="" val=""
+    local -a issues
+    local -A want
+    # Option (lowercase, as sshd -G prints it) -> value that is safe.
+    want=(permituserenvironment no permitemptypasswords no gatewayports no authorizedkeyscommand none
+          authorizedprincipalscommand none permittunnel no)
+    for key in ${(k)want}; do
+        val=$(print -r -- "$cfg" | awk -v k="$key" 'tolower($1) == k { $1 = ""; sub(/^ /, ""); print; exit }')
+        [[ -z "$val" || "${val:l}" == "${want[$key]}" ]] && continue
+        case "$key" in
+            permituserenvironment) issues+=("PermitUserEnvironment $val: users can set DYLD_*/LD_* for their own sshd session via ~/.ssh/environment") ;;
+            permitemptypasswords) issues+=("PermitEmptyPasswords $val: accounts without a password can log in") ;;
+            gatewayports) issues+=("GatewayPorts $val: forwarded ports are reachable from the network") ;;
+            authorizedkeyscommand) issues+=("AuthorizedKeysCommand $val: an external program decides who may log in") ;;
+            authorizedprincipalscommand) issues+=("AuthorizedPrincipalsCommand $val: an external program decides certificate principals") ;;
+            permittunnel) issues+=("PermitTunnel $val: layer-3 tunnels into the network are allowed") ;;
+        esac
+    done
+    if [[ "$SSHD_ENABLED" != 1 ]]; then
+        add_audit_result --category 'SSH Server & Client Hardening' --control 'SSH Server Risky Options' \
+            --status INFO --severity Informational \
+            --current "Remote Login is off; ${#issues[@]} risky option(s) would apply if enabled" --details "${(F)issues}" \
+            --recommended 'Harden before enabling Remote Login' --cis-macos 'N/A' --mscp 'N/A' \
+            --recommendation 'Not scored while Remote Login (sshd) is off.'
+        return
+    fi
+    local -a fw
+    fw=(--recommended 'No user environment, empty passwords, gateway ports, tunnels or external key commands'
+        --cis 'CIS 4.8' --nist 'AC-17, CM-6' --mitre 'T1021.004 (SSH), T1098.004 (SSH Authorized Keys)'
+        --iso27001 'A.8.9' --nis2 'Art.21(2)(e)' --cis-macos 'N/A' --mscp 'N/A')
+    if (( ${#issues[@]} )); then
+        add_audit_result --category 'SSH Server & Client Hardening' --control 'SSH Server Risky Options' \
+            --status WARN --severity Medium --current "${#issues[@]} risky sshd option(s)" --details "${(F)issues}" "${fw[@]}" \
+            --recommendation 'Set the listed options back to their defaults in /etc/ssh/sshd_config.d/ (PermitUserEnvironment no, PermitEmptyPasswords no, GatewayPorts no, PermitTunnel no) and remove AuthorizedKeysCommand unless it is a known identity integration.'
+    else
+        add_audit_result --category 'SSH Server & Client Hardening' --control 'SSH Server Risky Options' \
+            --status PASS --severity Medium --current 'No risky sshd options set' "${fw[@]}" --recommendation 'No action required.'
+    fi
+}
+
+# ---------------------------------------------------------------- network listeners
+
+check_network_exposed_listeners() {
+    run_root lsof -nP -iTCP -sTCP:LISTEN -F pcn
+    local line="" pid="" cmd="" name="" addr="" exe="" key=""
+    local -a exposed
+    local -A seen
+    for line in "${(@f)ROOT_CMD_OUTPUT}"; do
+        case "$line" in
+            p*) pid="${line#p}" ;;
+            c*) cmd="${line#c}" ;;
+            n*)
+                name="${line#n}"; addr="${name%:*}"
+                [[ "$addr" == (127.*|\[::1\]|localhost|\[::ffff:127.*) ]] && continue
+                [[ "$pid" == <-> ]] || continue
+                exe=$(ps -p "$pid" -o comm= 2>/dev/null)
+                [[ "$exe" == (/System/*|/usr/libexec/*|/usr/sbin/*|/usr/bin/*|/sbin/*|/bin/*) ]] && continue
+                key="$cmd $name"
+                [[ -n "${seen[$key]:-}" ]] && continue
+                seen[$key]=1
+                exposed+=("$cmd ($exe) on $name")
+                ;;
+        esac
+    done
+    local fw_state=""
+    fw_state=$(defaults_read_safe /Library/Preferences/com.apple.alf globalstate '')
+    local -a fw
+    fw=(--recommended 'Third-party services listen on loopback only, or are intended and firewalled'
+        --cis 'CIS 4.4, 12.4' --nist 'CM-7, SC-7' --mitre 'T1133 (External Remote Services), T1210 (Exploitation of Remote Services)'
+        --iso27001 'A.8.20' --nis2 'Art.21(2)(e)' --cis-macos 'N/A' --mscp 'N/A')
+    if (( ${#exposed[@]} )); then
+        add_audit_result --category 'System Services & Daemon Exposure' --control 'Third-Party Services Listening on the Network' \
+            --status WARN --severity "$( [[ "$fw_state" == (1|2) ]] && print Low || print Medium )" \
+            --current "${#exposed[@]} non-Apple listener(s) on non-loopback addresses (application firewall ${fw_state:-state unknown})" \
+            --details "${(F)${(@o)exposed}}" "${fw[@]}" \
+            --recommendation 'Confirm each listener should be reachable from the network. Bind development servers to 127.0.0.1, turn off sharing features you do not use, and keep the application firewall on so unexpected listeners are blocked.'
+    else
+        add_audit_result --category 'System Services & Daemon Exposure' --control 'Third-Party Services Listening on the Network' \
+            --status PASS --severity Medium --current 'No non-Apple TCP listeners on network addresses' "${fw[@]}" \
+            --recommendation 'No action required.'
+    fi
+}
+
+# ---------------------------------------------------------------- shell history beyond the console user
+
+# Bounded like the console-user sweep: the last 500 lines per file, counts only, never the
+# matched text. Covers root and every other local user, plus database/REPL histories.
+check_privileged_and_other_user_history_secrets() {
+    local entry="" user="" home="" f="" line="" lower="" count=0
+    local -a homes hits
+    homes=("root"$'\t'"/var/root")
+    for entry in "${(@f)$(_local_user_homes)}"; do
+        [[ -z "$entry" ]] && continue
+        [[ "${entry%%$'\t'*}" == "$CONSOLE_USER" ]] && continue   # covered by Shell History Secret Sweep
+        homes+=("$entry")
+    done
+    for entry in "${homes[@]}"; do
+        user="${entry%%$'\t'*}"; home="${entry#*$'\t'}"
+        for f in .zsh_history .bash_history .sh_history .mysql_history .psql_history .python_history .node_repl_history; do
+            run_root test -f "$home/$f"
+            [[ $ROOT_CMD_STATUS -eq 0 ]] || continue
+            run_root tail -n 500 "$home/$f"
+            count=0
+            for line in "${(@f)ROOT_CMD_OUTPUT}"; do
+                lower="${line:l}"
+                if [[ "$line" =~ 'AKIA[A-Z0-9]{16}' || "$line" == *"-----BEGIN"* || "$lower" == *(password=|passwd=|apikey=|api_key=|token=|secret=|identified\ by)* ]]; then
+                    count=$((count + 1))
+                fi
+            done
+            (( count > 0 )) && hits+=("$user: $count secret-like line(s) in ~/$f")
+        done
+    done
+    local -a fw
+    fw=(--recommended 'No secret-like patterns in root or other users'' shell and database histories'
+        --cis 'CIS 3.11' --nist 'IA-5' --mitre 'T1552.003 (Bash History)' --iso27001 'A.8.24'
+        --nis2 'Art.21(2)(h)' --cis-macos 'N/A' --mscp 'N/A')
+    if (( ${#hits[@]} )); then
+        add_audit_result --category 'Credential Exposure & Secret Leaks' --control 'Root & Other Users'' History Secret Sweep' \
+            --status WARN --severity High --current "${#hits[@]} history file(s) with secret-like lines" --details "${(F)hits}" "${fw[@]}" \
+            --recommendation 'Rotate any credential that was typed on a command line (root and database histories are read by anyone who later gains root), then clear the history entries. Prefer prompts or credential files over passwords in arguments.'
+    else
+        add_audit_result --category 'Credential Exposure & Secret Leaks' --control 'Root & Other Users'' History Secret Sweep' \
+            --status PASS --severity High --current "No secret-like lines in ${#homes[@]} account(s)' recent histories" "${fw[@]}" \
+            --recommendation 'No action required.'
+    fi
+}
+
+# ---------------------------------------------------------------- library validation
+
+check_library_validation_policy() {
+    local plist="${1:-/Library/Preferences/com.apple.security.libraryvalidation.plist}" value=""
+    value=$(defaults_read_safe "${plist%.plist}" DisableLibraryValidation '')
+    local -a fw
+    fw=(--recommended 'Library validation not disabled system-wide'
+        --cis 'CIS 2.5' --nist 'SI-7, CM-7' --mitre 'T1574.006 (Dynamic Linker Hijacking), T1055 (Process Injection)'
+        --iso27001 'A.8.19' --nis2 'Art.21(2)(e)' --cis-macos 'N/A' --mscp 'N/A')
+    if [[ "${value:l}" == (1|true|yes) ]]; then
+        add_audit_result --category 'Dylib Hijacking & Code Injection' --control 'Library Validation Disabled System-Wide' \
+            --status FAIL --severity High --current "DisableLibraryValidation = $value" "${fw[@]}" \
+            --recommendation 'Delete the setting: "sudo defaults delete /Library/Preferences/com.apple.security.libraryvalidation DisableLibraryValidation". With it, apps load unsigned plug-ins and libraries, so injected code inherits their TCC permissions and keychain access.'
+    else
+        add_audit_result --category 'Dylib Hijacking & Code Injection' --control 'Library Validation Disabled System-Wide' \
+            --status PASS --severity High --current 'Not disabled (default)' "${fw[@]}" --recommendation 'No action required.'
+    fi
+}
+
+# ---------------------------------------------------------------- download quarantine
+
+check_download_quarantine_disabled() {
+    local entry="" user="" home="" value=""
+    local -a off
+    for entry in "${(@f)$(_local_user_homes)}"; do
+        [[ -z "$entry" ]] && continue
+        user="${entry%%$'\t'*}"; home="${entry#*$'\t'}"
+        # Read the file directly: defaults goes through cfprefsd, which special-cases
+        # .../Library/Preferences paths outside the caller's own home.
+        value=$(plutil -extract LSQuarantine raw -o - "$home/Library/Preferences/com.apple.LaunchServices.plist" 2>/dev/null)
+        [[ "${value:l}" == (0|false|no) ]] && off+=("$user: LSQuarantine = $value")
+    done
+    local -a fw
+    fw=(--recommended 'Downloads get the quarantine flag (LSQuarantine not disabled)'
+        --cis 'CIS 2.6, 10.1' --nist 'SI-3, CM-7' --mitre 'T1553.001 (Gatekeeper Bypass)'
+        --iso27001 'A.8.7' --nis2 'Art.21(2)(e)' --cis-macos 'N/A' --mscp 'N/A')
+    if (( ${#off[@]} )); then
+        add_audit_result --category 'Gatekeeper, Notarization & Application Control' --control 'Download Quarantine Disabled' \
+            --status FAIL --severity High --current "Quarantine flag disabled for ${#off[@]} user(s)" --details "${(F)off}" "${fw[@]}" \
+            --recommendation 'Remove the setting for each listed user: "defaults delete com.apple.LaunchServices LSQuarantine" (as that user). Without the quarantine flag, Gatekeeper never checks downloaded apps and scripts.'
+    else
+        add_audit_result --category 'Gatekeeper, Notarization & Application Control' --control 'Download Quarantine Disabled' \
+            --status PASS --severity High --current 'Quarantine flag active for all users (default)' "${fw[@]}" --recommendation 'No action required.'
+    fi
+}
+
+# ---------------------------------------------------------------- legacy VNC
+
+check_legacy_vnc_password() {
+    local vnc_file="${1:-/Library/Preferences/com.apple.VNCSettings.txt}" legacy=""
+    local -a issues
+    [[ -f "$vnc_file" ]] && issues+=("$vnc_file exists: a legacy VNC password (8 characters max, reversibly obfuscated) is set")
+    legacy=$(defaults_read_safe /Library/Preferences/com.apple.RemoteManagement VNCLegacyConnectionsEnabled '')
+    [[ "${legacy:l}" == (1|true|yes) ]] && issues+=("Remote Management: VNC viewers may control the screen with a password (VNCLegacyConnectionsEnabled)")
+    local -a fw
+    fw=(--recommended 'No legacy VNC password; screen sharing uses macOS account authentication'
+        --cis 'CIS 4.6, 6.3' --nist 'IA-2, AC-17' --mitre 'T1021.005 (VNC)' --iso27001 'A.8.5'
+        --nis2 'Art.21(2)(j)' --cis-macos 'N/A' --mscp 'N/A')
+    if (( ${#issues[@]} )); then
+        add_audit_result --category 'Remote Access & Sharing Services' --control 'Legacy VNC Password Authentication' \
+            --status FAIL --severity High --current "${#issues[@]} legacy VNC setting(s)" --details "${(F)issues}" "${fw[@]}" \
+            --recommendation 'In System Settings > General > Sharing > Screen Sharing (or Remote Management > Computer Settings), turn off "VNC viewers may control screen with password", then delete /Library/Preferences/com.apple.VNCSettings.txt. The VNC password is short, has no lockout and is stored reversibly.'
+    else
+        add_audit_result --category 'Remote Access & Sharing Services' --control 'Legacy VNC Password Authentication' \
+            --status PASS --severity High --current 'No legacy VNC password configured' "${fw[@]}" --recommendation 'No action required.'
+    fi
+}
+
 # ---- 90-scoring.zsh ----
 #
 # Scoring & risk engine. Direct port of Get-CompliancePosture from the
@@ -8765,16 +9263,16 @@ AUDIT_CHECKS=(
     # Domain 3: Volume Encryption & Data-at-Rest (FileVault)
     check_filevault_status check_filevault_deferred_enablement check_filevault_enabled_user_count check_filevault_recovery_key_escrow
     # Domain 4: Gatekeeper, Notarization & Application Control
-    check_gatekeeper_status check_quarantine_enforcement_telemetry check_applications_quarantine_flag_survey
+    check_gatekeeper_status check_quarantine_enforcement_telemetry check_applications_quarantine_flag_survey check_download_quarantine_disabled
     # Domain 5: Malware Defense (XProtect / MRT / EDR)
     check_xprotect_freshness check_xprotect_remediator_results check_mrt_freshness check_third_party_edr_presence check_endpoint_security_clients
     # Domain 6: TCC & Privacy Controls
-    check_tcc_full_disk_access_grants check_tcc_screen_recording_grants check_tcc_accessibility_grants
+    check_tcc_full_disk_access_grants check_tcc_screen_recording_grants check_tcc_accessibility_grants check_tcc_grants_to_script_hosts
     check_tcc_camera_microphone_grants check_tcc_database_permissions
     check_location_services_enabled check_location_services_menu_icon
     # Domain 7: Identity, Accounts & Privilege Management
     check_root_account_disabled check_guest_account_disabled check_admin_group_membership_inventory check_password_policy_configured
-    check_sudoers_configuration
+    check_sudoers_configuration check_sudo_environment_and_dropins check_authorization_db_weakened_rights check_pam_configuration_integrity
     check_password_lockout_threshold check_password_minimum_length check_password_age check_password_history
     check_sudo_timeout_zero check_sudo_timestamp_per_tty check_sudo_logging_enabled
     check_admin_password_for_system_preferences check_admin_cannot_unlock_other_sessions
@@ -8783,12 +9281,12 @@ AUDIT_CHECKS=(
     check_firewall_state check_firewall_stealth_mode check_firewall_block_all_incoming check_firewall_signed_app_auto_allow
     check_firewall_per_app_exceptions check_etc_hosts_integrity
     # Domain 9: Remote Access & Sharing Services
-    check_screen_sharing_state check_remote_management_state check_file_sharing_state check_remote_login_toggle
+    check_screen_sharing_state check_remote_management_state check_file_sharing_state check_remote_login_toggle check_legacy_vnc_password
     check_airplay_receiver_disabled check_printer_sharing_disabled check_remote_apple_events_disabled
     check_internet_sharing_disabled check_content_caching_disabled check_media_sharing_disabled
     check_bluetooth_sharing_disabled
     # Domain 10: SSH Server & Client Hardening
-    check_sshd_password_auth check_sshd_permit_root_login check_sshd_weak_ciphers check_ssh_client_strict_host_key_checking
+    check_sshd_password_auth check_sshd_permit_root_login check_sshd_weak_ciphers check_ssh_client_strict_host_key_checking check_sshd_risky_options
     # Domain 11: Cryptography & Certificate Trust
     check_system_trust_settings_overrides check_login_keychain_lock_on_sleep check_fips_validated_crypto_note
     # Domain 12: Audit, Logging & Telemetry
@@ -8813,9 +9311,9 @@ AUDIT_CHECKS=(
     check_home_folders_secure check_world_writable_applications check_world_writable_system_folder
     check_world_writable_library_folder
     # Domain 17: Dylib Hijacking & Code Injection
-    check_dyld_insert_libraries_global_env check_writable_dylib_search_paths check_hardened_runtime_spotcheck check_electron_node_fuses
+    check_dyld_insert_libraries_global_env check_writable_dylib_search_paths check_hardened_runtime_spotcheck check_electron_node_fuses check_library_validation_policy
     # Domain 18: Credential Exposure & Secret Leaks
-    check_ssh_private_key_permissions check_cloud_cli_credential_files check_shell_history_secret_sweep check_sensitive_filename_sweep
+    check_ssh_private_key_permissions check_cloud_cli_credential_files check_shell_history_secret_sweep check_sensitive_filename_sweep check_privileged_and_other_user_history_secrets
     # Domain 19: Screen Lock & Physical Access
     check_screensaver_password_required check_screensaver_grace_period check_auto_login_disabled check_login_window_hardening
     check_screen_saver_corners_secure check_screensaver_idle_time check_login_window_custom_message
@@ -8838,12 +9336,12 @@ AUDIT_CHECKS=(
     # Domain 25: Third-Party Software & Package Inventory
     check_installed_applications_inventory check_homebrew_prefix_permissions check_homebrew_package_inventory
     # Domain 26: System Services & Daemon Exposure
-    check_listening_ports_inventory check_nonapple_running_launchd_services
+    check_listening_ports_inventory check_nonapple_running_launchd_services check_network_exposed_listeners
     check_bonjour_advertising_disabled check_http_server_disabled check_nfs_server_disabled
     # Domain 27: Kernel & Boot Security
     check_boot_security_policy check_authenticated_root_status check_nvram_boot_args check_thirdparty_kext_inventory
     # Domain 28: Virtualization & Container Escape Surface
-    check_docker_desktop_presence check_vm_hypervisor_apps_inventory
+    check_docker_desktop_presence check_vm_hypervisor_apps_inventory check_container_runtime_exposure
     # Domain 29: Data Loss Prevention & Sensitive Data
     check_screenshot_save_location_cloud_exposure check_handoff_universal_clipboard
     # Domain 31: Apple Intelligence, Siri & Analytics
