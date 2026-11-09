@@ -1,5 +1,5 @@
 #!/usr/bin/env zsh
-# EndpointPostureCheck for macOS — built 2026-11-09 22:07:08 from src/*.zsh. Do not edit directly.
+# EndpointPostureCheck for macOS — built 2026-11-09 22:09:25 from src/*.zsh. Do not edit directly.
 
 # ---- 00-header.zsh ----
 #
@@ -5741,10 +5741,30 @@ CHROMIUM_ROOTS=(
     'Chromium|Library/Application Support/Chromium'
 )
 
-# Store update URLs: anything else (or none) means not installed from a store.
+# Store update endpoints (host + path, matched exactly). Anything else, or
+# none, means not installed from a store.
 typeset -ga EXTENSION_STORE_URLS
-EXTENSION_STORE_URLS=('clients2.google.com/service/update2/crx' 'edge.microsoft.com/extensionwebstorebase'
+EXTENSION_STORE_URLS=('clients2.google.com/service/update2/crx' 'edge.microsoft.com/extensionwebstorebase/v1/crx'
     'update.googleapis.com/service/update2')
+
+# Returns 0 when an update URL is exactly a store endpoint. Parsed, not
+# substring-matched: "https://evil.example/clients2.google.com/service/
+# update2/crx" must not pass as store-hosted (an extension can set its own
+# update_url). https only; userinfo, ports, queries and fragments rejected.
+_is_store_update_url() {
+    local url="$1" rest="" host="" path="" store=""
+    [[ "$url" == https://* ]] || return 1
+    rest="${url#https://}"
+    [[ "$rest" == *[@?#\\]* ]] && return 1
+    host="${${rest%%/*}:l}"; host="${host%.}"
+    [[ "$host" == *:* ]] && return 1
+    path="${rest#*/}"; [[ "$rest" == */* ]] || path=""
+    path="${path%/}"
+    for store in "${EXTENSION_STORE_URLS[@]}"; do
+        [[ "$host/$path" == "$store" ]] && return 0
+    done
+    return 1
+}
 
 # Combined with every-site access these let an extension steal sessions,
 # reroute or rewrite traffic, or reach outside the browser. Plain
@@ -5794,7 +5814,7 @@ _extension_risk_reasons() {
             reasons+=("unsigned (signedState $signed)")
         fi
     else
-        for url in "${EXTENSION_STORE_URLS[@]}"; do [[ "$update" == *"$url"* ]] && from_store=1; done
+        _is_store_update_url "$update" && from_store=1
         case "$location" in
             4) reasons+=("unpacked (developer mode, not from a store)") ;;
             # Pre-installed through an external-extensions file. Store-hosted
