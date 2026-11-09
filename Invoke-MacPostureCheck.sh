@@ -1,5 +1,5 @@
 #!/usr/bin/env zsh
-# EndpointPostureCheck for macOS — built 2026-11-09 20:42:49 from src/*.zsh. Do not edit directly.
+# EndpointPostureCheck for macOS — built 2026-11-09 21:03:36 from src/*.zsh. Do not edit directly.
 
 # ---- 00-header.zsh ----
 #
@@ -742,7 +742,7 @@ check_sip_custom_configuration() {
             --recommendation 'Unable to query SIP configuration; verify manually with "csrutil status" in Terminal.'
     elif [[ "$ROOT_CMD_OUTPUT" == *"Custom Configuration"* ]]; then
         local disabled_items
-        disabled_items=$(print -r -- "$ROOT_CMD_OUTPUT" | grep ': disabled' | sed 's/^[[:space:]]*//' | paste -sd '; ' -)
+        disabled_items=$(print -r -- "$ROOT_CMD_OUTPUT" | grep ': disabled' | sed 's/^[[:space:]]*//' | paste -sd ';' - | sed 's/;/; /g')
         [[ -z "$disabled_items" ]] && disabled_items="Custom configuration detected but no specific disabled component parsed"
         add_audit_result --category 'SIP & Kernel Security' --control 'SIP Custom Configuration (Partial Disable)' \
             --status WARN --severity High --current "$disabled_items" \
@@ -1565,7 +1565,10 @@ check_root_account_disabled() {
             --recommended 'Password: *' \
             --cis 'CIS 5.4' --nist 'AC-6, IA-2' --cis-macos 'CIS-macOS 5.6' --mscp 'os_root_disable' \
             --recommendation 'Unable to determine root account status; verify manually with "dscl . -read /Users/root Password".'
-    elif [[ "$ROOT_CMD_OUTPUT" == *"Password: *"* ]]; then
+    # Exact match, whitespace removed: a disabled root reads "Password: *",
+    # an enabled one "Password: ********" — which a substring match on
+    # "Password: *" also accepted (caught by test-checks-defense-identity).
+    elif [[ "${ROOT_CMD_OUTPUT//[[:space:]]/}" == 'Password:*' ]]; then
         add_audit_result --category 'Identity, Accounts & Privilege Management' \
             --control 'Root Account Disabled' \
             --status PASS --severity Critical --current "$ROOT_CMD_OUTPUT" \
@@ -1707,8 +1710,9 @@ check_sudoers_configuration() {
     lines=("${(@f)combined}")
     local line trimmed
     for line in "${lines[@]}"; do
-        trimmed="${line## }"
-        trimmed="${trimmed##	}"
+        # All leading whitespace, not one character: an indented
+        # "#   ... NOPASSWD" comment must still count as a comment.
+        trimmed="${line#"${line%%[![:space:]]*}"}"
         [[ -z "$trimmed" || "$trimmed" == \#* ]] && continue
         if [[ "$line" == *NOPASSWD* || "$line" == *'!authenticate'* ]]; then
             flagged+=("$line")
@@ -2061,15 +2065,20 @@ check_guest_home_folder_absent() {
 check_firewall_state() {
     write_section_banner 'Network Firewall & Packet Filtering - Firewall State'
     run_root "$SOCKETFILTERFW" --getglobalstate
+    # "Firewall is enabled. (State = 1)", "... disabled. (State = 0)" and
+    # "Firewall is blocking all non-essential incoming connections.
+    # (State = 2)" (verified live): the State number is authoritative.
+    local fw_state=""
+    [[ "$ROOT_CMD_OUTPUT" =~ 'State = ([0-9])' ]] && fw_state="${match[1]}"
 
-    if [[ "$ROOT_CMD_OUTPUT" == *"enabled"* ]]; then
+    if [[ "$fw_state" == 1 || "$fw_state" == 2 || ( -z "$fw_state" && "$ROOT_CMD_OUTPUT" == *"is enabled"* ) ]]; then
         add_audit_result --category 'Network Firewall & Packet Filtering' --control 'Firewall State' \
             --status PASS --severity High --current "$ROOT_CMD_OUTPUT" \
             --recommended 'Firewall enabled' \
             --cis 'CIS 4.1' --nist 'SC-7' --mitre 'T1562.004 (Disable or Modify System Firewall)' --iso27001 'A.8.20' \
             --nis2 'Art.21(2)(d)' --nsa 'NSA/CISA macOS Hardening Guidance' --cis-macos 'CIS-macOS 2.2.1' --mscp 'system_settings_firewall_enable' \
             --recommendation 'No action required.'
-    elif [[ "$ROOT_CMD_OUTPUT" == *"disabled"* ]]; then
+    elif [[ "$fw_state" == 0 || ( -z "$fw_state" && "$ROOT_CMD_OUTPUT" == *"is disabled"* ) ]]; then
         add_audit_result --category 'Network Firewall & Packet Filtering' --control 'Firewall State' \
             --status FAIL --severity High --current "$ROOT_CMD_OUTPUT" \
             --recommended 'Firewall enabled' \
@@ -2090,15 +2099,17 @@ check_firewall_state() {
 
 check_firewall_stealth_mode() {
     run_root "$SOCKETFILTERFW" --getstealthmode
+    # Tahoe prints "Firewall stealth mode is on|off" (verified live);
+    # older releases printed "Stealth mode enabled|disabled".
 
-    if [[ "$ROOT_CMD_OUTPUT" == *"enabled"* ]]; then
+    if [[ "$ROOT_CMD_OUTPUT" == *"mode is on"* || "$ROOT_CMD_OUTPUT" == *"mode enabled"* ]]; then
         add_audit_result --category 'Network Firewall & Packet Filtering' --control 'Firewall Stealth Mode' \
             --status PASS --severity Medium --current "$ROOT_CMD_OUTPUT" \
             --recommended 'Stealth mode enabled' \
             --cis 'CIS 4.1' --nist 'SC-7' --mitre 'T1046 (Network Service Discovery)' --iso27001 'A.8.20' \
             --nis2 'Art.21(2)(d)' --cis-macos 'CIS-macOS 2.2.2' --mscp 'system_settings_firewall_stealth_mode_enable' \
             --recommendation 'No action required.'
-    elif [[ "$ROOT_CMD_OUTPUT" == *"disabled"* ]]; then
+    elif [[ "$ROOT_CMD_OUTPUT" == *"mode is off"* || "$ROOT_CMD_OUTPUT" == *"mode disabled"* ]]; then
         add_audit_result --category 'Network Firewall & Packet Filtering' --control 'Firewall Stealth Mode' \
             --status WARN --severity Medium --current "$ROOT_CMD_OUTPUT" \
             --recommended 'Stealth mode enabled' \
@@ -2216,8 +2227,9 @@ check_etc_hosts_integrity() {
     lines=("${(@f)ROOT_CMD_OUTPUT}")
     local line trimmed
     for line in "${lines[@]}"; do
-        trimmed="${line## }"
-        trimmed="${trimmed##	}"
+        # All leading whitespace, not one character: an indented
+        # "#   ... NOPASSWD" comment must still count as a comment.
+        trimmed="${line#"${line%%[![:space:]]*}"}"
         [[ -z "$trimmed" || "$trimmed" == \#* ]] && continue
         _is_baseline_hosts_entry "$trimmed" || extra+=("$trimmed")
     done
@@ -3071,19 +3083,10 @@ check_recent_update_history() {
     # chronological order (oldest first), each with a date column
     # formatted "YYYY-MM-DD, HH:MM:SS" — the date token itself carries a
     # trailing comma, split from the time as a separate whitespace token.
-    local last_line
-    last_line=$(print -r -- "$ROOT_CMD_OUTPUT" | grep -vE '^(Display Name|-+[[:space:]]*-+)' | grep -v '^[[:space:]]*$' | tail -1)
-
-    local -a tokens
-    tokens=(${(z)last_line})
-    local token date_token=""
-    for token in "${tokens[@]}"; do
-        if [[ "$token" =~ '^[0-9]{4}-[0-9]{2}-[0-9]{2},?$' ]]; then
-            date_token="${token%,}"
-            break
-        fi
-    done
-
+    # Newest date anywhere in the history, not the last line: the list is
+    # oldest-first today (verified live) but that order is undocumented.
+    local date_token=""
+    date_token=$(print -r -- "$ROOT_CMD_OUTPUT" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' | sort | tail -1)
     local epoch=""
     if [[ -n "$date_token" ]]; then
         epoch=$(date -j -f "%Y-%m-%d" "$date_token" +%s 2>/dev/null)
@@ -4037,7 +4040,7 @@ _ssh_authorized_keys_check() {
             (( n > 0 )) || continue
             # Key comments (usually user@host) identify keys without
             # copying key material into the report.
-            keys+=("$user: $n key(s) in ${f:t} — $(grep -vE '^[[:space:]]*(#|$)' "$f" | awk '{print $NF}' | head -5 | paste -sd ', ' -)")
+            keys+=("$user: $n key(s) in ${f:t} — $(grep -vE '^[[:space:]]*(#|$)' "$f" | awk '{print $NF}' | head -5 | paste -sd ',' - | sed 's/,/, /g')")
             [[ "$user" == root ]] && root_keys+=("$f")
         done
     done
@@ -4389,6 +4392,9 @@ check_writable_path_directories() {
 # fall outside /usr, /bin, /sbin, /System (i.e. under /Applications)?
 _is_system_suid_path() {
     case "$1" in
+        # /usr/local is not system: it is Homebrew's prefix on Intel Macs
+        # and often user-writable, so a SUID binary there must be reported.
+        /usr/local/*) return 1 ;;
         /usr/*|/bin/*|/sbin/*|/System/*) return 0 ;;
         *) return 1 ;;
     esac
@@ -4730,6 +4736,11 @@ _ssh_key_perms_check() {
 
     for k in "${keys[@]}"; do
         [[ -z "$k" ]] && continue
+        # Only actual private keys: known_hosts, config and authorized_keys
+        # are meant to be readable (known_hosts is 644 by default) and were
+        # reported as over-permissive keys before.
+        run_as_user head -c 64 "$k"
+        [[ "$RUN_AS_USER_OUTPUT" == *"PRIVATE KEY"* ]] || continue
         total=$((total + 1))
         run_as_user stat -f '%Lp' "$k"
         mode="$RUN_AS_USER_OUTPUT"
@@ -4932,62 +4943,89 @@ check_sensitive_filename_sweep() {
 #
 # Domain 19: Screen Lock & Physical Access
 
+# The screen-lock password setting stopped living in the user's
+# com.apple.screensaver askForPassword/askForPasswordDelay keys years ago
+# (verified live on Tahoe: both keys absent while `sysadminctl
+# -screenLock status`, run as the user, reports "screenLock delay is
+# immediate"). Reading the stale keys reported a FAIL on Macs that lock
+# immediately. Sources, in order: an MDM profile, sysadminctl as the
+# console user, the legacy key if a Mac still has it; otherwise WARN as
+# undeterminable, never a guessed FAIL. Prints "<delay-seconds|off|unknown>
+# <source>" (immediate = 0).
+_screen_lock_state() {
+    local managed="" managed_delay="" legacy="" legacy_delay=""
+    managed=$(managed_pref_read com.apple.screensaver askForPassword)
+    managed_delay=$(managed_pref_read com.apple.screensaver askForPasswordDelay)
+    if [[ "$managed" == 1 ]]; then
+        print -r -- "${managed_delay:-0} profile"; return 0
+    elif [[ "$managed" == 0 ]]; then
+        print -r -- "off profile"; return 0
+    fi
+    if [[ -n "$CONSOLE_USER" ]]; then
+        run_as_user sysadminctl -screenLock status
+        case "$RUN_AS_USER_OUTPUT" in
+            *"screenLock delay is immediate"*) print -r -- "0 sysadminctl"; return 0 ;;
+            *"screenLock is off"*) print -r -- "off sysadminctl"; return 0 ;;
+        esac
+        if [[ "$RUN_AS_USER_OUTPUT" =~ 'screenLock delay is ([0-9]+) seconds' ]]; then
+            print -r -- "${match[1]} sysadminctl"; return 0
+        fi
+        legacy=$(defaults_read_as_user_safe com.apple.screensaver askForPassword '')
+        legacy_delay=$(defaults_read_as_user_safe com.apple.screensaver askForPasswordDelay '')
+        if [[ "$legacy" == 1 ]]; then
+            print -r -- "${legacy_delay:-0} legacy-preference"; return 0
+        elif [[ "$legacy" == 0 ]]; then
+            print -r -- "off legacy-preference"; return 0
+        fi
+    fi
+    print -r -- "unknown none"
+}
+
 check_screensaver_password_required() {
     write_section_banner 'Screen Lock & Physical Access - Screensaver Password'
-    # defaults_read_as_user_safe silently falls back to the caller-supplied
-    # default both when the key is genuinely unset (normal, expected — most
-    # Macs never touch this key) AND when there's no console user to query
-    # at all (a real "cannot determine" case, not "verified insecure").
-    # Per the Global Constraints fault-isolation rule, those two must not
-    # collapse into the same FAIL.
-    if [[ -z "$CONSOLE_USER" ]]; then
+    local state="" delay="" source=""
+    state=$(_screen_lock_state); delay="${state%% *}"; source="${state#* }"
+    local -a fw
+    fw=(--recommended 'Password required after sleep or screen saver' --cis 'CIS 4.2' --nist 'AC-11'
+        --mitre 'T1078 (Valid Accounts)' --iso27001 'A.8.1' --nis2 'Art.21(2)(i)'
+        --cis-macos 'CIS-macOS 2.11.2' --mscp 'system_settings_screensaver_password_enforce')
+    if [[ "$delay" == unknown ]]; then
         add_audit_result --category 'Screen Lock & Physical Access' --control 'Screensaver Password Requirement' \
-            --status WARN --severity Low --current 'No console user detected' \
-            --recommended 'askForPassword=1' \
-            --cis-macos 'CIS-macOS 2.11.2' --mscp 'system_settings_screensaver_password_enforce' \
-            --recommendation 'Re-run interactively at a console login session to evaluate the screensaver password requirement.'
-        return
-    fi
-    local value
-    value=$(defaults_read_as_user_safe 'com.apple.screensaver' 'askForPassword' '0')
-
-    if [[ "$value" == "1" ]]; then
+            --status WARN --severity Low --current "Unable to determine the screen lock setting${CONSOLE_USER:+ for $CONSOLE_USER}${CONSOLE_USER:-: no console user}" "${fw[@]}" \
+            --recommendation 'Verify in System Settings > Lock Screen ("Require password after screen saver begins or display is turned off"), or check with "sysadminctl -screenLock status" as the user.'
+    elif [[ "$delay" == off ]]; then
         add_audit_result --category 'Screen Lock & Physical Access' --control 'Screensaver Password Requirement' \
-            --status PASS --severity High --current 'askForPassword=1 (required)' --recommended 'askForPassword=1' \
-            --cis 'CIS 4.2' --nist 'AC-11' --mitre 'T1078 (Valid Accounts)' --iso27001 'A.8.1' --nis2 'Art.21(2)(i)' \
-            --cis-macos 'CIS-macOS 2.11.2' --mscp 'system_settings_screensaver_password_enforce' \
-            --recommendation 'No action required.'
+            --status FAIL --severity High --current "Screen lock password not required (source: $source)" "${fw[@]}" \
+            --recommendation 'Require a password after the screen saver starts or the display sleeps: System Settings > Lock Screen, or a Screensaver profile payload with askForPassword=true.'
     else
         add_audit_result --category 'Screen Lock & Physical Access' --control 'Screensaver Password Requirement' \
-            --status FAIL --severity High --current "askForPassword=$value (not required)" --recommended 'askForPassword=1' \
-            --cis 'CIS 4.2' --nist 'AC-11' --mitre 'T1078 (Valid Accounts)' --iso27001 'A.8.1' --nis2 'Art.21(2)(i)' \
-            --cis-macos 'CIS-macOS 2.11.2' --mscp 'system_settings_screensaver_password_enforce' \
-            --recommendation 'Enable "Require password after screen saver begins" in System Settings > Lock Screen, or via MDM: set com.apple.screensaver askForPassword=1.'
+            --status PASS --severity High --current "Password required (source: $source)" "${fw[@]}" \
+            --recommendation 'No action required.'
     fi
 }
 
 check_screensaver_grace_period() {
-    if [[ -z "$CONSOLE_USER" ]]; then
+    local state="" delay="" source=""
+    state=$(_screen_lock_state); delay="${state%% *}"; source="${state#* }"
+    local -a fw
+    fw=(--recommended '<= 5 seconds' --cis 'CIS 4.2' --nist 'AC-11' --cis-macos 'CIS-macOS 2.11.2'
+        --mscp 'system_settings_screensaver_ask_for_password_delay_enforce')
+    if [[ "$delay" == unknown ]]; then
         add_audit_result --category 'Screen Lock & Physical Access' --control 'Screensaver Password Grace Period' \
-            --status WARN --severity Low --current 'No console user detected' \
-            --recommended '<= 5 seconds' \
-            --cis-macos 'CIS-macOS 2.11.2' --mscp 'system_settings_screensaver_ask_for_password_delay_enforce' \
-            --recommendation 'Re-run interactively at a console login session to evaluate the screensaver grace period.'
-        return
-    fi
-    local value
-    value=$(defaults_read_as_user_safe 'com.apple.screensaver' 'askForPasswordDelay' '300')
-
-    if [[ "$value" -le 5 ]]; then
+            --status WARN --severity Low --current 'Unable to determine the screen lock delay' "${fw[@]}" \
+            --recommendation 'Verify in System Settings > Lock Screen, or with "sysadminctl -screenLock status" as the user.'
+    elif [[ "$delay" == off ]]; then
         add_audit_result --category 'Screen Lock & Physical Access' --control 'Screensaver Password Grace Period' \
-            --status PASS --severity Medium --current "askForPasswordDelay=${value}s" --recommended '<= 5 seconds' \
-            --cis 'CIS 4.2' --nist 'AC-11' --cis-macos 'CIS-macOS 2.11.2' --mscp 'system_settings_screensaver_ask_for_password_delay_enforce' \
+            --status WARN --severity Medium --current "No screen lock (source: $source)" "${fw[@]}" \
+            --recommendation 'Turn on the screen lock password (see Screensaver Password Requirement) with a delay of 5 seconds or less.'
+    elif (( delay <= 5 )); then
+        add_audit_result --category 'Screen Lock & Physical Access' --control 'Screensaver Password Grace Period' \
+            --status PASS --severity Medium --current "$( (( delay == 0 )) && print immediate || print "${delay}s") (source: $source)" "${fw[@]}" \
             --recommendation 'No action required.'
     else
         add_audit_result --category 'Screen Lock & Physical Access' --control 'Screensaver Password Grace Period' \
-            --status WARN --severity Medium --current "askForPasswordDelay=${value}s" --recommended '<= 5 seconds' \
-            --cis 'CIS 4.2' --nist 'AC-11' --cis-macos 'CIS-macOS 2.11.2' --mscp 'system_settings_screensaver_ask_for_password_delay_enforce' \
-            --recommendation 'Reduce the screen lock grace period to 5 seconds or less in System Settings > Lock Screen, or via MDM: set com.apple.screensaver askForPasswordDelay=0.'
+            --status WARN --severity Medium --current "${delay}s (source: $source)" "${fw[@]}" \
+            --recommendation 'Reduce the screen lock grace period to 5 seconds or less in System Settings > Lock Screen, or a Screensaver profile payload with askForPasswordDelay=0.'
     fi
 }
 
@@ -5336,7 +5374,8 @@ check_icloud_keychain_sync_indicator() {
 
     # Always INFO: this is acknowledged best-effort text matching against
     # an internal plist structure, not a pass/fail judgement.
-    if [[ "$accounts_dump" == *"Keychain"* ]]; then
+    # Case-insensitive: the service entry may read "Keychain" or "KEYCHAIN_SYNC".
+    if [[ "${accounts_dump:l}" == *keychain* ]]; then
         add_audit_result --category 'iCloud & Cloud Sync Surface' --control 'iCloud Keychain Sync Indicator' \
             --status INFO --severity Informational \
             --current 'An iCloud account with Keychain sync appears to be configured' \
@@ -5537,8 +5576,17 @@ check_terminal_secure_keyboard_entry() {
 check_time_machine_configured_and_recent() {
     write_section_banner 'Ransomware Resilience & Recovery - Time Machine Configured & Recent'
     run_root tmutil destinationinfo
+    # "No destinations configured" exits 0 (verified live); a non-zero exit
+    # is a failed query and must not be reported as "no backup".
+    if [[ $ROOT_CMD_STATUS -ne 0 && "$ROOT_CMD_OUTPUT" != *"No destinations configured"* ]]; then
+        add_audit_result --category 'Ransomware Resilience & Recovery' --control 'Time Machine Configured & Recent' \
+            --status WARN --severity Low --current "tmutil query failed: $ROOT_CMD_OUTPUT" \
+            --recommended 'A Time Machine destination is configured, backed up within 7 days' --cis-macos 'N/A' --mscp 'N/A' \
+            --recommendation 'Unable to query Time Machine; re-run with sudo (Full Disk Access may be required) or check System Settings > General > Time Machine.'
+        return
+    fi
 
-    if [[ $ROOT_CMD_STATUS -ne 0 || "$ROOT_CMD_OUTPUT" == *"No destinations configured"* ]]; then
+    if [[ "$ROOT_CMD_OUTPUT" == *"No destinations configured"* ]]; then
         add_audit_result --category 'Ransomware Resilience & Recovery' --control 'Time Machine Configured & Recent' \
             --status FAIL --severity High --current 'No Time Machine destination configured' \
             --recommended 'A Time Machine destination is configured, backed up within 7 days' \
@@ -5681,6 +5729,7 @@ _applications_inventory_check() {
         names+=("${a:t}")
     done
 
+    names=("${(@o)names}")   # stable, readable order (find returns directory order)
     local total=${#names[@]}
     local joined
     joined=$(printf '%s\n' "${names[@]}")
@@ -6033,7 +6082,14 @@ check_nvram_boot_args() {
     parts=(${=ROOT_CMD_OUTPUT})
     local value="${(j: :)parts[2,-1]}"
 
-    if [[ $ROOT_CMD_STATUS -ne 0 || -z "$value" ]]; then
+    # Unset boot-args is "Error getting variable" with a non-zero exit;
+    # any other failure is a failed query, not a verified "none set".
+    if [[ $ROOT_CMD_STATUS -ne 0 && "$ROOT_CMD_OUTPUT" != *"Error getting variable"* ]]; then
+        add_audit_result --category 'Kernel & Boot Security' --control 'NVRAM Boot-Args' \
+            --status WARN --severity Low --current "nvram query failed: $ROOT_CMD_OUTPUT" \
+            --recommended 'No boot-args set' --cis-macos 'CIS-macOS 5.1.3' --mscp 'os_mobile_file_integrity_enable' \
+            --recommendation 'Unable to read NVRAM boot-args; verify manually with "nvram boot-args".'
+    elif [[ $ROOT_CMD_STATUS -ne 0 || -z "$value" ]]; then
         add_audit_result --category 'Kernel & Boot Security' --control 'NVRAM Boot-Args' \
             --status PASS --severity Low --current 'No boot-args set' \
             --recommended 'No boot-args set' \
@@ -6290,6 +6346,7 @@ check_installed_application_count() {
         [[ -n "$a" ]] && names+=("${a:t}")
     done
 
+    names=("${(@o)names}")   # stable, readable order (find returns directory order)
     local joined
     joined=$(printf '%s\n' "${names[@]}")
 
@@ -7196,6 +7253,22 @@ json_escape() {
     s="${s//$'\n'/\\n}"
     s="${s//$'\t'/\\t}"
     s="${s//$'\r'/\\r}"
+    # Every other control character (ANSI escapes and the like in command
+    # output) must be \u-escaped too, or the export is not valid JSON
+    # (caught by test-engine.zsh with plutil). Rare, so only then is the
+    # string walked character by character.
+    if [[ "$s" == *[[:cntrl:]]* ]]; then
+        local out="" ch="" i
+        for (( i = 1; i <= ${#s}; i++ )); do
+            ch="${s[i]}"
+            if [[ "$ch" == [[:cntrl:]] ]]; then
+                out+=$(printf '\\u%04x' "'$ch")
+            else
+                out+="$ch"
+            fi
+        done
+        s="$out"
+    fi
     print -r -- "$s"
 }
 
@@ -7279,7 +7352,12 @@ echo "sshd_config updated. Restart sshd (or reboot) for the change to take effec
 EOF
             ;;
         system_settings_screensaver_password_enforce)
-            print -r -- 'sudo -u "$CONSOLE_USER" defaults write com.apple.screensaver askForPassword -bool true'
+            # The old askForPassword defaults key has no effect on current
+            # macOS, and sysadminctl -screenLock needs the user's password.
+            cat <<'EOF'
+echo "Turn on 'Require password after screen saver begins or display is turned off' in System Settings > Lock Screen,"
+echo "or deploy a Screensaver profile payload with askForPassword=true and askForPasswordDelay=0 (see --generate-profile)."
+EOF
             ;;
         system_settings_automatic_login_disable)
             print -r -- 'sudo defaults delete /Library/Preferences/com.apple.loginwindow autoLoginUser'

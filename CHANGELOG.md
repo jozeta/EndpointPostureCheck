@@ -21,6 +21,19 @@ The project has no tagged releases yet, so changes are grouped by date. Entries 
   references renumbered to the CIS Apple macOS 26 Tahoe Benchmark v1.0.0
 - macOS: fixed a remediation-script bug where a renamed key would have attached the DYLD fix to
   every finding without an mSCP rule
+- macOS fixes found while rebuilding the test suite:
+  - Root account: an enabled root account (`Password: ********`) was reported as disabled
+  - Screen lock: read keys macOS no longer uses, so a Mac that locks immediately got a FAIL; now
+    uses `sysadminctl -screenLock status`, with the profile and the old key as fallbacks
+  - Firewall: stealth mode always read as "query failed" on Tahoe ("is on/off" wording), and
+    "block all" mode (State = 2) was unrecognized
+  - SUID/SGID: binaries under `/usr/local` were treated as system files and never reported
+  - SSH keys: `known_hosts`, `config` and `authorized_keys` were flagged as readable private keys
+  - JSON export: control characters in a finding made the file invalid JSON
+  - sudoers and `/etc/hosts`: indented comment lines were treated as active entries
+  - Time Machine and NVRAM boot-args: a failed query was reported as "nothing configured"
+  - Smaller: "a; b; c" lists, update history picks the newest date regardless of order, sorted
+    application lists, case-insensitive iCloud Keychain marker
 
 - PSScriptAnalyzer clean-up: checks that fail quietly now say why with `-Verbose`; removed five values
   that were read but never used (including an unused Device Guard query)

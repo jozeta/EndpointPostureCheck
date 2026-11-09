@@ -20,12 +20,17 @@ mappings, plus optional JSON export and a generated remediation script.
 ```
 ```sh
 # macOS
-sudo ./Invoke-MacPostureCheck.sh [--report-path ~/Reports] [--export-json] [--generate-remediation]
+sudo ./Invoke-MacPostureCheck.sh [--report-path ~/Reports] [--export-json] [--generate-remediation] [--generate-profile]
 ```
 
 Both refuse to run without admin/root rather than produce a partial report. A full Windows run
-takes 60–90 s. There is no automated test suite: verify by running on a real (or VM) endpoint and
-reviewing the HTML report.
+takes 60–90 s, a full macOS run about 30–60 s. The macOS edition has a local zsh test suite
+(`tests/run-tests.sh`, about 600 assertions with stubbed system commands); still verify on a real
+(or VM) endpoint and review the HTML report.
+
+**Never run `sfltool` unprivileged** (including through an unprivileged smoke run of the audit):
+without root it opens a GUI admin-password dialog that a background process can't answer, and
+the run hangs. Stub `sfltool` in unprivileged runs; a real `sudo` run never prompts.
 
 ## Build (macOS edition)
 
@@ -38,6 +43,10 @@ rebuilt `Invoke-MacPostureCheck.sh`.
 If `src/` is missing, it can be recovered without loss from the built script, since every module
 is marked `# ---- <name>.zsh ----`. Split on those markers, restore each module's shebang line,
 and drop the one blank line `build.sh` adds before each marker. Then rebuild and diff to confirm.
+
+Backup of `src/`, `tests/` and `build.sh` (local, not on GitHub): iCloud Drive
+`Backups/EndpointPostureCheck-dev/` with dated `snapshots/` and a `latest/` mirror. Refresh it
+after changing the sources.
 
 ## Design rules (from README "Design Principles")
 
