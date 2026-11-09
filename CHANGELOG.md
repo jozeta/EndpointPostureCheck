@@ -6,6 +6,13 @@ The project has no tagged releases yet, so changes are grouped by date. Entries 
 
 ## Unreleased
 
+- macOS dashboard sidebar no longer jumps: it scrolls on its own inside the window (it was taller
+  than the screen, so the lower domains were out of reach), domain links filter in place instead
+  of jumping to `#findings`, the active domain shows as a removable chip above the table, and the
+  Overview / System / Findings links mark the current section. The Overview link never worked
+  because the page section shared the id `overview` with a Låda Glass sprite icon; renamed.
+  "Privilege Escalation: File & Directory Permissions" was split into two sidebar entries by a
+  second spelling of the domain name; unified.
 - macOS dashboard redesigned in the Låda Glass family look (frosted glass, dark main theme, light
   following the system, theme switch): sidebar with a per-domain FAIL/WARN count that filters the
   table, KPI cards that filter by status, score ring, item lists in a keyboard-accessible popover,

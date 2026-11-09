@@ -1,5 +1,5 @@
 #!/usr/bin/env zsh
-# EndpointPostureCheck for macOS — built 2026-11-09 22:09:25 from src/*.zsh. Do not edit directly.
+# EndpointPostureCheck for macOS — built 2026-11-09 22:26:46 from src/*.zsh. Do not edit directly.
 
 # ---- 00-header.zsh ----
 #
@@ -4541,11 +4541,11 @@ _world_writable_dirs_result() {
         --mitre 'T1574 (Hijack Execution Flow)' --iso27001 'A.8.3' --nis2 'Art.21(2)(i)'
         --cis-macos "CIS-macOS $cis_macos" --mscp "$mscp_id")
     if [[ ${#found[@]} -eq 0 ]]; then
-        add_audit_result --category 'Privilege Escalation - File & Directory Permissions' --control "$control" \
+        add_audit_result --category 'Privilege Escalation: File & Directory Permissions' --control "$control" \
             --status PASS --severity "$severity" --current "No world-writable directories under $scanned" "${fw[@]}" \
             --recommendation 'No action required.'
     else
-        add_audit_result --category 'Privilege Escalation - File & Directory Permissions' --control "$control" \
+        add_audit_result --category 'Privilege Escalation: File & Directory Permissions' --control "$control" \
             --status FAIL --severity "$severity" --current "${#found[@]} world-writable director(ies) under $scanned" \
             --details "${(F)found}" "${fw[@]}" --recommendation "$recommendation"
     fi
@@ -4562,7 +4562,7 @@ _home_folders_secure_check() {
         --cis-macos 'CIS-macOS 5.1.1' --mscp 'os_home_folders_secure')
 
     if [[ ${#insecure[@]} -eq 0 ]]; then
-        add_audit_result --category 'Privilege Escalation - File & Directory Permissions' --control 'Home Folders Secure' \
+        add_audit_result --category 'Privilege Escalation: File & Directory Permissions' --control 'Home Folders Secure' \
             --status PASS --severity Medium --current 'All home folders restrict other users' "${fw[@]}" \
             --recommendation 'No action required.'
     else
@@ -4571,7 +4571,7 @@ _home_folders_secure_check() {
         for d in "${insecure[@]}"; do
             described+=("$d ($(stat -f '%Sp' "$d" 2>/dev/null))")
         done
-        add_audit_result --category 'Privilege Escalation - File & Directory Permissions' --control 'Home Folders Secure' \
+        add_audit_result --category 'Privilege Escalation: File & Directory Permissions' --control 'Home Folders Secure' \
             --status FAIL --severity Medium --current "${#insecure[@]} home folder(s) readable by other users" \
             --details "${(F)described}" "${fw[@]}" \
             --recommendation 'Restrict each listed home folder: "sudo chmod -R og-rwx /Users/<username>" (use og-rw to keep traverse access if a service requires it).'
@@ -7737,9 +7737,27 @@ get_html_template() {
 {{LADA_CSS}}
 /* ---- EndpointPostureCheck dashboard (on top of Låda Glass) ---- */
 .lg-app { max-width: 1680px; margin: 0 auto; }
-@media (min-width: 761px) { .lg-app { grid-template-columns: 240px minmax(0, 1fr); } }  /* phones keep the design system's top bar */
+@media (min-width: 761px) {
+  .lg-app { grid-template-columns: 240px minmax(0, 1fr); }  /* phones keep the design system's top bar */
+  /* The sidebar is one viewport tall and scrolls on its own: with 32 domains it is taller than
+     the window, and a sticky element taller than the viewport cannot show its end and slides away
+     when filtering shortens the page (measured: 1344 px sidebar in a 900 px window). */
+  .lg-sidebar { max-height: calc(100vh - 2 * var(--lg-space-m)); overflow-y: auto; overscroll-behavior: contain;
+                scrollbar-width: thin; scrollbar-color: var(--lg-line-2) transparent; }
+  .lg-main { min-height: calc(100vh - 2 * var(--lg-space-m)); }
+}
+#sec-overview, #system, #findings { scroll-margin-top: var(--lg-space-m); }
+#findings { min-height: min(80vh, 720px); align-content: start; }   /* filtering never collapses the page */
+@media (prefers-reduced-motion: no-preference) { html { scroll-behavior: smooth; } }
+.pc-filter-chip { display: inline-flex; align-items: center; gap: 4px; font: inherit; font-size: var(--lg-fs-small);
+                  border: 1px solid color-mix(in srgb, var(--lg-accent) 45%, transparent); cursor: pointer;
+                  background: color-mix(in srgb, var(--lg-accent) 14%, transparent); color: var(--lg-text);
+                  border-radius: 999px; padding: 1px 4px 1px 9px; }
+.pc-filter-chip .lg-icon { width: 14px; height: 14px; }
 .pc-domains a { white-space: normal; line-height: 1.25; justify-content: space-between; font-size: var(--lg-fs-small); min-height: 24px; }
 .pc-domains .lg-chip { flex: none; }
+.lg-nav a[aria-current="location"] { background: color-mix(in srgb, var(--lg-accent) 16%, transparent); color: var(--lg-text); }
+.lg-nav a[aria-current="location"] .lg-icon { color: var(--lg-accent); }
 .pc-score { display: flex; align-items: center; gap: var(--lg-space-l); }
 @media (min-width: 561px) { .pc-span2 { grid-column: span 2; } }
 @media (max-width: 560px) { .pc-span2 { grid-column: 1 / -1; } }
@@ -7803,7 +7821,7 @@ footer.pc-foot { text-align: center; padding: var(--lg-space-s) 0 var(--lg-space
   <nav class="lg-sidebar" aria-label="Report sections">
     <div class="lg-brand"><span class="lg-mark"><svg class="lg-icon" aria-hidden="true"><use href="#shield"/></svg></span>PostureCheck</div>
     <div class="lg-nav">
-      <a href="#overview"><svg class="lg-icon" aria-hidden="true"><use href="#overview"/></svg>Overview</a>
+      <a href="#sec-overview"><svg class="lg-icon" aria-hidden="true"><use href="#overview"/></svg>Overview</a>
       <a href="#system"><svg class="lg-icon" aria-hidden="true"><use href="#app"/></svg>System</a>
       <a href="#findings"><svg class="lg-icon" aria-hidden="true"><use href="#list"/></svg>Findings</a>
     </div>
@@ -7828,7 +7846,7 @@ footer.pc-foot { text-align: center; padding: var(--lg-space-s) 0 var(--lg-space
       </div>
     </header>
 
-    <section id="overview" class="lg-grid" style="--lg-col: 150px;" aria-label="Overview">
+    <section id="sec-overview" class="lg-grid" style="--lg-col: 150px;" aria-label="Overview">
       <div class="lg-card pc-score pc-span2">
         <div class="pc-ring pc-{{RISK_TONE}}" style="--pc-deg: {{SCORE_DEG}};" role="img" aria-label="Compliance score {{SCORE}} percent"><span>{{SCORE}}%</span></div>
         <div>
@@ -7863,7 +7881,10 @@ footer.pc-foot { text-align: center; padding: var(--lg-space-s) 0 var(--lg-space
 
     <section id="findings" class="lg-card lg-stack" aria-labelledby="h-findings">
       <div class="lg-header">
-        <h2 class="lg-label" id="h-findings" style="margin: 0;">Findings</h2>
+        <div class="lg-row">
+          <h2 class="lg-label" id="h-findings" style="margin: 0;">Findings</h2>
+          <button type="button" class="pc-filter-chip" id="domainChip" hidden aria-label="Clear domain filter"><span id="domainChipText"></span><svg class="lg-icon" aria-hidden="true"><use href="#x"/></svg></button>
+        </div>
         <span class="lg-muted lg-small" id="resultCount" aria-live="polite"></span>
       </div>
       <div class="pc-toolbar">
@@ -7921,19 +7942,49 @@ footer.pc-foot { text-align: center; padding: var(--lg-space-s) 0 var(--lg-space
       else a.removeAttribute('aria-current');
     });
     doc.getElementById('categoryFilter').value = state.category;
+    doc.getElementById('domainChip').hidden = !state.category;
+    doc.getElementById('domainChipText').textContent = state.category ? 'Domain: ' + state.category : '';
+  }
+  // Bring the findings into view only when they are off screen, so a filter
+  // click never yanks the page around while the table is already visible.
+  function revealFindings() {
+    var top = doc.getElementById('findings').getBoundingClientRect().top;
+    if (top < 0 || top > window.innerHeight * 0.5) doc.getElementById('findings').scrollIntoView({ block: 'start' });
   }
   all('[data-filter]').forEach(function (b) {
     b.addEventListener('click', function () {
       state.status = b.getAttribute('data-filter'); apply();
-      if (b.classList.contains('pc-kpi')) doc.getElementById('findings').scrollIntoView({ block: 'start' });
+      if (b.classList.contains('pc-kpi')) revealFindings();
     });
   });
   all('.pc-domains a').forEach(function (a) {
-    a.addEventListener('click', function () {
+    a.addEventListener('click', function (e) {
+      e.preventDefault();   // no "#findings" jump: filter in place, scroll only if needed
       var c = a.getAttribute('data-category');
       state.category = state.category === c ? '' : c; apply();
+      if (state.category) revealFindings();
     });
   });
+  doc.getElementById('domainChip').addEventListener('click', function () { state.category = ''; apply(); });
+
+  // Section links show where you are (Overview / System / Findings).
+  var sectionLinks = all('.lg-nav:not(.pc-domains) a');
+  // The current section is the last one whose top has scrolled up to the top
+  // edge (the first section wins at the very top of the page).
+  // Note: "sec-overview", not "overview", which is a sprite symbol id.
+  var sectionIds = ['sec-overview', 'system', 'findings'], spyQueued = false;
+  function spy() {
+    spyQueued = false;
+    var line = 80, current = sectionIds[0];
+    sectionIds.forEach(function (id) { if (doc.getElementById(id).getBoundingClientRect().top <= line) current = id; });
+    sectionLinks.forEach(function (l) {
+      if (l.getAttribute('href') === '#' + current) l.setAttribute('aria-current', 'location'); else l.removeAttribute('aria-current');
+    });
+  }
+  function queueSpy() { if (!spyQueued) { spyQueued = true; window.requestAnimationFrame(spy); } }
+  window.addEventListener('scroll', queueSpy, { passive: true });
+  window.addEventListener('resize', queueSpy);
+  spy();
   doc.getElementById('categoryFilter').addEventListener('change', function (e) { state.category = e.target.value; apply(); });
   doc.getElementById('searchInput').addEventListener('input', function (e) { state.search = e.target.value.toLowerCase().trim(); apply(); });
   doc.getElementById('printBtn').addEventListener('click', function () { window.print(); });
@@ -8750,7 +8801,7 @@ AUDIT_CHECKS=(
     check_directory_services_plugins check_privileged_helper_tools check_cron_and_at_jobs
     check_legacy_boot_and_periodic_scripts check_ssh_login_scripts check_ssh_authorized_keys_inventory
     check_python_startup_hooks check_btm_item_integrity check_autostart_inventory
-    # Domain 16: Privilege Escalation - File & Directory Permissions
+    # Domain 16: Privilege Escalation: File & Directory Permissions
     check_writable_launchd_directories check_writable_path_directories check_suid_sgid_binary_audit
     check_home_folders_secure check_world_writable_applications check_world_writable_system_folder
     check_world_writable_library_folder
