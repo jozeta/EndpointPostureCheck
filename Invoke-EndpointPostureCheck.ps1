@@ -36,6 +36,12 @@
     Switch. When present, generates a companion Remediate-EndpointPostureCheck.ps1 script
     containing modular, commented remediation commands for every FAIL finding.
 
+.PARAMETER BaselinePath
+    Optional path to a JSON export (-ExportJson) from an earlier run. Adds two findings: new
+    items in tracked inventories (autostart items, administrators, WMI subscriptions, Defender
+    exclusions, browser extensions, PowerShell profiles) since the baseline, and controls that
+    got worse or better.
+
 .EXAMPLE
     .\Invoke-EndpointPostureCheck.ps1
 
@@ -46,6 +52,11 @@
 
     Runs a full audit, writes the HTML dashboard and JSON export to C:\Reports, and generates
     a remediation script for every failed control.
+
+.EXAMPLE
+    .\Invoke-EndpointPostureCheck.ps1 -ExportJson -BaselinePath C:\Reports\last-week.json
+
+    Runs a full audit and reports what changed since the earlier export.
 
 .NOTES
     Name       : EndpointPostureCheck
@@ -63,7 +74,10 @@ param(
     [switch]$ExportJson,
 
     [Parameter(Mandatory = $false)]
-    [switch]$GenerateRemediationScript
+    [switch]$GenerateRemediationScript,
+
+    [Parameter(Mandatory = $false)]
+    [string]$BaselinePath
 )
 
 #region ============================== INITIALIZATION ==============================
@@ -2247,16 +2261,17 @@ function Test-PrivilegedGroupMembership {
     try {
         $members = Get-LocalGroupMember -Group 'Administrators' -ErrorAction Stop
         $memberList = ($members | ForEach-Object { $_.Name }) -join ', '
+        $memberDetails = (@($members | ForEach-Object { $_.Name }) | Sort-Object) -join "`n"
         $count = @($members).Count
 
         if ($count -le 3) {
             Add-AuditResult -Category 'Identity, Privilege Management & Access Control' -Control 'Local Administrators Group Membership' -Status 'PASS' -Severity 'Medium' `
-                -CurrentValue "$count member(s): $memberList" -RecommendedValue 'Minimal, justified membership (break-glass account + LAPS-managed local admin)' `
+                -CurrentValue "$count member(s): $memberList" -Details $memberDetails -RecommendedValue 'Minimal, justified membership (break-glass account + LAPS-managed local admin)' `
                 -CIS_Control 'CIS 5.4' -NIST_Control 'AC-6' -MITRE_Technique 'T1078 (Valid Accounts), T1136 (Create Account)' -ISO27001_Control 'A.5.18' `
                 -NIS2_Article 'Art.21(2)(i)' -NSA_Guidance 'NSA/CISA Identity and Access Management Best Practices' -Recommendation 'No action required; periodically re-review.'
         } else {
             Add-AuditResult -Category 'Identity, Privilege Management & Access Control' -Control 'Local Administrators Group Membership' -Status 'WARN' -Severity 'Medium' `
-                -CurrentValue "$count member(s): $memberList" -RecommendedValue 'Minimal, justified membership (break-glass account + LAPS-managed local admin)' `
+                -CurrentValue "$count member(s): $memberList" -Details $memberDetails -RecommendedValue 'Minimal, justified membership (break-glass account + LAPS-managed local admin)' `
                 -CIS_Control 'CIS 5.4' -NIST_Control 'AC-6' -MITRE_Technique 'T1078 (Valid Accounts), T1136 (Create Account)' -ISO27001_Control 'A.5.18' `
                 -NIS2_Article 'Art.21(2)(i)' -NSA_Guidance 'NSA/CISA Identity and Access Management Best Practices' `
                 -Recommendation 'Review the full membership list above against least-privilege expectations for this device role. Remove standing personal admin accounts in favor of just-in-time elevation (e.g. Entra PIM, LAPS) where feasible.'
@@ -4017,9 +4032,12 @@ function Test-WMIEventSubscriptionPersistence {
             $consumerDetails = [System.Collections.Generic.List[string]]::new()
             foreach ($c in $cmdConsumers) { $consumerDetails.Add("CommandLineEventConsumer: $($c.Name) -> $($c.CommandLineTemplate)") }
             foreach ($c in $scriptConsumers) { $consumerDetails.Add("ActiveScriptEventConsumer: $($c.Name) -> [$($c.ScriptingEngine)] $($c.ScriptText)") }
+            $wmiItems = @($filters | ForEach-Object { "EventFilter: $($_.Name) -> $($_.Query)" }) + @($consumerDetails) +
+                @($bindings | ForEach-Object { "Binding: $($_.Filter) -> $($_.Consumer)" })
 
             Add-AuditResult -Category 'Persistence & Post-Exploitation Vectors' -Control 'WMI Permanent Event Subscriptions' -Status 'WARN' -Severity 'High' `
                 -CurrentValue "Filters=$($filters.Count); CommandLineConsumers=$($cmdConsumers.Count); ScriptConsumers=$($scriptConsumers.Count); Bindings=$($bindings.Count). Details: $($consumerDetails -join ' | ')" `
+                -Details (($wmiItems | Sort-Object) -join "`n") `
                 -RecommendedValue 'None present, unless attributable to known management/AV tooling' -CIS_Control 'CIS 4.8' -NIST_Control 'CM-7, SI-7' `
                 -MITRE_Technique 'T1546.003 (Windows Management Instrumentation Event Subscription)' -ISO27001_Control 'A.8.19' -NIS2_Article 'Art.21(2)(i)' `
                 -NSA_Guidance 'NSA/CISA Guidance on Endpoint Detection and Response' `
@@ -6214,7 +6232,11 @@ function Test-DefenderExclusions {
 
         $totalExclusions = $exclusionPaths.Count + $exclusionProcesses.Count + $exclusionExtensions.Count
         if ($totalExclusions -gt 0) {
+            $exclusionItems = @($exclusionPaths | Where-Object { $_ } | ForEach-Object { "Path: $_" }) +
+                @($exclusionProcesses | Where-Object { $_ } | ForEach-Object { "Process: $_" }) +
+                @($exclusionExtensions | Where-Object { $_ } | ForEach-Object { "Extension: $_" })
             Add-AuditResult -Category 'Next-Gen Antivirus & EDR' -Control 'Defender Exclusions - Full Inventory' -Status 'INFO' -Severity 'Informational' `
+                -Details (($exclusionItems | Sort-Object) -join "`n") `
                 -CurrentValue "Paths=$($exclusionPaths.Count) [$($exclusionPaths -join ', ')]; Processes=$($exclusionProcesses.Count) [$($exclusionProcesses -join ', ')]; Extensions=$($exclusionExtensions.Count) [$($exclusionExtensions -join ', ')]" `
                 -RecommendedValue 'Every exclusion documented with a specific, current business justification' -CIS_Control 'CIS 10.1' -NIST_Control 'SI-3, CM-7' -ISO27001_Control 'A.8.7' -NIS2_Article 'Art.21(2)(b)' `
                 -Recommendation 'Review this exclusion inventory against current business need - stale exclusions are common, and each is a standing gap in coverage. Process exclusions are especially high-value to attackers if the excluded process name can be reused/impersonated.'
@@ -6731,13 +6753,13 @@ function Test-FirewallInboundActiveRulesInventory {
         if ($notableLines.Count -gt 0) {
             $uniqueNotable = @($notableLines | Select-Object -Unique)
             Add-AuditResult -Category 'Network Architecture & Protocol Hardening' -Control 'Active Inbound Firewall Rules Inventory' -Status 'WARN' -Severity 'Medium' `
-                -CurrentValue $summary -RecommendedValue 'All program-bound rules reference a present, Authenticode-signed binary outside user-writable locations' `
+                -CurrentValue $summary -Details ((@($ruleLines) | Sort-Object) -join "`n") -RecommendedValue 'All program-bound rules reference a present, Authenticode-signed binary outside user-writable locations' `
                 -CIS_Control 'CIS 4.4' -NIST_Control 'SC-7, CM-7' -MITRE_Technique 'T1071 (Application Layer Protocol), T1218 (Signed Binary Proxy Execution)' `
                 -ISO27001_Control 'A.8.20' -NIS2_Article 'Art.21(2)(d)' -NSA_Guidance 'NSA/CISA Host-Based Firewall Guidance' `
                 -Recommendation "Review the following notable rule(s): $($uniqueNotable -join ' | '). A rule bound to a missing, unsigned, or user-writable-path binary can indicate stale/leftover software or a persistence mechanism disguising itself as a legitimate listener."
         } else {
             Add-AuditResult -Category 'Network Architecture & Protocol Hardening' -Control 'Active Inbound Firewall Rules Inventory' -Status 'INFO' -Severity 'Informational' `
-                -CurrentValue $summary -RecommendedValue 'Reviewed periodically against expected listening services' `
+                -CurrentValue $summary -Details ((@($ruleLines) | Sort-Object) -join "`n") -RecommendedValue 'Reviewed periodically against expected listening services' `
                 -CIS_Control 'CIS 4.4' -NIST_Control 'SC-7, CM-7' -ISO27001_Control 'A.8.20' -NIS2_Article 'Art.21(2)(d)' `
                 -Recommendation 'No action required. Full inventory of active inbound rules (name, port/protocol, profile, bound binary) for review against expected listening services.'
         }
@@ -7138,9 +7160,14 @@ function Test-LocalUserAndAdminInventory {
             $lastLogon = if ($_.LastLogon) { $_.LastLogon.ToString('yyyy-MM-dd') } else { 'Never' }
             "$($_.Name) [Enabled=$($_.Enabled); Admin=$isAdmin; LastLogon=$lastLogon]"
         }
+        # Item list for -BaselinePath: without the last-logon date, which changes every day.
+        $userDetails = (@($users | ForEach-Object {
+            $isAdmin = ($adminMembers -contains "$env:COMPUTERNAME\$($_.Name)") -or ($adminMembers -contains $_.Name)
+            "$($_.Name) [Enabled=$($_.Enabled); Admin=$isAdmin]"
+        }) | Sort-Object) -join "`n"
 
         Add-AuditResult -Category 'System Inventory & Asset Information' -Control 'Local User & Administrator Roster' -Status 'INFO' -Severity 'Informational' `
-            -CurrentValue "$($users.Count) local account(s): $($userSummary -join ' | ')" -RecommendedValue 'Reviewed periodically against expected roster' -CIS_Control 'CIS 5.1' -NIST_Control 'AC-2' `
+            -CurrentValue "$($users.Count) local account(s): $($userSummary -join ' | ')" -Details $userDetails -RecommendedValue 'Reviewed periodically against expected roster' -CIS_Control 'CIS 5.1' -NIST_Control 'AC-2' `
             -ISO27001_Control 'A.5.16' -NIS2_Article 'Art.21(2)(i)' `
             -Recommendation 'Full inventory for asset/access review. Cross-reference against the Built-in Account Hardening, Local Administrators Group Membership, and Password Never Expires findings elsewhere in this report for the corresponding pass/fail judgments.'
     } catch {
@@ -7241,8 +7268,9 @@ function Test-InstalledApplicationInventory {
 
         $appSummary = (($apps | Select-Object -First 60 | ForEach-Object { "$($_.DisplayName) $($_.DisplayVersion) [$($_.Publisher)]" }) -join ' | ')
         $truncatedNote = if ($apps.Count -gt 60) { " (showing first 60 of $($apps.Count))" } else { '' }
+        $appDetails = (@($apps | ForEach-Object { "$($_.DisplayName) $($_.DisplayVersion) [$($_.Publisher)]".Trim() }) | Sort-Object -Unique) -join "`n"
         Add-AuditResult -Category 'System Inventory & Asset Information' -Control 'Installed Application Inventory' -Status 'INFO' -Severity 'Informational' `
-            -CurrentValue "$($apps.Count) application(s)$($truncatedNote): $appSummary" -RecommendedValue 'Reviewed against approved software list; unrecognized entries investigated' -CIS_Control 'CIS 2.1' `
+            -Details $appDetails -CurrentValue "$($apps.Count) application(s)$($truncatedNote): $appSummary" -RecommendedValue 'Reviewed against approved software list; unrecognized entries investigated' -CIS_Control 'CIS 2.1' `
             -NIST_Control 'CM-8' -ISO27001_Control 'A.8.19' -NIS2_Article 'Art.21(2)(e)' `
             -Recommendation 'Full software inventory for asset/patch management review. This audit does not check individual application versions against known-vulnerable releases (no external CVE feed is available offline) - cross-reference against the organization''s vulnerability management tooling.'
     } catch {
@@ -7443,6 +7471,827 @@ function Test-WindowsUpdateSettingsDeep {
         Add-AuditResult -Category 'Advanced Security Auditing & Event Logging' -Control 'Windows Update Settings' -Status 'WARN' -Severity 'Low' -CurrentValue 'Query failed' `
             -Recommendation "Unable to query Windows Update deferral/management settings: $($_.Exception.Message)"
     }
+}
+
+#endregion
+
+#region ============================== 35. BROWSER EXTENSIONS, SCRIPT-HOST PERSISTENCE & BASELINE ==============================
+# Parity with the macOS edition: browser extension inventory and risk review, PowerShell
+# profile persistence, Electron fuses, an autostart inventory, and --baseline drift.
+
+function ConvertFrom-JsonFile {
+    <#
+        Reads and parses a JSON file into nested dictionaries (IDictionary) and arrays, or
+        returns $null when the file is missing, larger than -MaxBytes, or not valid JSON.
+        Windows PowerShell 5.1's ConvertFrom-Json refuses input over 2 MB (Chromium
+        "Preferences" files are often larger), so 5.1 uses JavaScriptSerializer with the
+        limit raised. PowerShell 7 uses -AsHashtable, which also accepts keys that differ only
+        in case. Both give dictionaries, so callers index with ['key'] on either version.
+    #>
+    param(
+        [Parameter(Mandatory = $true)] [string]$Path,
+        [Parameter(Mandatory = $false)] [long]$MaxBytes = 50MB
+    )
+    try {
+        $item = Get-Item -LiteralPath $Path -ErrorAction Stop
+        if ($item.PSIsContainer -or $item.Length -gt $MaxBytes) { return $null }
+        $text = [System.IO.File]::ReadAllText($item.FullName, [System.Text.Encoding]::UTF8)
+        if ($PSVersionTable.PSVersion.Major -ge 6) {
+            return (ConvertFrom-Json -InputObject $text -AsHashtable -ErrorAction Stop)
+        }
+        Add-Type -AssemblyName System.Web.Extensions -ErrorAction Stop
+        $serializer = New-Object System.Web.Script.Serialization.JavaScriptSerializer
+        $serializer.MaxJsonLength = [int]::MaxValue
+        $serializer.RecursionLimit = 256
+        return $serializer.DeserializeObject($text)
+    } catch {
+        return $null
+    }
+}
+
+function Test-JsonKey {
+    <#
+        True when a parsed JSON dictionary has the key. Uses ContainsKey (Hashtable and the
+        Dictionary<string,object> from JavaScriptSerializer both have it); IDictionary.Contains
+        is an explicit interface method that Windows PowerShell 5.1 cannot call on a Dictionary.
+    #>
+    param([Parameter(Mandatory = $false)] $Node, [Parameter(Mandatory = $true)] [string]$Key)
+    if ($Node -isnot [System.Collections.IDictionary]) { return $false }
+    if ($Node.PSObject.Methods['ContainsKey']) { return [bool]$Node.ContainsKey($Key) }
+    return ($Node.Keys -contains $Key)
+}
+
+function Get-JsonValue {
+    <# Walks nested JSON dictionaries by key; returns $null as soon as a level is missing or not a dictionary. #>
+    param(
+        [Parameter(Mandatory = $false)] $Node,
+        [Parameter(Mandatory = $true)] [string[]]$Key
+    )
+    $current = $Node
+    foreach ($k in $Key) {
+        if (-not (Test-JsonKey -Node $current -Key $k)) { return $null }
+        $current = $current[$k]
+    }
+    return ,$current   # comma: a one-element array must not be unrolled into its element
+}
+
+function Get-JsonStringList {
+    <# Returns the string elements of a JSON array (other element types are ignored). #>
+    param([Parameter(Mandatory = $false)] $Value)
+    $list = [System.Collections.Generic.List[string]]::new()
+    if ($null -eq $Value -or $Value -is [string] -or $Value -is [System.Collections.IDictionary]) { return ,$list }
+    foreach ($v in @($Value)) { if ($v -is [string]) { $list.Add($v) } }
+    return ,$list
+}
+
+# ---------------------------------------------------------------- browser extensions
+
+$Script:ChromiumUserDataRoots = [ordered]@{
+    'Google Chrome'  = 'AppData\Local\Google\Chrome\User Data'
+    'Microsoft Edge' = 'AppData\Local\Microsoft\Edge\User Data'
+    'Brave'          = 'AppData\Local\BraveSoftware\Brave-Browser\User Data'
+    'Vivaldi'        = 'AppData\Local\Vivaldi\User Data'
+    'Chromium'       = 'AppData\Local\Chromium\User Data'
+}
+
+# Store update endpoints (host + path, matched exactly). Anything else, or none, means the
+# extension was not installed from a store.
+$Script:ExtensionStoreUrls = @(
+    'clients2.google.com/service/update2/crx'
+    'edge.microsoft.com/extensionwebstorebase/v1/crx'
+    'update.googleapis.com/service/update2'
+)
+
+# Combined with every-site access these let an extension steal sessions, reroute or rewrite
+# traffic, or reach outside the browser. Plain script injection / webRequest is common to
+# ordinary ad blockers and spell checkers, so it is listed in the inventory but not flagged.
+$Script:ExtensionSensitivePermissions = @('cookies', 'proxy', 'nativeMessaging', 'management', 'webRequestBlocking')
+
+function Test-ExtensionStoreUpdateUrl {
+    <#
+        True when an update URL is exactly a store endpoint. Parsed, not substring-matched:
+        "https://evil.example/clients2.google.com/service/update2/crx" must not pass as
+        store-hosted (an extension sets its own update_url). https only; userinfo, ports,
+        queries, fragments and backslashes are rejected.
+    #>
+    param([Parameter(Mandatory = $false)] [AllowEmptyString()] [string]$Url)
+    if ([string]::IsNullOrEmpty($Url) -or -not $Url.StartsWith('https://', [System.StringComparison]::Ordinal)) { return $false }
+    $rest = $Url.Substring(8)
+    if ($rest.IndexOfAny([char[]]@('@', '?', '#', '\')) -ge 0) { return $false }
+    $slash = $rest.IndexOf('/')
+    if ($slash -ge 0) { $hostPart = $rest.Substring(0, $slash); $pathPart = $rest.Substring($slash + 1) }
+    else { $hostPart = $rest; $pathPart = '' }
+    $hostPart = $hostPart.ToLowerInvariant()
+    if ($hostPart.EndsWith('.')) { $hostPart = $hostPart.Substring(0, $hostPart.Length - 1) }
+    if ($hostPart.Contains(':')) { return $false }
+    if ($pathPart.EndsWith('/')) { $pathPart = $pathPart.Substring(0, $pathPart.Length - 1) }
+    return ($Script:ExtensionStoreUrls -ccontains "$hostPart/$pathPart")
+}
+
+function Get-ExtensionLocalizedName {
+    <# Resolves a "__MSG_key__" manifest name from the extension's _locales messages (case-insensitive key). #>
+    param([string]$ExtensionDir, $Manifest, [string]$Name)
+    $m = [regex]::Match([string]$Name, '^__MSG_(.+)__$')
+    if (-not $m.Success -or -not $ExtensionDir) { return $Name }
+    $key = $m.Groups[1].Value
+    $locale = [string](Get-JsonValue $Manifest @('default_locale'))
+    if (-not $locale) { $locale = 'en' }
+    $messages = ConvertFrom-JsonFile -Path (Join-Path $ExtensionDir "_locales\$locale\messages.json") -MaxBytes 5MB
+    if ($null -eq $messages) { $messages = ConvertFrom-JsonFile -Path (Join-Path $ExtensionDir '_locales\en\messages.json') -MaxBytes 5MB }
+    if ($messages -isnot [System.Collections.IDictionary]) { return $Name }
+    foreach ($k in @($messages.Keys)) {
+        if ([string]$k -ieq $key) {
+            $msg = Get-JsonValue $messages @([string]$k, 'message')
+            if ($msg) { return [string]$msg }
+        }
+    }
+    return $Name
+}
+
+function Get-ChromiumProfileExtension {
+    <#
+        Extensions of one Chromium profile. Settings come from both "Preferences" and
+        "Secure Preferences" (the only place unpacked and policy-installed extensions are
+        recorded); the manifest is read from disk, falling back to the copy in the settings.
+        Built-in components (location 5/10) and themes are skipped.
+    #>
+    param([string]$ProfileDir)
+    $records = [System.Collections.Generic.List[PSObject]]::new()
+    $settings = @{}
+    foreach ($file in @('Preferences', 'Secure Preferences')) {
+        $prefs = ConvertFrom-JsonFile -Path (Join-Path $ProfileDir $file)
+        $s = Get-JsonValue $prefs @('extensions', 'settings')
+        if ($s -isnot [System.Collections.IDictionary]) { continue }
+        foreach ($id in @($s.Keys)) {
+            if (-not $settings.ContainsKey($id)) { $settings[$id] = @{} }
+            $entry = $s[$id]
+            if ($entry -is [System.Collections.IDictionary]) { foreach ($k in @($entry.Keys)) { $settings[$id][$k] = $entry[$k] } }
+        }
+    }
+    $extRoot = Join-Path $ProfileDir 'Extensions'
+    foreach ($d in @(Get-ChildItem -LiteralPath $extRoot -Directory -ErrorAction SilentlyContinue)) {
+        if (-not $settings.ContainsKey($d.Name)) { $settings[$d.Name] = @{} }
+    }
+
+    foreach ($id in @($settings.Keys)) {
+        $st = $settings[$id]
+        $loc = [string]$st['location']
+        if ($loc -eq '5' -or $loc -eq '10') { continue }
+        $dir = $null
+        if ($st['path']) {
+            $p = [string]$st['path']
+            $dir = if ([System.IO.Path]::IsPathRooted($p)) { $p } else { Join-Path $extRoot $p }
+        } else {
+            $versions = @(Get-ChildItem -LiteralPath (Join-Path $extRoot $id) -Directory -ErrorAction SilentlyContinue | Sort-Object Name)
+            if ($versions.Count -gt 0) { $dir = $versions[-1].FullName }
+        }
+        $manifest = $null
+        if ($dir) { $manifest = ConvertFrom-JsonFile -Path (Join-Path $dir 'manifest.json') -MaxBytes 5MB }
+        if ($manifest -isnot [System.Collections.IDictionary]) { $manifest = $st['manifest'] }
+        if ($manifest -isnot [System.Collections.IDictionary] -or $manifest['theme']) { continue }
+
+        $perms = Get-JsonStringList $manifest['permissions']
+        $hosts = [System.Collections.Generic.List[string]]::new()
+        foreach ($h in (Get-JsonStringList $manifest['host_permissions'])) { $hosts.Add($h) }
+        foreach ($p in $perms) { if ($p.Contains('://') -or $p -eq '<all_urls>') { $hosts.Add($p) } }
+        foreach ($cs in @($manifest['content_scripts'])) {
+            if ($cs -is [System.Collections.IDictionary]) { foreach ($m in (Get-JsonStringList $cs['matches'])) { $hosts.Add($m) } }
+        }
+        # disable_reasons: a list in current Chromium, a bitmask number in older versions.
+        $dr = $st['disable_reasons']
+        $hasDisableReason = $false
+        if ($dr -is [string]) { $hasDisableReason = [bool]$dr }
+        elseif ($dr -is [System.Collections.IDictionary]) { $hasDisableReason = $dr.Count -gt 0 }
+        elseif ($dr -is [System.Collections.IEnumerable]) { $hasDisableReason = @($dr).Count -gt 0 }
+        elseif ($null -ne $dr) { $hasDisableReason = [double]$dr -ne 0 }
+        $disabled = ([string]$st['state'] -eq '0') -or $hasDisableReason
+
+        $records.Add([PSCustomObject]@{
+            Id          = $id
+            Name        = (Get-ExtensionLocalizedName -ExtensionDir $dir -Manifest $manifest -Name ([string]$manifest['name']))
+            Version     = [string]$manifest['version']
+            Location    = $loc
+            UpdateUrl   = [string]$manifest['update_url']
+            Enabled     = -not $disabled
+            SignedState = ''
+            Permissions = @($perms | Where-Object { -not $_.Contains('://') -and $_ -ne '<all_urls>' })
+            Hosts       = @($hosts | Select-Object -Unique)
+        })
+    }
+    return $records
+}
+
+function Get-FirefoxProfileExtension {
+    <# Extensions of one Firefox profile from extensions.json (built-in and system add-ons skipped). #>
+    param([string]$ProfileDir)
+    $records = [System.Collections.Generic.List[PSObject]]::new()
+    $json = ConvertFrom-JsonFile -Path (Join-Path $ProfileDir 'extensions.json')
+    foreach ($a in @(Get-JsonValue $json @('addons'))) {
+        if ($a -isnot [System.Collections.IDictionary]) { continue }
+        if ([string]$a['type'] -ne 'extension' -or [string]$a['location'] -match '^app-(builtin|system-defaults|system-addons)$') { continue }
+        $name = [string](Get-JsonValue $a @('defaultLocale', 'name'))
+        if (-not $name) { $name = [string]$a['id'] }
+        $signed = ''
+        $ss = $a['signedState']
+        if ($ss -is [int] -or $ss -is [long] -or $ss -is [double] -or $ss -is [decimal]) { $signed = [string][int]$ss }
+        $records.Add([PSCustomObject]@{
+            Id          = [string]$a['id']
+            Name        = $name
+            Version     = [string]$a['version']
+            Location    = [string]$a['location']
+            UpdateUrl   = [string]$a['sourceURI']
+            Enabled     = [bool]$a['active']
+            SignedState = $signed
+            Permissions = @(Get-JsonStringList (Get-JsonValue $a @('userPermissions', 'permissions')))
+            Hosts       = @(Get-JsonStringList (Get-JsonValue $a @('userPermissions', 'origins')))
+        })
+    }
+    return $records
+}
+
+function Get-BrowserExtensionRecord {
+    <# All extensions in every local user's Chromium and Firefox profiles, cached for the run. #>
+    if ($null -ne $Script:BrowserExtensionCache) { return $Script:BrowserExtensionCache }
+    $all = [System.Collections.Generic.List[PSObject]]::new()
+    foreach ($userDir in @(Get-UserProfileDirectories)) {
+        $user = Split-Path -Path $userDir -Leaf
+        foreach ($browser in $Script:ChromiumUserDataRoots.Keys) {
+            $root = Join-Path $userDir $Script:ChromiumUserDataRoots[$browser]
+            $profileDirs = @(Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -eq 'Default' -or $_.Name -like 'Profile *' })
+            foreach ($prof in $profileDirs) {
+                try {
+                    foreach ($r in (Get-ChromiumProfileExtension -ProfileDir $prof.FullName)) {
+                        $r | Add-Member -NotePropertyName Browser -NotePropertyValue $browser
+                        $r | Add-Member -NotePropertyName Profile -NotePropertyValue $prof.Name
+                        $r | Add-Member -NotePropertyName User -NotePropertyValue $user
+                        $all.Add($r)
+                    }
+                } catch { Write-Verbose "Skipped $($prof.FullName): $($_.Exception.Message)" }
+            }
+        }
+        $ffRoot = Join-Path $userDir 'AppData\Roaming\Mozilla\Firefox\Profiles'
+        foreach ($prof in @(Get-ChildItem -LiteralPath $ffRoot -Directory -ErrorAction SilentlyContinue)) {
+            try {
+                foreach ($r in (Get-FirefoxProfileExtension -ProfileDir $prof.FullName)) {
+                    $r | Add-Member -NotePropertyName Browser -NotePropertyValue 'Firefox'
+                    $r | Add-Member -NotePropertyName Profile -NotePropertyValue $prof.Name
+                    $r | Add-Member -NotePropertyName User -NotePropertyValue $user
+                    $all.Add($r)
+                }
+            } catch { Write-Verbose "Skipped $($prof.FullName): $($_.Exception.Message)" }
+        }
+    }
+    $Script:BrowserExtensionCache = $all
+    return $all
+}
+
+function Get-ExtensionSourceLabel {
+    param([string]$Browser, [string]$Location)
+    if ($Browser -eq 'Firefox') { if ($Location -eq 'app-profile') { return 'user-installed' } else { return $Location } }
+    switch ($Location) {
+        '4' { return 'unpacked' }
+        '2' { return 'sideloaded' }
+        '6' { return 'sideloaded' }
+        '7' { return 'policy' }
+        '9' { return 'policy' }
+        default { return 'store' }
+    }
+}
+
+function Get-ExtensionRiskReason {
+    <# Risk reasons for one extension record, joined with "; " (empty = nothing to flag). Same rules as the macOS edition. #>
+    param([Parameter(Mandatory = $true)] [PSObject]$Extension)
+    $reasons = [System.Collections.Generic.List[string]]::new()
+    if ($Extension.Browser -eq 'Firefox') {
+        if ($Extension.Location -ne 'app-profile') { $reasons.Add("sideloaded or temporary (location $($Extension.Location))") }
+        $signed = 0
+        if ([int]::TryParse([string]$Extension.SignedState, [ref]$signed) -and $signed -le 0) {
+            $reasons.Add("unsigned (signedState $signed)")
+        }
+    } else {
+        $fromStore = Test-ExtensionStoreUpdateUrl -Url $Extension.UpdateUrl
+        switch ($Extension.Location) {
+            '4' { $reasons.Add('unpacked (developer mode, not from a store)') }
+            { $_ -in @('2', '6') } { if (-not $fromStore) { $reasons.Add('sideloaded by an external extensions file, not store-hosted') } }
+            { $_ -in @('7', '9') } { }   # force-installed by policy: listed in the inventory, not a risk by itself
+            default {
+                if ($Extension.Location -notin @('4', '2', '6', '7', '9') -and -not $fromStore) {
+                    $note = if ($Extension.UpdateUrl) { " (update URL $($Extension.UpdateUrl))" } else { '' }
+                    $reasons.Add("not from a browser store$note")
+                }
+            }
+        }
+    }
+    if ($Extension.Permissions -ccontains 'debugger') { $reasons.Add('debugger permission (full control of every tab)') }
+    $broad = @($Extension.Hosts | Where-Object {
+        $_.Contains('<all_urls>') -or $_.StartsWith('*://*/') -or $_.StartsWith('http://*/') -or $_.StartsWith('https://*/')
+    }).Count -gt 0
+    if ($broad) {
+        $sensitive = @($Script:ExtensionSensitivePermissions | Where-Object { $Extension.Permissions -ccontains $_ })
+        if ($sensitive.Count -gt 0) { $reasons.Add("every site + $($sensitive -join ', ')") }
+    }
+    return ($reasons -join '; ')
+}
+
+function Test-BrowserExtensionInventory {
+    <#
+        Inventory of Chromium (Chrome, Edge, Brave, Vivaldi, Chromium) and Firefox extensions
+        in every local user's profiles. Extensions are a common credential- and session-theft
+        path (a 2026 campaign of 108 malicious Chrome extensions hit 20,000+ enterprise users)
+        that no other check sees.
+    #>
+    Write-SectionBanner 'Browser & Application Hardening - Browser Extensions'
+    try {
+        $records = @(Get-BrowserExtensionRecord)
+        $profiles = @($records | ForEach-Object { "$($_.Browser)/$($_.Profile)/$($_.User)" } | Select-Object -Unique)
+        $enabled = @($records | Where-Object { $_.Enabled }).Count
+        $lines = @($records | ForEach-Object {
+            $state = if ($_.Enabled) { 'on' } else { 'off' }
+            $ver = if ($_.Version) { " v$($_.Version)" } else { '' }
+            "[$($_.Browser) $($_.Profile), $($_.User)] $($_.Name)$ver ($state, $(Get-ExtensionSourceLabel -Browser $_.Browser -Location $_.Location))"
+        } | Sort-Object)
+        Add-AuditResult -Category 'Browser & Application Hardening' -Control 'Browser Extensions Inventory' -Status 'INFO' -Severity 'Informational' `
+            -CurrentValue "$($records.Count) extension(s) in $($profiles.Count) browser profile(s); $enabled enabled" -Details ($lines -join "`n") `
+            -RecommendedValue 'N/A' -CIS_Control 'CIS 9.4' -NIST_Control 'CM-7(5), CM-8' -ISO27001_Control 'A.8.19' `
+            -Recommendation 'Informational baseline. Remove extensions nobody uses; enforce an allowlist with the ExtensionInstallAllowlist / ExtensionSettings policies (Chrome, Edge) in managed environments.'
+    } catch {
+        Add-AuditResult -Category 'Browser & Application Hardening' -Control 'Browser Extensions Inventory' -Status 'WARN' -Severity 'Low' `
+            -CurrentValue 'Query failed' -Recommendation "Unable to enumerate browser extensions: $($_.Exception.Message)"
+    }
+}
+
+function Test-BrowserExtensionRisk {
+    <#
+        Flags enabled extensions that are unpacked, sideloaded, not from a store, unsigned
+        (Firefox), hold the debugger permission, or combine every-site access with cookies,
+        proxy, native messaging, management or blocking web requests.
+    #>
+    try {
+        $enabledExt = @(Get-BrowserExtensionRecord | Where-Object { $_.Enabled })
+        $flagged = @($enabledExt | ForEach-Object {
+            $why = Get-ExtensionRiskReason -Extension $_
+            if ($why) { "[$($_.Browser) $($_.Profile), $($_.User)] $($_.Name) ($($_.Id)): $why" }
+        } | Sort-Object)
+        $common = @{
+            Category = 'Browser & Application Hardening'; Control = 'Browser Extension Risk Review'; Severity = 'Medium'
+            RecommendedValue = 'Enabled extensions come from a store and hold only the access they need'
+            CIS_Control = 'CIS 9.4'; NIST_Control = 'CM-7(5), SI-4'; MITRE_Technique = 'T1176 (Browser Extensions)'
+            ISO27001_Control = 'A.8.19'; NIS2_Article = 'Art.21(2)(d)'
+        }
+        if ($flagged.Count -gt 0) {
+            Add-AuditResult @common -Status 'WARN' -CurrentValue "$($flagged.Count) of $($enabledExt.Count) enabled extension(s) need review" -Details ($flagged -join "`n") `
+                -Recommendation 'Review each listed extension: remove unpacked, sideloaded and unknown-source extensions, and keep broad-access ones (every site plus cookies, web requests, proxy or native messaging) only when they are from a vendor you trust. Extensions auto-update, so an ownership change can turn a trusted one malicious.'
+        } else {
+            Add-AuditResult @common -Status 'PASS' -CurrentValue "$($enabledExt.Count) enabled extension(s), none flagged" -Recommendation 'No action required.'
+        }
+    } catch {
+        Add-AuditResult -Category 'Browser & Application Hardening' -Control 'Browser Extension Risk Review' -Status 'WARN' -Severity 'Low' `
+            -CurrentValue 'Query failed' -Recommendation "Unable to review browser extensions: $($_.Exception.Message)"
+    }
+}
+
+# ---------------------------------------------------------------- PowerShell profiles
+
+# Content that has no business in a profile script. Plain Invoke-Expression is NOT listed:
+# oh-my-posh, starship, zoxide and conda all initialize with "... | Invoke-Expression".
+$Script:PowerShellProfileRiskPatterns = [ordered]@{
+    'downloads content from the network'            = '(?i)DownloadString|DownloadFile|DownloadData|Net\.WebClient|Invoke-WebRequest|\biwr\b|Invoke-RestMethod|\birm\s+http|Start-BitsTransfer|Net\.Http\.HttpClient'
+    'decodes or runs encoded commands'               = '(?i)FromBase64String|\s-e(nc|ncodedcommand)?\s+[A-Za-z0-9+/=]{40,}'
+    'tampers with AMSI or script logging'            = '(?i)AmsiUtils|amsiInitFailed|AmsiScanBuffer|EnableScriptBlockLogging|ScriptBlockLogging.*=\s*0|HistorySaveStyle\s+SaveNothing'
+    'changes Defender settings or exclusions'        = '(?i)(Add|Set)-MpPreference|DisableRealtimeMonitoring'
+    'creates persistence (task, service, Run key)'   = '(?i)Register-ScheduledTask|schtasks(\.exe)?\s+/create|New-Service|sc(\.exe)?\s+create|CurrentVersion\\Run'
+    'uses process-injection APIs'                    = '(?i)VirtualAlloc|WriteProcessMemory|CreateRemoteThread|NtCreateThreadEx'
+    'starts hidden processes'                        = '(?i)-WindowStyle\s+Hidden|\s-w\s+h(idden)?\b'
+}
+
+function Get-PowerShellProfilePath {
+    <#
+        Every PowerShell profile script that can exist on this machine: all-users profiles for
+        Windows PowerShell (64- and 32-bit) and each PowerShell 7 install, and per-user profiles
+        in every user's Documents (including OneDrive-redirected Documents). Returns objects
+        with Scope ('AllUsers' or the user folder name), Path and Exists.
+    #>
+    $paths = [System.Collections.Generic.List[PSObject]]::new()
+    $hostFiles = @('profile.ps1', 'Microsoft.PowerShell_profile.ps1', 'Microsoft.PowerShellISE_profile.ps1', 'Microsoft.VSCode_profile.ps1')
+    $allUserDirs = [System.Collections.Generic.List[string]]::new()
+    $allUserDirs.Add((Join-Path $env:windir 'System32\WindowsPowerShell\v1.0'))
+    $allUserDirs.Add((Join-Path $env:windir 'SysWOW64\WindowsPowerShell\v1.0'))
+    foreach ($d in @(Get-ChildItem -LiteralPath (Join-Path $env:ProgramFiles 'PowerShell') -Directory -ErrorAction SilentlyContinue)) { $allUserDirs.Add($d.FullName) }
+    foreach ($dir in $allUserDirs) {
+        if (-not (Test-Path -LiteralPath $dir -PathType Container)) { continue }
+        foreach ($f in $hostFiles) {
+            $p = Join-Path $dir $f
+            $paths.Add([PSCustomObject]@{ Scope = 'AllUsers'; Directory = $dir; Path = $p; Exists = (Test-Path -LiteralPath $p -PathType Leaf) })
+        }
+    }
+    foreach ($userDir in @(Get-UserProfileDirectories)) {
+        $user = Split-Path -Path $userDir -Leaf
+        $docRoots = @(Join-Path $userDir 'Documents') + @(Get-ChildItem -LiteralPath $userDir -Directory -Filter 'OneDrive*' -ErrorAction SilentlyContinue |
+            ForEach-Object { Join-Path $_.FullName 'Documents' })
+        foreach ($docs in $docRoots) {
+            foreach ($sub in @('WindowsPowerShell', 'PowerShell')) {
+                $dir = Join-Path $docs $sub
+                foreach ($f in @(Get-ChildItem -LiteralPath $dir -File -Filter '*profile.ps1' -ErrorAction SilentlyContinue)) {
+                    $paths.Add([PSCustomObject]@{ Scope = $user; Directory = $dir; Path = $f.FullName; Exists = $true })
+                }
+            }
+        }
+    }
+    return $paths
+}
+
+function Test-PowerShellProfilePersistence {
+    <#
+        PowerShell profiles run automatically in every matching PowerShell session (T1546.013).
+        An all-users profile runs in every administrator's session, so one writable by
+        non-admins is a privilege escalation. Profile content is scanned (first 1 MB) for
+        things a profile should not do: downloading code, encoded commands, AMSI or logging
+        tampering, Defender changes, creating persistence, injection APIs, hidden processes.
+        The inventory lists each profile with a short SHA-256, so a baseline run shows edits.
+    #>
+    Write-SectionBanner 'Persistence - PowerShell Profile Scripts'
+    $fw = @{
+        CIS_Control = 'CIS 2.7'; NIST_Control = 'CM-7, SI-7'; MITRE_Technique = 'T1546.013 (PowerShell Profile)'
+        ISO27001_Control = 'A.8.19'; NIS2_Article = 'Art.21(2)(i)'
+    }
+    try {
+        $all = @(Get-PowerShellProfilePath)
+        $existing = @($all | Where-Object { $_.Exists })
+        $inventory = [System.Collections.Generic.List[string]]::new()
+        $flagged = [System.Collections.Generic.List[string]]::new()
+        foreach ($p in $existing) {
+            try {
+                $item = Get-Item -LiteralPath $p.Path -ErrorAction Stop
+                $hash = (Get-FileHash -LiteralPath $p.Path -Algorithm SHA256 -ErrorAction Stop).Hash.Substring(0, 12).ToLowerInvariant()
+                $inventory.Add("[$($p.Scope)] $($p.Path) (sha256 $hash)")
+                $stream = [System.IO.File]::Open($p.Path, 'Open', 'Read', 'ReadWrite')
+                try {
+                    $len = [int][Math]::Min($item.Length, 1MB)
+                    $bytes = New-Object byte[] $len
+                    [void]$stream.Read($bytes, 0, $len)
+                } finally { $stream.Dispose() }
+                $text = [System.Text.Encoding]::UTF8.GetString($bytes)
+                if ($text.IndexOf([char]0) -ge 0) { $text = [System.Text.Encoding]::Unicode.GetString($bytes) }
+                $why = @($Script:PowerShellProfileRiskPatterns.Keys | Where-Object { $text -match $Script:PowerShellProfileRiskPatterns[$_] })
+                if ($why.Count -gt 0) { $flagged.Add("[$($p.Scope)] $($p.Path): $($why -join '; ')") }
+            } catch { $inventory.Add("[$($p.Scope)] $($p.Path) (unreadable: $($_.Exception.Message))") }
+        }
+
+        if ($flagged.Count -gt 0) {
+            Add-AuditResult -Category 'Persistence & Post-Exploitation Vectors' -Control 'PowerShell Profile Scripts' -Status 'WARN' -Severity 'Medium' @fw `
+                -CurrentValue "$($flagged.Count) of $($existing.Count) profile script(s) contain risky code" -Details ((@($flagged) + @('') + @($inventory)) -join "`n") `
+                -RecommendedValue 'Profiles only set up the shell (prompt, modules, aliases)' `
+                -Recommendation 'Open each listed profile and confirm the flagged code is intended. Profiles run silently in every PowerShell session of that scope, which makes them a quiet persistence and credential-capture spot; remove anything that downloads code, decodes payloads, touches AMSI/logging or Defender, or creates tasks/services.'
+        } else {
+            $cv = if ($existing.Count -gt 0) { "$($existing.Count) profile script(s), none with risky code" } else { 'No PowerShell profile scripts found' }
+            Add-AuditResult -Category 'Persistence & Post-Exploitation Vectors' -Control 'PowerShell Profile Scripts' -Status 'PASS' -Severity 'Medium' @fw `
+                -CurrentValue $cv -Details ($inventory -join "`n") -RecommendedValue 'Profiles only set up the shell (prompt, modules, aliases)' -Recommendation 'No action required.'
+        }
+
+        # All-users profile files and their folders: a low-privilege write grant lets any user
+        # plant code that runs in every administrator's PowerShell session.
+        $writable = [System.Collections.Generic.List[string]]::new()
+        foreach ($dir in @($all | Where-Object { $_.Scope -eq 'AllUsers' } | Select-Object -ExpandProperty Directory -Unique)) {
+            $check = Test-LowPrivilegeWriteAccess -Path $dir
+            if ($check.IsVulnerable) { $writable.Add("$dir (folder): $($check.Principals -join '; ')") }
+        }
+        foreach ($p in @($existing | Where-Object { $_.Scope -eq 'AllUsers' })) {
+            $check = Test-LowPrivilegeWriteAccess -Path $p.Path
+            if ($check.IsVulnerable) { $writable.Add("$($p.Path): $($check.Principals -join '; ')") }
+        }
+        $fwAcl = $fw.Clone()
+        $fwAcl.MITRE_Technique = 'T1546.013 (PowerShell Profile), T1574 (Hijack Execution Flow)'
+        if ($writable.Count -gt 0) {
+            Add-AuditResult -Category 'Persistence & Post-Exploitation Vectors' -Control 'All-Users PowerShell Profile Write Access' -Status 'FAIL' -Severity 'High' @fwAcl `
+                -CurrentValue "$($writable.Count) all-users profile location(s) writable by non-admins" -Details ($writable -join "`n") `
+                -RecommendedValue 'Only Administrators/SYSTEM can write all-users profiles and their folders' `
+                -Recommendation 'Remove the Users / Authenticated Users / Everyone write grant from the listed files and folders (icacls <path> /remove:g *S-1-5-32-545 *S-1-5-11 *S-1-1-0). Any code placed there runs in every administrator''s PowerShell session.'
+        } else {
+            Add-AuditResult -Category 'Persistence & Post-Exploitation Vectors' -Control 'All-Users PowerShell Profile Write Access' -Status 'PASS' -Severity 'High' @fwAcl `
+                -CurrentValue 'No all-users profile file or folder is writable by non-admins' `
+                -RecommendedValue 'Only Administrators/SYSTEM can write all-users profiles and their folders' -Recommendation 'No action required.'
+        }
+    } catch {
+        Add-AuditResult -Category 'Persistence & Post-Exploitation Vectors' -Control 'PowerShell Profile Scripts' -Status 'WARN' -Severity 'Low' `
+            -CurrentValue 'Query failed' -Recommendation "Unable to audit PowerShell profiles: $($_.Exception.Message)"
+    }
+}
+
+# ---------------------------------------------------------------- Electron fuses
+
+# Fuses are build-time switches compiled into an Electron app right after this sentinel, as a
+# version byte, a length byte and one byte per fuse ('1' on, '0' off, 'r' removed).
+$Script:ElectronFuseSentinel = 'dL7pKGdnNz796PbbjQWNKmHXBZaB9tsX'
+$Script:ElectronFuseNames = @('RunAsNode', 'EnableCookieEncryption', 'EnableNodeOptionsEnvironmentVariable',
+    'EnableNodeCliInspectArguments', 'EnableEmbeddedAsarIntegrityValidation', 'OnlyLoadAppFromAsar')
+$Script:ElectronAppScanLimit = 25
+
+function Get-ElectronFuseState {
+    <#
+        Returns an ordered name -> 'on'/'off'/'removed'/'unknown' map of an Electron exe's
+        fuses, or $null when it has no fuse wire (pre-fuses Electron). The exe (often 150 MB+)
+        is streamed in 4 MB chunks and the search stops at the sentinel.
+    #>
+    param([Parameter(Mandatory = $true)] [string]$ExePath)
+    $latin1 = [System.Text.Encoding]::GetEncoding(28591)
+    $sentinelLength = $Script:ElectronFuseSentinel.Length
+    $stream = [System.IO.File]::Open($ExePath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+    try {
+        $chunk = 4MB
+        $buffer = New-Object byte[] ($chunk + $sentinelLength)
+        $carry = 0
+        $bufferStart = [long]0
+        while (($read = $stream.Read($buffer, $carry, $chunk)) -gt 0) {
+            $len = $carry + $read
+            $idx = $latin1.GetString($buffer, 0, $len).IndexOf($Script:ElectronFuseSentinel, [System.StringComparison]::Ordinal)
+            if ($idx -ge 0) {
+                [void]$stream.Seek($bufferStart + $idx + $sentinelLength, [System.IO.SeekOrigin]::Begin)
+                $wire = New-Object byte[] 18
+                $got = $stream.Read($wire, 0, 18)
+                if ($got -lt 2) { return $null }
+                $state = [ordered]@{}
+                $count = [Math]::Min([int]$wire[1], [Math]::Min($Script:ElectronFuseNames.Count, $got - 2))
+                for ($i = 0; $i -lt $count; $i++) {
+                    $state[$Script:ElectronFuseNames[$i]] = switch ([int]$wire[2 + $i]) { 49 { 'on' } 48 { 'off' } 114 { 'removed' } default { 'unknown' } }
+                }
+                return $state
+            }
+            $keep = [Math]::Min($sentinelLength - 1, $len)
+            [Array]::Copy($buffer, $len - $keep, $buffer, 0, $keep)
+            $bufferStart += $len - $keep
+            $carry = $keep
+        }
+        return $null
+    } finally { $stream.Dispose() }
+}
+
+function Get-ElectronAppDirectory {
+    <#
+        Folders that hold an Electron app (resources\app.asar next to the exe): Program Files
+        (two levels deep), every user's AppData\Local\Programs, and Squirrel-installed apps
+        (AppData\Local\<app>\app-<version>, newest version only).
+    #>
+    $candidates = [System.Collections.Generic.List[string]]::new()
+    $roots = @($env:ProgramFiles, ${env:ProgramFiles(x86)}) | Where-Object { $_ }
+    foreach ($root in $roots) {
+        foreach ($d in @(Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue)) {
+            $candidates.Add($d.FullName)
+            foreach ($d2 in @(Get-ChildItem -LiteralPath $d.FullName -Directory -ErrorAction SilentlyContinue)) { $candidates.Add($d2.FullName) }
+        }
+    }
+    foreach ($userDir in @(Get-UserProfileDirectories)) {
+        $programs = Join-Path $userDir 'AppData\Local\Programs'
+        foreach ($d in @(Get-ChildItem -LiteralPath $programs -Directory -ErrorAction SilentlyContinue)) {
+            $candidates.Add($d.FullName)
+            foreach ($d2 in @(Get-ChildItem -LiteralPath $d.FullName -Directory -ErrorAction SilentlyContinue)) { $candidates.Add($d2.FullName) }
+        }
+        foreach ($d in @(Get-ChildItem -LiteralPath (Join-Path $userDir 'AppData\Local') -Directory -ErrorAction SilentlyContinue)) {
+            $latest = @(Get-ChildItem -LiteralPath $d.FullName -Directory -Filter 'app-*' -ErrorAction SilentlyContinue | Sort-Object Name | Select-Object -Last 1)
+            if ($latest.Count -gt 0) { $candidates.Add($latest[0].FullName) }
+        }
+    }
+    return @($candidates | Where-Object { Test-Path -LiteralPath (Join-Path $_ 'resources\app.asar') -PathType Leaf } | Select-Object -Unique)
+}
+
+function Test-ElectronNodeFuses {
+    <#
+        Electron apps with the RunAsNode, NODE_OPTIONS or --inspect fuses on can be driven as a
+        Node.js runtime: "ELECTRON_RUN_AS_NODE=1 <signed app>.exe script.js" runs arbitrary
+        code under a trusted, signed binary (an application-control bypass, T1218) and inside
+        the app's own permissions (CVE-2025-54871 class). Bounded to the first
+        $Script:ElectronAppScanLimit apps found.
+    #>
+    Write-SectionBanner 'Execution Bypass - Electron Node Fuses'
+    $common = @{
+        Category = 'AppLocker - LOLBAS & Execution Bypass Vectors'; Control = 'Electron Apps with Node Execution Fuses Enabled'; Severity = 'Medium'
+        RecommendedValue = 'Electron apps ship with RunAsNode, NODE_OPTIONS and --inspect fuses disabled'
+        CIS_Control = 'CIS 2.5'; NIST_Control = 'SI-7, AC-6'; MITRE_Technique = 'T1218 (System Binary Proxy Execution), T1548 (Abuse Elevation Control Mechanism)'
+        ISO27001_Control = 'A.8.19'; NIS2_Article = 'Art.21(2)(e)'
+    }
+    try {
+        $dirs = @(Get-ElectronAppDirectory)
+        $capNote = ''
+        if ($dirs.Count -gt $Script:ElectronAppScanLimit) {
+            $capNote = " (first $($Script:ElectronAppScanLimit) of $($dirs.Count) checked)"
+            $dirs = @($dirs | Select-Object -First $Script:ElectronAppScanLimit)
+        }
+        $vulnerable = [System.Collections.Generic.List[string]]::new()
+        $hardened = [System.Collections.Generic.List[string]]::new()
+        $skipNames = '^(unins.*|update|squirrel|elevate|crashpad_handler|notification_helper)\.exe$'
+        foreach ($dir in $dirs) {
+            $exe = Get-ChildItem -LiteralPath $dir -File -Filter '*.exe' -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -notmatch $skipNames -and $_.Length -gt 20MB } | Sort-Object Length -Descending | Select-Object -First 1
+            if (-not $exe) { continue }
+            try {
+                $fuses = Get-ElectronFuseState -ExePath $exe.FullName
+                if ($null -eq $fuses) { $vulnerable.Add("$($exe.FullName): no fuse wire (pre-fuses Electron, RunAsNode always available)"); continue }
+                $exposed = @('RunAsNode', 'EnableNodeOptionsEnvironmentVariable', 'EnableNodeCliInspectArguments' | Where-Object { $fuses[$_] -eq 'on' })
+                if ($exposed.Count -gt 0) { $vulnerable.Add("$($exe.FullName): $($exposed -join ', ') on") }
+                else { $hardened.Add($exe.FullName) }
+            } catch { Write-Verbose "Skipped $($exe.FullName): $($_.Exception.Message)" }
+        }
+        $total = $vulnerable.Count + $hardened.Count
+        if ($vulnerable.Count -gt 0) {
+            Add-AuditResult @common -Status 'WARN' -CurrentValue "$($vulnerable.Count) of $total Electron app(s) can be driven as a Node.js runtime$capNote" `
+                -Details ($vulnerable -join "`n") `
+                -Recommendation 'Update the listed apps (vendors increasingly ship hardened fuses). Where application control (WDAC/AppLocker) trusts these signed apps, remember they can run arbitrary JavaScript via ELECTRON_RUN_AS_NODE / --inspect; block that with a WDAC rule or by removing apps nobody uses, and report unhardened builds to the vendor.'
+        } elseif ($total -gt 0) {
+            Add-AuditResult @common -Status 'PASS' -CurrentValue "$total Electron app(s), all with Node execution fuses disabled$capNote" -Details ($hardened -join "`n") -Recommendation 'No action required.'
+        } else {
+            Add-AuditResult @common -Status 'PASS' -CurrentValue 'No Electron apps found' -Recommendation 'No action required.'
+        }
+    } catch {
+        Add-AuditResult -Category 'AppLocker - LOLBAS & Execution Bypass Vectors' -Control 'Electron Apps with Node Execution Fuses Enabled' -Status 'WARN' -Severity 'Low' `
+            -CurrentValue 'Query failed' -Recommendation "Unable to check Electron fuses: $($_.Exception.Message)"
+    }
+}
+
+# ---------------------------------------------------------------- autostart inventory
+
+function Test-AutostartInventory {
+    <#
+        One list of what starts automatically: Run/RunOnce entries (machine and every loaded
+        user hive), Startup folder items, non-Microsoft scheduled tasks and auto-start services
+        outside the Windows folder. Informational on its own; with -BaselinePath, new items
+        since the baseline become a scored finding.
+    #>
+    Write-SectionBanner 'Persistence - Autostart Inventory'
+    try {
+        $items = [System.Collections.Generic.List[string]]::new()
+        $counts = [ordered]@{ 'Run-key entries' = 0; 'startup-folder items' = 0; 'non-Microsoft scheduled tasks' = 0; 'non-Windows auto-start services' = 0 }
+
+        $runKeys = [ordered]@{
+            'HKLM'       = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion'
+            'HKLM 32-bit' = 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion'
+        }
+        foreach ($sidKey in @(Get-ChildItem -LiteralPath 'Registry::HKEY_USERS' -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -match '^S-1-5-21-[\d-]+$' })) {
+            $label = $sidKey.PSChildName
+            try { $label = ([System.Security.Principal.SecurityIdentifier]$sidKey.PSChildName).Translate([System.Security.Principal.NTAccount]).Value } catch { Write-Verbose 'Unresolved SID' }
+            $runKeys["user $label"] = "Registry::HKEY_USERS\$($sidKey.PSChildName)\SOFTWARE\Microsoft\Windows\CurrentVersion"
+        }
+        foreach ($scope in $runKeys.Keys) {
+            foreach ($sub in @('Run', 'RunOnce')) {
+                $key = "$($runKeys[$scope])\$sub"
+                try {
+                    $props = Get-ItemProperty -LiteralPath $key -ErrorAction Stop
+                    foreach ($prop in $props.PSObject.Properties) {
+                        if ($prop.Name -in @('PSPath', 'PSParentPath', 'PSChildName', 'PSDrive', 'PSProvider')) { continue }
+                        $items.Add("$sub ($scope): $($prop.Name) = $($prop.Value)")
+                        $counts['Run-key entries']++
+                    }
+                } catch { Write-Verbose "No $key" }
+            }
+        }
+
+        $startupDirs = @(Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\StartUp') +
+            @(Get-UserProfileDirectories | ForEach-Object { Join-Path $_ 'AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup' })
+        foreach ($dir in $startupDirs) {
+            foreach ($f in @(Get-ChildItem -LiteralPath $dir -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne 'desktop.ini' })) {
+                $items.Add("Startup folder: $($f.FullName)")
+                $counts['startup-folder items']++
+            }
+        }
+
+        foreach ($task in @(Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskPath -notlike '\Microsoft\*' })) {
+            $actions = @($task.Actions | ForEach-Object { if ($_.Execute) { "$($_.Execute) $($_.Arguments)".Trim() } else { $_.CimClass.CimClassName } }) -join '; '
+            $runAs = if ($task.Principal.UserId) { $task.Principal.UserId } else { $task.Principal.GroupId }
+            $items.Add("Scheduled task: $($task.TaskPath)$($task.TaskName) -> $actions [$runAs; $($task.State)]")
+            $counts['non-Microsoft scheduled tasks']++
+        }
+
+        $winDir = $env:windir.TrimEnd('\') + '\'
+        foreach ($svc in @(Get-CimInstance -ClassName Win32_Service -Filter "StartMode='Auto'" -ErrorAction SilentlyContinue)) {
+            $image = ([string]$svc.PathName).Trim().TrimStart('"')
+            if (-not $image -or $image.StartsWith($winDir, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+            $items.Add("Service: $($svc.Name) ($($svc.DisplayName)) -> $($svc.PathName) [$($svc.StartName)]")
+            $counts['non-Windows auto-start services']++
+        }
+
+        $summary = ($counts.Keys | ForEach-Object { "$($counts[$_]) $_" }) -join ', '
+        Add-AuditResult -Category 'Persistence & Post-Exploitation Vectors' -Control 'Autostart Inventory (Run Keys, Startup, Tasks & Services)' -Status 'INFO' -Severity 'Informational' `
+            -CurrentValue "$($items.Count) autostart item(s): $summary" -Details ((@($items) | Sort-Object) -join "`n") -RecommendedValue 'Every item recognized and expected' `
+            -CIS_Control 'CIS 2.1, 4.8' -NIST_Control 'CM-7, CM-8' -MITRE_Technique 'T1547.001 (Registry Run Keys / Startup Folder), T1053.005 (Scheduled Task), T1543.003 (Windows Service)' `
+            -ISO27001_Control 'A.8.19' -NIS2_Article 'Art.21(2)(i)' `
+            -Recommendation 'Review the list for anything unrecognized, especially items running from user-writable folders (AppData, Temp, Downloads, ProgramData). Run keys of users who are not signed in are not loaded and so not listed. Run with -BaselinePath to see new items since an earlier run.'
+    } catch {
+        Add-AuditResult -Category 'Persistence & Post-Exploitation Vectors' -Control 'Autostart Inventory (Run Keys, Startup, Tasks & Services)' -Status 'WARN' -Severity 'Low' `
+            -CurrentValue 'Query failed' -Recommendation "Unable to build the autostart inventory: $($_.Exception.Message)"
+    }
+}
+
+# ---------------------------------------------------------------- baseline comparison
+
+# Inventories whose new items are a security signal (scored), and ones that change too often
+# to score (reported in the informational finding only).
+$Script:BaselineTrackedControls = @(
+    'Autostart Inventory (Run Keys, Startup, Tasks & Services)', 'Local Administrators Group Membership',
+    'Local User & Administrator Roster', 'WMI Permanent Event Subscriptions', 'Defender Exclusions - Full Inventory',
+    'Browser Extensions Inventory', 'PowerShell Profile Scripts'
+)
+$Script:BaselineInfoControls = @('Installed Application Inventory', 'Active Inbound Firewall Rules Inventory')
+
+function Get-FindingItemList {
+    <# The item list behind a finding: its Details lines (one item per line), else nothing. #>
+    param([Parameter(Mandatory = $false)] $Details)
+    if ([string]::IsNullOrWhiteSpace([string]$Details)) { return @() }
+    return @(([string]$Details) -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+}
+
+function Compare-WithBaseline {
+    <#
+        Compares this run with an earlier JSON export (-ExportJson) of the same tool. Adds
+        "New Privileged & Persistence Items Since Baseline" (WARN when tracked inventories
+        gained items) and "Posture Changes Since Baseline" (INFO: controls that got worse or
+        better, plus changes in busy inventories; not scored, since those controls already
+        carry their own status in this run). The baseline file is untrusted input: it is only
+        parsed as JSON and compared as strings.
+    #>
+    param([Parameter(Mandatory = $true)] [string]$Path)
+    $base = ConvertFrom-JsonFile -Path $Path
+    $findings = Get-JsonValue $base @('Findings')
+    if ($null -eq $findings -or $findings -is [string] -or $findings -is [System.Collections.IDictionary]) {
+        Add-AuditResult -Category 'Baseline Comparison' -Control 'Baseline Comparison' -Status 'WARN' -Severity 'Low' `
+            -CurrentValue "Could not read baseline $Path" -RecommendedValue 'A JSON export from an earlier run of this tool' `
+            -Recommendation 'Pass a file written by -ExportJson from a previous run.'
+        return
+    }
+
+    $baseStatus = @{}
+    $baseDetails = @{}
+    $baseHasDetails = @{}
+    $duplicate = @{}
+    foreach ($f in @($findings)) {
+        if ($f -isnot [System.Collections.IDictionary]) { continue }
+        $control = [string]$f['Control']
+        if (-not $control) { continue }
+        if ($baseStatus.ContainsKey($control)) { $duplicate[$control] = $true }
+        $baseStatus[$control] = [string]$f['Status']
+        $baseDetails[$control] = $f['Details']
+        $baseHasDetails[$control] = Test-JsonKey -Node $f -Key 'Details'
+    }
+
+    $rank = @{ 'PASS' = 0; 'WARN' = 1; 'FAIL' = 2 }
+    $newItems = [System.Collections.Generic.List[string]]::new()
+    $removedItems = [System.Collections.Generic.List[string]]::new()
+    $regressions = [System.Collections.Generic.List[string]]::new()
+    $improvements = [System.Collections.Generic.List[string]]::new()
+    $infoChanges = [System.Collections.Generic.List[string]]::new()
+    $currentCount = @{}
+    foreach ($r in $Script:AuditResults) { $currentCount[$r.Control] = 1 + [int]$currentCount[$r.Control] }
+
+    foreach ($r in @($Script:AuditResults)) {
+        $control = $r.Control
+        if (-not $baseStatus.ContainsKey($control)) { continue }
+        $was = $baseStatus[$control]
+        $now = $r.Status
+        # Status changes only for controls reported once in both runs (per-path controls repeat).
+        if (-not $duplicate.ContainsKey($control) -and [int]$currentCount[$control] -eq 1 -and
+            $rank.ContainsKey($was) -and $rank.ContainsKey($now) -and $was -ne $now) {
+            if ($rank[$now] -gt $rank[$was]) { $regressions.Add("$control`: $was -> $now") } else { $improvements.Add("$control`: $was -> $now") }
+        }
+        $tracked = $Script:BaselineTrackedControls -contains $control
+        if (-not $tracked -and $Script:BaselineInfoControls -notcontains $control) { continue }
+        # A baseline from a version without item lists would make every current item look new.
+        if (-not $baseHasDetails[$control]) { continue }
+        $curList = @(Get-FindingItemList $r.Details)
+        $baseList = @(Get-FindingItemList $baseDetails[$control])
+        foreach ($item in $curList) {
+            if ($baseList -ccontains $item) { continue }
+            if ($tracked) { $newItems.Add("+ [$control] $item") } else { $infoChanges.Add("+ [$control] $item") }
+        }
+        foreach ($item in $baseList) {
+            if ($curList -ccontains $item) { continue }
+            if ($tracked) { $removedItems.Add("- [$control] $item") } else { $infoChanges.Add("- [$control] $item") }
+        }
+    }
+
+    $metaTime = [string](Get-JsonValue $base @('ScanStartTime'))
+    $metaHost = [string](Get-JsonValue $base @('ComputerName'))
+    $since = if ($metaTime) { $metaTime } else { 'unknown time' }
+    if ($metaHost) { $since += " on $metaHost" }
+    if ($metaHost -and $metaHost -ne $Script:ComputerName) { $since += ' (a different computer)' }
+
+    $fw = @{
+        Category = 'Baseline Comparison'; Control = 'New Privileged & Persistence Items Since Baseline'; Severity = 'Medium'
+        RecommendedValue = 'No unexpected new persistence, privilege or extension items since the baseline'
+        CIS_Control = 'CIS 1.1, 2.1, 4.1'; NIST_Control = 'CM-3, CM-8(3), SI-4'
+        MITRE_Technique = 'T1543 (Create or Modify System Process), T1098 (Account Manipulation)'; ISO27001_Control = 'A.8.9'; NIS2_Article = 'Art.21(2)(d)'
+    }
+    $removedNote = if ($removedItems.Count -gt 0) { "; $($removedItems.Count) removed" } else { '' }
+    if ($newItems.Count -gt 0) {
+        Add-AuditResult @fw -Status 'WARN' -CurrentValue "$($newItems.Count) new item(s) since $since$removedNote" `
+            -Details ((@($newItems) + @($removedItems)) -join "`n") `
+            -Recommendation 'Confirm each new item was an intended change (software install, admin change, granted permission). Unexplained new autostart items, admin members, WMI subscriptions, Defender exclusions, extensions or edited profiles are a common sign of compromise.'
+    } else {
+        Add-AuditResult @fw -Status 'PASS' -CurrentValue "No new items in $($Script:BaselineTrackedControls.Count) tracked inventories since $since$removedNote" `
+            -Details ($removedItems -join "`n") -Recommendation 'No action required.'
+    }
+    $changes = @($regressions | ForEach-Object { "worse: $_" }) + @($improvements | ForEach-Object { "better: $_" }) + @($infoChanges)
+    Add-AuditResult -Category 'Baseline Comparison' -Control 'Posture Changes Since Baseline' -Status 'INFO' -Severity 'Informational' `
+        -CurrentValue "$($regressions.Count) control(s) worse, $($improvements.Count) better since $since" -Details ($changes -join "`n") `
+        -RecommendedValue 'N/A' -Recommendation 'Informational. Controls that got worse are already scored in this run; review why they changed.'
+    $Script:BaselineSummary = "$($newItems.Count) new tracked item(s), $($regressions.Count) control(s) worse, $($improvements.Count) better (baseline: $since)"
 }
 
 #endregion
@@ -7972,19 +8821,20 @@ function Get-ValueCellHtml {
     $items = @($RawText -split ' \| ' | Where-Object { $_ -ne '' })
     if ($items.Count -eq 0) { $items = @($RawText) }
 
-    if (-not [string]::IsNullOrWhiteSpace($Details)) {
+    $hasDetails = -not [string]::IsNullOrWhiteSpace($Details)
+    if ($hasDetails -and $items.Count -le 3 -and $RawText.Length -le 320) {
         $previewHtml = (($items | ForEach-Object { Get-HtmlEncoded $_ }) -join '<br>')
         $tip = $Details
     } elseif ($items.Count -gt 3) {
         $previewHtml = (($items | Select-Object -First 2 | ForEach-Object { Get-HtmlEncoded $_ }) -join '<br>') +
             "<br>+ $($items.Count - 2) more"
-        $tip = $items -join "`n"
+        $tip = if ($hasDetails) { $Details } else { $items -join "`n" }
     } elseif ($RawText.Length -gt 320) {
         $preview = $RawText.Substring(0, 200)
         $lastSpace = $preview.LastIndexOf(' ')
         if ($lastSpace -gt 100) { $preview = $preview.Substring(0, $lastSpace) }
         $previewHtml = (Get-HtmlEncoded $preview) + '&hellip;'
-        $tip = $RawText
+        $tip = if ($hasDetails) { $Details } else { $RawText }
     } else {
         return (($items | ForEach-Object { Get-HtmlEncoded $_ }) -join '<br>')
     }
@@ -8609,6 +9459,7 @@ function Export-JsonReport {
         ScanEndTime   = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
         ComplianceScore = $Posture.Score
         RiskLevel     = $Posture.RiskLevel
+        BaselineFile  = $(if ([string]::IsNullOrWhiteSpace($BaselinePath)) { $null } else { $BaselinePath })
         Summary       = [PSCustomObject]@{
             TotalControls = $Posture.Total
             Pass          = $Posture.PassCount
@@ -9503,6 +10354,8 @@ $auditChecks = @(
     'Test-RemoteRegistryService',
     'Test-RemovableMediaControl',
     'Test-SmartScreenAndSmartAppControl',
+    'Test-BrowserExtensionInventory',
+    'Test-BrowserExtensionRisk',
     'Test-WindowsRecallControl',
     'Test-DeviceIdentityAndJoinState',
     'Test-WindowsUpdateCompliance',
@@ -9532,6 +10385,8 @@ $auditChecks = @(
     'Test-AccessibilityBinaryIntegrity',
     'Test-StartupFolderPermissions',
     'Test-WMIEventSubscriptionPersistence',
+    'Test-AutostartInventory',
+    'Test-PowerShellProfilePersistence',
     'Test-EventLogChannelACLTampering',
     'Test-UACBypassIndicators',
     'Test-AppLockerEnforcementModeDeep',
@@ -9540,6 +10395,7 @@ $auditChecks = @(
     'Test-AppLockerDotNetFrameworkWritablePaths',
     'Test-AppLockerPathRuleOverPermissiveness',
     'Test-AppLockerLOLBASExposure',
+    'Test-ElectronNodeFuses',
     'Test-AppLockerPublisherRuleOverTrust',
     'Test-AppLockerServiceIntegrity',
     'Test-AppLockerPolicyRegistryKeyACLs',
@@ -9625,6 +10481,17 @@ foreach ($checkName in $auditChecks) {
 }
 Write-Progress -Activity 'EndpointPostureCheck - Running Audit' -Completed
 
+# --- Optional baseline comparison (after every check, before scoring) ---
+if (-not [string]::IsNullOrWhiteSpace($BaselinePath)) {
+    Write-SectionBanner 'Baseline Comparison'
+    try {
+        Compare-WithBaseline -Path $BaselinePath
+    } catch {
+        Add-AuditResult -Category 'Baseline Comparison' -Control 'Baseline Comparison' -Status 'WARN' -Severity 'Low' `
+            -CurrentValue 'Comparison failed' -Recommendation "The baseline comparison was interrupted: $($_.Exception.Message)"
+    }
+}
+
 # --- Scoring & risk ---
 $posture = Get-CompliancePosture
 
@@ -9637,6 +10504,7 @@ Write-Host ("  Risk Level       : {0}" -f $posture.RiskLevel) -ForegroundColor $
 Write-Host ("  Total Controls   : {0}" -f $posture.Total) -ForegroundColor Gray
 Write-Host ("  PASS / FAIL / WARN / INFO : {0} / {1} / {2} / {3}" -f $posture.PassCount, $posture.FailCount, $posture.WarnCount, $posture.InfoCount) -ForegroundColor Gray
 Write-Host ("  Critical Failures: {0}   High-Severity Failures: {1}" -f $posture.CriticalFails, $posture.HighFails) -ForegroundColor Gray
+if ($Script:BaselineSummary) { Write-Host ("  Baseline         : {0}" -f $Script:BaselineSummary) -ForegroundColor Gray }
 Write-Host '=================================================================================' -ForegroundColor DarkCyan
 Write-Host ''
 

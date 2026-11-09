@@ -6,6 +6,24 @@ The project has no tagged releases yet, so changes are grouped by date. Entries 
 
 ## Unreleased
 
+- Windows: four macOS-parity features (151 checks, 35 domains).
+  - `-BaselinePath <earlier.json>`: compares with an earlier `-ExportJson` run. New items in the
+    tracked inventories are a scored WARN; controls that got worse or better are reported as INFO.
+    Six existing inventories (local administrators, local accounts, WMI subscriptions, Defender
+    exclusions, installed applications, inbound firewall rules) now carry item lists for this.
+  - Autostart inventory: Run/RunOnce entries (machine and loaded user hives), Startup folders,
+    non-Microsoft scheduled tasks and auto-start services outside the Windows folder.
+  - Browser extensions (Chrome, Edge, Brave, Vivaldi, Chromium, Firefox, every user): inventory
+    plus a risk review with the macOS rules (unpacked, sideloaded, off-store, unsigned, debugger,
+    every-site access with cookies/proxy/native messaging). Store update URLs are matched exactly.
+    Large Chromium preference files are parsed without Windows PowerShell 5.1's 2 MB JSON limit.
+  - PowerShell profile scripts (all-users and per-user, 5.1 and 7, OneDrive-redirected
+    Documents): content review for downloads, encoded commands, AMSI/logging or Defender
+    tampering, persistence creation and injection APIs, and a FAIL when an all-users profile or
+    its folder is writable by non-admins. Plain `Invoke-Expression` is not flagged (prompt tools
+    such as oh-my-posh use it).
+  - Electron apps whose RunAsNode / NODE_OPTIONS / --inspect fuses are on (a signed-binary
+    execution bypass), read by streaming the exe for the fuse wire; at most 25 apps per run.
 - Windows dashboard redesigned in the Låda Glass family look, matching the macOS edition: a port
   of the macOS template with identical CSS and JavaScript (sidebar domain filter with FAIL/WARN
   counts, KPI filters, score ring, theme switch, phone card layout, print styles). Long values open

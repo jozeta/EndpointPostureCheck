@@ -4,7 +4,7 @@
 
 This repository contains two independent tools sharing one design philosophy (fault-isolated checks, weighted compliance scoring, a self-contained HTML dashboard, optional JSON export and generated remediation script):
 
-- [`Invoke-EndpointPostureCheck.ps1`](#endpointposturecheck-for-windows) — Windows 11 Enterprise, 142 checks across 34 domains.
+- [`Invoke-EndpointPostureCheck.ps1`](#endpointposturecheck-for-windows) — Windows 11 Enterprise, 151 checks across 35 domains.
 - [`Invoke-MacPostureCheck.sh`](#endpointposturecheck-for-macos) — macOS 15 (Sequoia) / 26 (Tahoe), 185 checks across 32 domains.
 
 ---
@@ -13,7 +13,7 @@ This repository contains two independent tools sharing one design philosophy (fa
 
 **A comprehensive, standalone PowerShell security posture auditor for Windows 11 Enterprise endpoints.**
 
-`EndpointPostureCheck` runs **142 read-only security controls** across 34 hardening domains — from firmware and virtualization-based security through privilege-escalation vectors, AppLocker bypass paths, ransomware resilience, and modern cloud-identity token security — and renders the results as a single-file, interactive HTML dashboard. Every finding is mapped to CIS Controls v8, NIST SP 800-53 Rev.5, MITRE ATT&CK, ISO/IEC 27001:2022, the NIS2 Directive, and NSA/CISA guidance, and the tool can generate a companion remediation script for everything it finds wrong.
+`EndpointPostureCheck` runs **151 read-only security controls** across 35 hardening domains — from firmware and virtualization-based security through privilege-escalation vectors, AppLocker bypass paths, ransomware resilience, and modern cloud-identity token security — and renders the results as a single-file, interactive HTML dashboard. Every finding is mapped to CIS Controls v8, NIST SP 800-53 Rev.5, MITRE ATT&CK, ISO/IEC 27001:2022, the NIS2 Directive, and NSA/CISA guidance, and the tool can generate a companion remediation script for everything it finds wrong.
 
 It is designed to run standalone with zero external dependencies — no modules to install, no internet access required, just PowerShell and the Windows APIs already on the box.
 
@@ -39,7 +39,7 @@ It is designed to run standalone with zero external dependencies — no modules 
 
 ## Highlights
 
-- **142 checks, zero dependencies.** Everything runs on native PowerShell, CIM/WMI, and built-in Windows command-line tools (`bcdedit`, `reagentc`, `vssadmin`, `netsh`, `auditpol`, `wevtutil`, `sc`, `secedit`). Nothing to install.
+- **151 checks, zero dependencies.** Everything runs on native PowerShell, CIM/WMI, and built-in Windows command-line tools (`bcdedit`, `reagentc`, `vssadmin`, `netsh`, `auditpol`, `wevtutil`, `sc`, `secedit`). Nothing to install.
 - **Fault-tolerant by design.** Every single check runs inside its own `try/catch` boundary. A missing subsystem, an unsupported SKU, or an access-denied condition is logged as a `WARN`/`INFO` finding — it never aborts the run.
 - **Executive HTML dashboard.** A self-contained, single-file dashboard in the Låda Glass family design (frosted glass, dark theme with a light theme that follows the system, and a theme switch). It shows a compliance score ring, risk badge, KPI cards that filter by status, a sidebar listing every domain with its FAIL/WARN count, a **System Overview** panel (hostname, domain/Entra ID join state, uptime, IP, disk space, RAM/CPU, installed app count, BitLocker status), and a searchable, filterable findings table. Long item lists open in a popover. On a phone the table becomes stacked cards, and it has print styles. The design system's CSS and icons are inlined, so the report makes no network requests.
 - **Weighted compliance scoring.** Critical/High severity failures are penalized more heavily than Medium/Low ones; the result is a single 0–100% score and a `LOW`/`MEDIUM`/`HIGH`/`CRITICAL` risk badge.
@@ -82,6 +82,7 @@ The script must be run from an elevated PowerShell session ("Run as Administrato
 | `-ReportPath` | `string` | Optional output location for the HTML dashboard. Accepts a directory (default filename is used) or a full file path. Defaults to the current working directory. |
 | `-ExportJson` | `switch` | Exports the complete structured finding set — plus posture/summary metadata — to a JSON file alongside the HTML report. |
 | `-GenerateRemediationScript` | `switch` | Generates `Remediate-EndpointPostureCheck.ps1`, containing a remediation block for every `FAIL` finding from the current run. |
+| `-BaselinePath` | `string` | A JSON export (`-ExportJson`) from an earlier run. Adds two findings: **New Privileged & Persistence Items Since Baseline** (scored WARN when the autostart inventory, local administrators, local accounts, WMI subscriptions, Defender exclusions, browser extensions or PowerShell profiles gained items) and **Posture Changes Since Baseline** (informational: controls that got worse or better, and changes in installed applications and inbound firewall rules). |
 
 ---
 
@@ -125,7 +126,7 @@ The dashboard lets you filter by status (All / Failures / Warnings / Critical-Hi
 
 ## Audit Domains
 
-142 checks organized across 34 domains:
+151 checks organized across 35 domains (plus the optional baseline comparison):
 
 | # | Domain |
 |---|---|
@@ -150,9 +151,9 @@ The dashboard lets you filter by status (All / Failures / Warnings / Critical-Hi
 | 19 | Credential Theft & LSASS Exposure |
 | 20 | Privileged Token, Process & COM Hijacking |
 | 21 | Kernel & Driver Security (vulnerable driver blocklist, test signing, signature validity) |
-| 22 | Persistence Mechanisms & Unauthorized Auto-Runs |
+| 22 | Persistence Mechanisms & Unauthorized Auto-Runs (Run keys, Winlogon, WMI subscriptions, autostart inventory, PowerShell profile scripts and their write access) |
 | 23 | Active Exploitation & Security Subversion Controls (UAC bypass IOCs, event log ACL tampering) |
-| 24 | AppLocker ACL & Bypass Vulnerability Audit (enforcement, writable paths, LOLBAS, registry/service integrity) |
+| 24 | AppLocker ACL & Bypass Vulnerability Audit (enforcement, writable paths, LOLBAS, registry/service integrity, Electron apps usable as a Node.js runtime) |
 | 25 | Modern Identity, Tokens & Cloud Sync (Entra ID PRT/TPM binding, Seamless SSO, WHfB, Intune/MDM integrity) |
 | 26 | Recoverability, Shadow Copies & Ransomware Preparation (VSS, WinRE, System Restore) |
 | 27 | Advanced Network Interface, Cellular & Wi-Fi Security |
@@ -163,6 +164,7 @@ The dashboard lets you filter by status (All / Failures / Warnings / Critical-Hi
 | 32 | Targeted Gap Checks — Defender, Network, Accounts & Awareness |
 | 33 | Targeted Gap Closure — Credential, Kernel, Network & Privacy |
 | 34 | System Inventory & Asset Information |
+| 35 | Browser & Application Hardening (browser extension inventory and risk review for Chrome, Edge, Brave, Vivaldi, Chromium and Firefox) |
 
 ---
 
@@ -205,7 +207,7 @@ A few choices worth knowing about if you're extending this tool:
 
 ## Performance Notes
 
-A full run typically takes **60–90 seconds** depending on hardware and installed feature set (WSL, Hyper-V, AppLocker, and Wi-Fi profile checks each add a few seconds). All 142 checks run sequentially in a single process for fault-tolerance and predictable console output ordering.
+A full run typically takes **60–90 seconds** depending on hardware and installed feature set (WSL, Hyper-V, AppLocker, and Wi-Fi profile checks each add a few seconds). All 151 checks run sequentially in a single process for fault-tolerance and predictable console output ordering.
 
 ---
 
