@@ -34,6 +34,17 @@ The project has no tagged releases yet, so changes are grouped by date. Entries 
   - Time Machine and NVRAM boot-args: a failed query was reported as "nothing configured"
   - Smaller: "a; b; c" lists, update history picks the newest date regardless of order, sorted
     application lists, case-insensitive iCloud Keychain marker
+- macOS fixes from the first real `sudo` run on Tahoe:
+  - `--report-path` with a folder that does not exist yet created a file of that name instead of
+    the folder
+  - SSH server checks always read "not available" (`sshd -T` needs host keys that exist only after
+    Remote Login is turned on); now read with `sshd -G`, scored only while Remote Login is on, and
+    reported as INFO otherwise
+  - Update history failed as root; now read from `/Library/Receipts/InstallHistory.plist`, ignoring
+    weekly XProtect data that would make an unpatched Mac look current
+  - MRT (retired by Apple) was reported as years out of date; now INFO when XProtect Remediator is
+    present
+  - Writable PATH listed repeated PATH entries several times
 
 - PSScriptAnalyzer clean-up: checks that fail quietly now say why with `-Verbose`; removed five values
   that were read but never used (including an unused Device Guard query)

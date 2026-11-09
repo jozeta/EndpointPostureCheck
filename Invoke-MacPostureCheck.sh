@@ -1,5 +1,5 @@
 #!/usr/bin/env zsh
-# EndpointPostureCheck for macOS — built 2026-11-09 21:03:36 from src/*.zsh. Do not edit directly.
+# EndpointPostureCheck for macOS — built 2026-11-09 21:22:51 from src/*.zsh. Do not edit directly.
 
 # ---- 00-header.zsh ----
 #
@@ -1148,6 +1148,16 @@ check_xprotect_freshness() {
 }
 
 check_mrt_freshness() {
+    # Apple stopped updating MRT once XProtect Remediator replaced it, so
+    # an old MRT date is expected, not a finding (a real run reported
+    # "1579 day(s) ago" as WARN Medium).
+    if [[ -d "${XPROTECT_APP:-/Library/Apple/System/Library/CoreServices/XProtect.app}" ]]; then
+        add_audit_result --category 'Malware Defense (XProtect / MRT / EDR)' --control 'MRT Update Freshness' \
+            --status INFO --severity Informational \
+            --current 'MRT is retired on this macOS; XProtect Remediator performs its scans (see XProtect Remediator Scan Results)' \
+            --recommended 'N/A' --cis-macos 'N/A' --mscp 'N/A' --recommendation 'Informational only.'
+        return
+    fi
     _bundle_freshness_check \
         '/Library/Apple/System/Library/CoreServices/MRT.app/Contents/Info.plist' \
         'CFBundleShortVersionString' 'MRT Update Freshness'
@@ -2504,16 +2514,46 @@ check_bluetooth_sharing_disabled() {
 #
 # Domain 10: SSH Server & Client Hardening
 
+# `sshd -T` exits "no hostkeys available" until Remote Login has been
+# turned on once (verified live on Tahoe), so every check read "not
+# available". `sshd -G` prints the same effective configuration without
+# host keys (mSCP's method). The settings only matter while Remote Login
+# is on, so with it off they are reported as INFO, not scored — the stock
+# config (password auth on, root login prohibit-password) is an OS default.
+_sshd_query() {
+    run_root sshd -G
+    [[ $ROOT_CMD_STATUS -ne 0 ]] && run_root sshd -T
+    local cfg="$ROOT_CMD_OUTPUT" cfg_status=$ROOT_CMD_STATUS
+    run_root launchctl print system/com.openssh.sshd
+    SSHD_ENABLED=0
+    [[ $ROOT_CMD_STATUS -eq 0 ]] && SSHD_ENABLED=1
+    ROOT_CMD_OUTPUT="$cfg"; ROOT_CMD_STATUS=$cfg_status
+}
+
+_sshd_inactive_result() {
+    local control="$1" key="$2" mscp_id="$3" line=""
+    line=$(print -r -- "$ROOT_CMD_OUTPUT" | grep -i "^$key " | head -1)
+    add_audit_result --category 'SSH Server & Client Hardening' --control "$control" \
+        --status INFO --severity Informational \
+        --current "Remote Login is off; effective setting if enabled: ${line:-$key not reported}" \
+        --recommended 'Harden before enabling Remote Login' --cis-macos 'N/A' --mscp "$mscp_id" \
+        --recommendation 'Not scored while Remote Login (sshd) is off. Before turning it on, set this in /etc/ssh/sshd_config.d/ and re-run the audit.'
+}
+
 check_sshd_password_auth() {
     write_section_banner 'SSH Server & Client Hardening - sshd Password Authentication'
-    run_root sshd -T
+    _sshd_query
 
     if [[ $ROOT_CMD_STATUS -ne 0 ]]; then
         add_audit_result --category 'SSH Server & Client Hardening' --control 'sshd Password Authentication' \
             --status WARN --severity Low --current 'sshd not available for query' \
             --recommended 'PasswordAuthentication no' \
             --cis 'CIS 5.9' --nist 'IA-2, IA-5' --cis-macos 'N/A' --mscp 'auth_ssh_password_authentication_disable' \
-            --recommendation 'Unable to query sshd effective configuration; verify manually with "sshd -T".'
+            --recommendation 'Unable to query sshd effective configuration; verify manually with "sshd -G".'
+        return
+    fi
+    if (( ! SSHD_ENABLED )); then
+        _sshd_inactive_result 'sshd Password Authentication' passwordauthentication 'auth_ssh_password_authentication_disable'
         return
     fi
 
@@ -2543,20 +2583,24 @@ check_sshd_password_auth() {
                 --status WARN --severity Low --current "Query failed or unrecognized output: $line" \
                 --recommended 'PasswordAuthentication no' \
                 --cis 'CIS 5.9' --nist 'IA-2, IA-5' --cis-macos 'N/A' --mscp 'auth_ssh_password_authentication_disable' \
-                --recommendation 'Unable to determine PasswordAuthentication setting; verify manually with "sshd -T".'
+                --recommendation 'Unable to determine PasswordAuthentication setting; verify manually with "sshd -G".'
             ;;
     esac
 }
 
 check_sshd_permit_root_login() {
-    run_root sshd -T
+    _sshd_query
 
     if [[ $ROOT_CMD_STATUS -ne 0 ]]; then
         add_audit_result --category 'SSH Server & Client Hardening' --control 'sshd Permit Root Login' \
             --status WARN --severity Low --current 'sshd not available for query' \
             --recommended 'PermitRootLogin no' \
             --cis 'CIS 5.9' --nist 'AC-6, IA-2' --cis-macos 'N/A' --mscp 'os_sshd_permit_root_login_configure' \
-            --recommendation 'Unable to query sshd effective configuration; verify manually with "sshd -T".'
+            --recommendation 'Unable to query sshd effective configuration; verify manually with "sshd -G".'
+        return
+    fi
+    if (( ! SSHD_ENABLED )); then
+        _sshd_inactive_result 'sshd Permit Root Login' permitrootlogin 'os_sshd_permit_root_login_configure'
         return
     fi
 
@@ -2582,14 +2626,18 @@ check_sshd_permit_root_login() {
 }
 
 check_sshd_weak_ciphers() {
-    run_root sshd -T
+    _sshd_query
 
     if [[ $ROOT_CMD_STATUS -ne 0 ]]; then
         add_audit_result --category 'SSH Server & Client Hardening' --control 'sshd Weak Ciphers' \
             --status WARN --severity Low --current 'sshd not available for query' \
             --recommended 'No weak (3des-cbc/arcfour/*-cbc) ciphers configured' \
             --cis 'CIS 5.9' --nist 'SC-13' --cis-macos 'N/A' --mscp 'os_sshd_channel_timeout_configure' \
-            --recommendation 'Unable to query sshd effective configuration; verify manually with "sshd -T".'
+            --recommendation 'Unable to query sshd effective configuration; verify manually with "sshd -G".'
+        return
+    fi
+    if (( ! SSHD_ENABLED )); then
+        _sshd_inactive_result 'sshd Weak Ciphers' ciphers 'N/A'
         return
     fi
 
@@ -3076,6 +3124,23 @@ check_audit_records_access() {
 
 check_recent_update_history() {
     write_section_banner 'Software Update & Patch Compliance - Recent Update History'
+    # Newest Apple update in the system install log (softwareupdated /
+    # bootinstalld entries; readable without root). `softwareupdate
+    # --history` is the fallback: in a real sudo run on Tahoe it returned
+    # nothing parseable, although the same command worked unprivileged.
+    local date_token=""
+    local history_plist="${INSTALL_HISTORY_PLIST:-/Library/Receipts/InstallHistory.plist}"
+    if [[ -r "$history_plist" ]]; then
+        # Weekly background data (XProtectPlistConfigData, XProtectPayloads,
+        # Gatekeeper/MRT config) also arrives via softwareupdated and would
+        # make an unpatched Mac look current, so it is excluded.
+        date_token=$(plutil -p "$history_plist" 2>/dev/null | awk '
+            /"date" =>/ { d = $3 }
+            /"displayName" =>/ { n = $0 }
+            /"processName" => "(softwareupdated|bootinstalld)"/ {
+                if (n !~ /XProtect|ConfigData|Payloads|Gatekeeper|MRT/) print d
+            }' | sort | tail -1)
+    fi
     run_root softwareupdate --history
 
     # Real "softwareupdate --history" output (confirmed live): a header
@@ -3085,8 +3150,7 @@ check_recent_update_history() {
     # trailing comma, split from the time as a separate whitespace token.
     # Newest date anywhere in the history, not the last line: the list is
     # oldest-first today (verified live) but that order is undocumented.
-    local date_token=""
-    date_token=$(print -r -- "$ROOT_CMD_OUTPUT" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' | sort | tail -1)
+    [[ -z "$date_token" ]] && date_token=$(print -r -- "$ROOT_CMD_OUTPUT" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' | sort | tail -1)
     local epoch=""
     if [[ -n "$date_token" ]]; then
         epoch=$(date -j -f "%Y-%m-%d" "$date_token" +%s 2>/dev/null)
@@ -4341,7 +4405,7 @@ check_writable_launchd_directories() {
 _writable_path_scan() {
     local path_string="$1"
     local -a dirs
-    dirs=(${(s.:.)path_string})
+    dirs=(${(us.:.)path_string})   # unique: inherited PATHs often repeat entries
 
     local -a writable=()
     local scanned=0 dir
@@ -7688,7 +7752,11 @@ _resolve_output_paths() {
         JSON_OUTPUT_PATH="$(pwd)/$default_json_name"
         REMEDIATION_OUTPUT_PATH="$(pwd)/Remediate-EndpointPostureCheck.sh"
         PROFILE_OUTPUT_PATH="$(pwd)/EndpointPostureCheck-Hardening.mobileconfig"
-    elif [[ -d "$REPORT_PATH" ]]; then
+    elif [[ -d "$REPORT_PATH" ]] || [[ ! -e "$REPORT_PATH" && "${REPORT_PATH:l}" != *.htm(|l) ]]; then
+        # A path that does not exist yet and has no .html extension is a
+        # folder to create (a run with --report-path ~/Desktop/run once
+        # wrote the dashboard to an extension-less file named "run").
+        mkdir -p "$REPORT_PATH"
         HTML_OUTPUT_PATH="$REPORT_PATH/$default_html_name"
         JSON_OUTPUT_PATH="$REPORT_PATH/$default_json_name"
         REMEDIATION_OUTPUT_PATH="$REPORT_PATH/Remediate-EndpointPostureCheck.sh"
