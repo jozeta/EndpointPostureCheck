@@ -1,5 +1,5 @@
 #!/usr/bin/env zsh
-# EndpointPostureCheck for macOS — built 2026-11-09 21:22:51 from src/*.zsh. Do not edit directly.
+# EndpointPostureCheck for macOS — built 2026-11-09 21:50:14 from src/*.zsh. Do not edit directly.
 
 # ---- 00-header.zsh ----
 #
@@ -7,7 +7,8 @@
 # A read-only security posture auditor for macOS 15/26 endpoints.
 #
 # Usage: Invoke-MacPostureCheck.sh [--report-path <dir|file>] [--export-json]
-#                                   [--generate-remediation] [--generate-profile] [--help]
+#                                   [--generate-remediation] [--generate-profile]
+#                                   [--baseline <previous.json>] [--help]
 #
 # Deliberately NOT running under `set -u`/`set -e`: the #1 design
 # requirement (Global Constraints) is that one check's failure must never
@@ -31,6 +32,7 @@ REPORT_PATH=""
 EXPORT_JSON=0
 GENERATE_REMEDIATION=0
 GENERATE_PROFILE=0
+BASELINE_PATH=""
 
 print_usage() {
     cat <<'EOF'
@@ -51,6 +53,9 @@ Options:
   --generate-profile           Generate EndpointPostureCheck-Hardening.mobileconfig
                                with every profile-enforceable WARN/FAIL setting
                                (written for review only; never installed).
+  --baseline <file.json>       Compare with an earlier --export-json report:
+                               flags new autostart items, admins, permissions
+                               and extensions, and lists what got worse/better.
   --help                       Show this help text and exit.
 
 Must be run with sudo (root). No changes are made to the system during
@@ -79,6 +84,14 @@ while [[ $# -gt 0 ]]; do
         --generate-profile)
             GENERATE_PROFILE=1
             shift
+            ;;
+        --baseline)
+            if [[ $# -lt 2 ]]; then
+                echo "Error: --baseline requires a JSON file" >&2
+                exit 1
+            fi
+            BASELINE_PATH="$2"
+            shift 2
             ;;
         --help|-h)
             print_usage
@@ -129,6 +142,10 @@ OS_BUILD=$(sw_vers -buildVersion 2>/dev/null || echo "Unknown")
 # alone without triggering the root gate or CLI arg parsing.
 
 : ${CONSOLE_USER:=""}
+# A newline for use inside double-quoted expansions such as
+# "${a}${b:+$NL$b}": $'\n' is not expanded inside double quotes and
+# produced a literal "$'" in finding details.
+typeset -g NL=$'\n'
 : ${IS_APPLE_SILICON:=0}
 : ${OS_PRODUCT_VERSION:="0.0"}
 
@@ -3602,7 +3619,7 @@ _persistence_scan_report() {
     if [[ ${#PERSIST_STRONG[@]} -gt 0 ]]; then
         add_audit_result --category "$PERSIST_CATEGORY" --control "$control_label" \
             --status FAIL --severity High --current "${(j: | :)PERSIST_STRONG}" \
-            --details "${(F)PERSIST_STRONG}${PERSIST_WEAK:+$'\n'${(F)PERSIST_WEAK}}" "${fw[@]}" \
+            --details "${(F)PERSIST_STRONG}${PERSIST_WEAK:+$NL${(F)PERSIST_WEAK}}" "${fw[@]}" \
             --recommendation 'Investigate and remove the listed launch items unless independently verified as legitimate. An unsigned, /tmp-hosted, masquerading or tamperable persistent launch target, or a script with download-and-execute / credential-theft patterns, is a strong persistence-malware indicator. Capture the plist and target for forensics before removing.'
     elif [[ ${#PERSIST_WEAK[@]} -gt 0 ]]; then
         add_audit_result --category "$PERSIST_CATEGORY" --control "$control_label" \
@@ -3777,7 +3794,7 @@ _persistence_tiered_result() {
     if [[ ${#hi[@]} -gt 0 ]]; then
         add_audit_result --category "$PERSIST_CATEGORY" --control "$control" \
             --status FAIL --severity High --current "${#hi[@]} high-risk item(s)${lo:+, ${#lo[@]} to review}" \
-            --details "${(F)hi}${lo:+$'\n'${(F)lo}}" "${fw[@]}" --recommendation "$recommendation"
+            --details "${(F)hi}${lo:+$NL${(F)lo}}" "${fw[@]}" --recommendation "$recommendation"
     elif [[ ${#lo[@]} -gt 0 ]]; then
         add_audit_result --category "$PERSIST_CATEGORY" --control "$control" \
             --status WARN --severity "$warn_severity" --current "${#lo[@]} item(s) to review" \
@@ -5633,6 +5650,229 @@ check_terminal_secure_keyboard_entry() {
         --recommendation 'Enforce Terminal Secure Keyboard Entry (com.apple.Terminal SecureKeyboardEntry=true) via profile so other processes cannot read keystrokes typed into Terminal, including sudo passwords.'
 }
 
+# ---- 32b-browser-extensions.zsh ----
+#
+# Domain 23 (continued): Browser & Application Hardening - browser
+# extensions. Chromium browsers (Chrome, Edge, Brave, Vivaldi, Arc,
+# Chromium) and Firefox, in every local user's profiles, plus Safari web
+# extensions. A 2026 campaign of 108 malicious Chrome extensions hit
+# 20,000+ enterprise users; extensions are a common credential- and
+# session-theft path that no other check sees.
+#
+# Manifests and preference files are JSON; they are parsed with
+# JavaScript through osascript (JXA), so there is still no dependency
+# beyond what macOS ships. Extension settings come from both
+# "Preferences" and "Secure Preferences" — the only place unpacked
+# (developer-mode) and policy-installed extensions are recorded.
+
+typeset -g BROWSER_EXT_JXA
+read -r -d '' BROWSER_EXT_JXA <<'JXA'
+ObjC.import('Foundation');
+function readJSON(p) {
+    var s = $.NSString.stringWithContentsOfFileEncodingError(p, $.NSUTF8StringEncoding, null);
+    if (s.isNil()) return null;
+    try { return JSON.parse(ObjC.unwrap(s)); } catch (e) { return null; }
+}
+function listDir(p) {
+    var c = ObjC.deepUnwrap($.NSFileManager.defaultManager.contentsOfDirectoryAtPathError(p, null)) || [];
+    return c.filter(function (x) { return x[0] !== '.'; }).sort();
+}
+function localized(dir, m, s) {
+    var r = /^__MSG_(.+)__$/.exec(s || '');
+    if (!r || !dir) return s || '';
+    var j = readJSON(dir + '/_locales/' + (m.default_locale || 'en') + '/messages.json') || readJSON(dir + '/_locales/en/messages.json');
+    if (!j) return s;
+    var k = Object.keys(j).filter(function (x) { return x.toLowerCase() === r[1].toLowerCase(); })[0];
+    return k ? j[k].message : s;
+}
+function clean(v) { return String(v == null ? '' : v).replace(/[\t\n\r\x1f]/g, ' '); }
+function chromium(prof) {
+    var settings = {}, out = [];
+    ['Preferences', 'Secure Preferences'].forEach(function (f) {
+        var j = readJSON(prof + '/' + f), s = j && j.extensions && j.extensions.settings;
+        if (s) for (var id in s) settings[id] = Object.assign(settings[id] || {}, s[id]);
+    });
+    listDir(prof + '/Extensions').forEach(function (id) { if (!settings[id]) settings[id] = {}; });
+    for (var id in settings) {
+        var st = settings[id], loc = st.location, dir = null, m = null;
+        if (loc === 5 || loc === 10) continue;                       // built-in components
+        if (st.path) dir = st.path[0] === '/' ? st.path : prof + '/Extensions/' + st.path;
+        else { var v = listDir(prof + '/Extensions/' + id); if (v.length) dir = prof + '/Extensions/' + id + '/' + v[v.length - 1]; }
+        if (dir) m = readJSON(dir + '/manifest.json');
+        if (!m) m = st.manifest || null;
+        if (!m || m.theme) continue;
+        var perms = (m.permissions || []).filter(function (p) { return typeof p === 'string'; });
+        var hosts = (m.host_permissions || []).concat(perms.filter(function (p) { return p.indexOf('://') >= 0 || p === '<all_urls>'; }));
+        (m.content_scripts || []).forEach(function (cs) { hosts = hosts.concat(cs.matches || []); });
+        var dr = st.disable_reasons, disabled = st.state === 0 || (Array.isArray(dr) ? dr.length > 0 : !!dr);
+        out.push([id, localized(dir, m, m.name), m.version, loc == null ? '' : loc, m.update_url || '', disabled ? 0 : 1, '',
+            perms.filter(function (p) { return p.indexOf('://') < 0 && p !== '<all_urls>'; }).join(','),
+            hosts.filter(function (h, i) { return hosts.indexOf(h) === i; }).join(',')].map(clean).join('\x1f'));
+    }
+    return out.join('\n');
+}
+function firefox(prof) {
+    var j = readJSON(prof + '/extensions.json'), out = [];
+    ((j && j.addons) || []).forEach(function (a) {
+        if (a.type !== 'extension' || /^app-(builtin|system-defaults|system-addons)$/.test(a.location)) return;
+        var up = a.userPermissions || {};
+        out.push([a.id, (a.defaultLocale && a.defaultLocale.name) || a.id, a.version, a.location, a.sourceURI || '', a.active ? 1 : 0,
+            a.signedState == null ? '' : a.signedState, (up.permissions || []).join(','), (up.origins || []).join(',')].map(clean).join('\x1f'));
+    });
+    return out.join('\n');
+}
+function run(argv) { return argv[0] === 'firefox' ? firefox(argv[1]) : chromium(argv[1]); }
+JXA
+
+# Chromium-family user-data roots, relative to a home directory.
+typeset -ga CHROMIUM_ROOTS
+CHROMIUM_ROOTS=(
+    'Google Chrome|Library/Application Support/Google/Chrome'
+    'Microsoft Edge|Library/Application Support/Microsoft Edge'
+    'Brave|Library/Application Support/BraveSoftware/Brave-Browser'
+    'Vivaldi|Library/Application Support/Vivaldi'
+    'Arc|Library/Application Support/Arc/User Data'
+    'Chromium|Library/Application Support/Chromium'
+)
+
+# Store update URLs: anything else (or none) means not installed from a store.
+typeset -ga EXTENSION_STORE_URLS
+EXTENSION_STORE_URLS=('clients2.google.com/service/update2/crx' 'edge.microsoft.com/extensionwebstorebase'
+    'update.googleapis.com/service/update2')
+
+# Combined with every-site access these let an extension steal sessions,
+# reroute or rewrite traffic, or reach outside the browser. Plain
+# script injection / webRequest is common to ordinary ad blockers and
+# spell checkers, so it is shown in the inventory but not flagged
+# (measured live: flagging it marked 10 of 12 enabled extensions).
+typeset -ga EXTENSION_SENSITIVE_PERMS
+EXTENSION_SENSITIVE_PERMS=(cookies proxy nativeMessaging management webRequestBlocking)
+
+# One line per extension: "browser|profile|user|" then id, name, version,
+# location, update URL (Firefox: sourceURI), enabled, signedState, perms
+# and hosts joined by \x1f. Not tabs: tab is IFS whitespace, so `read`
+# would collapse empty fields and shift every later one.
+_browser_extension_records() {
+    local entry="" user="" home="" root="" browser="" rel="" prof="" line=""
+    for entry in "${(@f)$(_local_user_homes)}"; do
+        [[ -z "$entry" ]] && continue
+        user="${entry%%$'\t'*}"; home="${entry#*$'\t'}"
+        for root in "${CHROMIUM_ROOTS[@]}"; do
+            browser="${root%%|*}"; rel="${root#*|}"
+            for prof in "$home/$rel"/(Default|Profile*)(N/); do
+                for line in "${(@f)$(osascript -l JavaScript -e "$BROWSER_EXT_JXA" chromium "$prof" 2>/dev/null)}"; do
+                    [[ -n "$line" ]] && print -r -- "$browser|${prof:t}|$user|$line"
+                done
+            done
+        done
+        for prof in "$home/Library/Application Support/Firefox/Profiles"/*(N/); do
+            for line in "${(@f)$(osascript -l JavaScript -e "$BROWSER_EXT_JXA" firefox "$prof" 2>/dev/null)}"; do
+                [[ -n "$line" ]] && print -r -- "Firefox|${prof:t}|$user|$line"
+            done
+        done
+    done
+}
+
+# Prints the risk reasons for one record (empty = nothing to flag).
+_extension_risk_reasons() {
+    local browser="$1" location="$2" update="$3" signed="$4" perms="$5" hosts="$6"
+    local -a reasons sensitive
+    local p="" url="" from_store=0 broad=0
+    if [[ "$browser" == Firefox ]]; then
+        [[ "$location" != app-profile ]] && reasons+=("sideloaded or temporary (location $location)")
+        [[ "$signed" == <-> ]] || [[ "$signed" == -* ]] && (( signed <= 0 )) && reasons+=("unsigned (signedState $signed)")
+    else
+        for url in "${EXTENSION_STORE_URLS[@]}"; do [[ "$update" == *"$url"* ]] && from_store=1; done
+        case "$location" in
+            4) reasons+=("unpacked (developer mode, not from a store)") ;;
+            # Pre-installed through an external-extensions file. Store-hosted
+            # ones (e.g. Chrome's bundled Google Docs Offline) are normal.
+            2|6) (( from_store )) || reasons+=("sideloaded by an external extensions file, not store-hosted") ;;
+            7|9) ;;   # force-installed by policy: listed in the inventory, not a risk by itself
+            *) (( from_store )) || reasons+=("not from a browser store${update:+ (update URL $update)}") ;;
+        esac
+    fi
+    [[ ",$perms," == *",debugger,"* ]] && reasons+=("debugger permission (full control of every tab)")
+    [[ ",$hosts," == *"<all_urls>"* || ",$hosts," == *",*://*/"* || ",$hosts," == *",http://*/"* || ",$hosts," == *",https://*/"* ]] && broad=1
+    if (( broad )); then
+        for p in "${EXTENSION_SENSITIVE_PERMS[@]}"; do [[ ",$perms," == *",$p,"* ]] && sensitive+=("$p"); done
+        (( ${#sensitive[@]} )) && reasons+=("every site + ${(j:, :)sensitive}")
+    fi
+    print -r -- "${(j:; :)reasons}"
+}
+
+_extension_source_label() {
+    local browser="$1" location="$2"
+    if [[ "$browser" == Firefox ]]; then
+        [[ "$location" == app-profile ]] && print -r -- 'user-installed' || print -r -- "$location"
+        return
+    fi
+    case "$location" in
+        4) print -r -- unpacked ;;
+        2|6) print -r -- sideloaded ;;
+        7|9) print -r -- 'policy' ;;
+        *) print -r -- store ;;
+    esac
+}
+
+check_browser_extensions_inventory() {
+    write_section_banner 'Browser & Application Hardening - Browser Extensions'
+    local rec="" browser="" prof="" user="" rest="" id="" name="" version="" location="" update="" enabled="" signed="" perms="" hosts=""
+    local -a lines safari
+    local enabled_count=0
+    local -A profiles
+    for rec in "${(@f)$(_browser_extension_records)}"; do
+        [[ -z "$rec" ]] && continue
+        IFS='|' read -r browser prof user rest <<< "$rec"
+        IFS=$'\x1f' read -r id name version location update enabled signed perms hosts <<< "$rest"
+        profiles[$browser/$prof/$user]=1
+        (( enabled )) && enabled_count=$((enabled_count + 1))
+        lines+=("[$browser $prof, $user] $name ${version:+v$version} ($( (( enabled )) && print on || print off), $(_extension_source_label "$browser" "$location"))")
+    done
+    if [[ -n "$CONSOLE_USER" ]]; then
+        run_as_user pluginkit -mA -p com.apple.Safari.web-extension
+        [[ $RUN_AS_USER_STATUS -eq 0 ]] && safari=("${(@f)$(print -r -- "$RUN_AS_USER_OUTPUT" | awk 'NF {sub(/^[+!=-]? */, ""); print $1}')}")
+        safari=(${safari:#})
+        local s=""
+        for s in "${safari[@]}"; do lines+=("[Safari, $CONSOLE_USER] $s (Safari web extension)"); done
+    fi
+    add_audit_result --category 'Browser & Application Hardening' --control 'Browser Extensions Inventory' \
+        --status INFO --severity Informational \
+        --current "$(( ${#lines[@]} )) extension(s) in ${#profiles} browser profile(s); $enabled_count enabled (Chromium/Firefox), ${#safari[@]} Safari" \
+        --details "${(F)${(@o)lines}}" --recommended 'N/A' --cis 'CIS 9.4' --nist 'CM-7(5), CM-8' --iso27001 'A.8.19' \
+        --cis-macos 'N/A' --mscp 'N/A' \
+        --recommendation 'Informational baseline. Remove extensions nobody uses; enforce an allowlist with ExtensionInstallAllowlist / ExtensionSettings policies in managed environments.'
+}
+
+check_browser_extension_risk() {
+    local rec="" browser="" prof="" user="" rest="" id="" name="" version="" location="" update="" enabled="" signed="" perms="" hosts="" reasons=""
+    local -a flagged
+    local total=0
+    for rec in "${(@f)$(_browser_extension_records)}"; do
+        [[ -z "$rec" ]] && continue
+        IFS='|' read -r browser prof user rest <<< "$rec"
+        IFS=$'\x1f' read -r id name version location update enabled signed perms hosts <<< "$rest"
+        (( enabled )) || continue
+        total=$((total + 1))
+        reasons=$(_extension_risk_reasons "$browser" "$location" "$update" "$signed" "$perms" "$hosts")
+        [[ -n "$reasons" ]] && flagged+=("[$browser $prof, $user] $name ($id): $reasons")
+    done
+    local -a fw
+    fw=(--recommended 'Enabled extensions come from a store and hold only the access they need'
+        --cis 'CIS 9.4' --nist 'CM-7(5), SI-4' --mitre 'T1176 (Browser Extensions)' --iso27001 'A.8.19'
+        --nis2 'Art.21(2)(d)' --cis-macos 'N/A' --mscp 'N/A')
+    if [[ ${#flagged[@]} -gt 0 ]]; then
+        add_audit_result --category 'Browser & Application Hardening' --control 'Browser Extension Risk Review' \
+            --status WARN --severity Medium --current "${#flagged[@]} of $total enabled extension(s) need review" \
+            --details "${(F)${(@o)flagged}}" "${fw[@]}" \
+            --recommendation 'Review each listed extension: remove unpacked, sideloaded and unknown-source extensions, and keep broad-access ones (every site plus cookies, web requests, proxy or native messaging) only when they are from a vendor you trust. Extensions auto-update, so an ownership change can turn a trusted one malicious.'
+    else
+        add_audit_result --category 'Browser & Application Hardening' --control 'Browser Extension Risk Review' \
+            --status PASS --severity Medium --current "$total enabled extension(s), none flagged" "${fw[@]}" \
+            --recommendation 'No action required.'
+    fi
+}
+
 # ---- 33-ransomware-resilience.zsh ----
 #
 # Domain 24: Ransomware Resilience & Recovery
@@ -7362,6 +7602,7 @@ EOF
   "OperatingSystem": "$(json_escape "$osinfo")",
   "ScanStartTime": "$START_TIME_HUMAN",
   "ScanEndTime": "$(date '+%Y-%m-%d %H:%M:%S')",
+  "BaselineFile": "$(json_escape "${BASELINE_PATH:-}")",
   "ComplianceScore": $POSTURE_SCORE,
   "RiskLevel": "$POSTURE_RISK",
   "Summary": {
@@ -7699,6 +7940,129 @@ generate_hardening_profile() {
     chmod 644 "$output_path"
 }
 
+# ---- 95-baseline.zsh ----
+#
+# Baseline comparison (--baseline <previous.json>): compares this run with
+# an earlier JSON export of the same tool. Drift is often a stronger
+# signal than a single snapshot: a new LaunchDaemon, admin account, Full
+# Disk Access grant or browser extension since last week matters even
+# when each one looks plausible on its own.
+#
+# Two findings, added after every check has run:
+#   - New Privileged & Persistence Items Since Baseline (scored, WARN):
+#     items that appeared in security-relevant inventories.
+#   - Posture Changes Since Baseline (INFO): controls that got worse or
+#     better. Not scored, because those controls already carry their own
+#     status in this run (scoring them again would double-count).
+
+# Inventories whose new items are a security signal.
+typeset -ga BASELINE_TRACKED_CONTROLS
+BASELINE_TRACKED_CONTROLS=(
+    'Autostart Inventory (Apps & Scripts)' 'Login Items & Background Task Inventory'
+    'Admin Group Membership Inventory' 'Full Disk Access Grants' 'Screen Recording Grants' 'Accessibility Grants'
+    'Browser Extensions Inventory' 'Third-Party System Extensions Inventory' 'Third-Party Kernel Extension Inventory'
+    'Installed Profiles Inventory' 'Privileged Helper Tools' 'SSH Authorized Keys Inventory'
+)
+# Inventories that change too often to score; reported in the INFO finding.
+typeset -ga BASELINE_INFO_CONTROLS
+BASELINE_INFO_CONTROLS=('Listening Ports Inventory' 'Installed Applications Inventory')
+
+# JXA: prints "@meta\x1f<ComputerName>\x1f<ScanStartTime>" then one
+# "<control>\x1f<status>\x1f<details with \x1e between lines>" per finding.
+typeset -g BASELINE_JXA
+read -r -d '' BASELINE_JXA <<'JXA'
+ObjC.import('Foundation');
+function run(argv) {
+    var s = $.NSString.stringWithContentsOfFileEncodingError(argv[0], $.NSUTF8StringEncoding, null);
+    if (s.isNil()) throw new Error('cannot read ' + argv[0]);
+    var d = JSON.parse(ObjC.unwrap(s));
+    if (!d || !Array.isArray(d.Findings)) throw new Error('not an EndpointPostureCheck JSON export');
+    var c = function (v) { return String(v == null ? '' : v).replace(/[\x1e\x1f\r]/g, ' '); };
+    var out = ['@meta\x1f' + c(d.ComputerName) + '\x1f' + c(d.ScanStartTime)];
+    d.Findings.forEach(function (f) {
+        out.push([c(f.Control), c(f.Status), c(f.Details).split('\n').join('\x1e')].join('\x1f'));
+    });
+    return out.join('\n');
+}
+JXA
+
+compare_with_baseline() {
+    local baseline_path="$1" raw="" line="" control="" bstatus="" bdetails="" meta_host="" meta_time="" i=""
+    local -A base_status base_details
+    raw=$(osascript -l JavaScript -e "$BASELINE_JXA" "$baseline_path" 2>&1)
+    if [[ $? -ne 0 || "$raw" != @meta* ]]; then
+        add_audit_result --category 'Baseline Comparison' --control 'Baseline Comparison' \
+            --status WARN --severity Low --current "Could not read baseline $baseline_path: ${raw[1,200]}" \
+            --recommended 'A JSON export from an earlier run of this tool' --cis-macos 'N/A' --mscp 'N/A' \
+            --recommendation 'Pass a file written by --export-json from a previous run.'
+        return 0
+    fi
+    for line in "${(@f)raw}"; do
+        IFS=$'\x1f' read -r control bstatus bdetails <<< "$line"
+        if [[ "$control" == @meta ]]; then
+            meta_host="$bstatus"; meta_time="$bdetails"; continue
+        fi
+        base_status[$control]="$bstatus"; base_details[$control]="$bdetails"
+    done
+
+    local -a new_items removed_items regressions improvements info_changes
+    local -A rank
+    rank=(PASS 0 WARN 1 FAIL 2)
+    local cur_status="" cur_details="" item="" was="" now=""
+    local -a cur_list base_list
+    for (( i = 1; i <= ${#AUDIT_CONTROL[@]}; i++ )); do
+        control="${AUDIT_CONTROL[$i]}"; cur_status="${AUDIT_STATUS[$i]}"; cur_details="${AUDIT_DETAILS[$i]}"
+        [[ -n "${base_status[$control]+x}" ]] || continue
+        was="${base_status[$control]}"; now="$cur_status"
+        if [[ -n "${rank[$was]:-}" && -n "${rank[$now]:-}" && "$was" != "$now" ]]; then
+            if (( rank[$now] > rank[$was] )); then regressions+=("$control: $was -> $now")
+            else improvements+=("$control: $was -> $now"); fi
+        fi
+        if (( ${BASELINE_TRACKED_CONTROLS[(Ie)$control]} || ${BASELINE_INFO_CONTROLS[(Ie)$control]} )); then
+            cur_list=("${(@f)cur_details}"); cur_list=(${cur_list:#})
+            base_list=("${(@ps:\x1e:)base_details[$control]}"); base_list=(${base_list:#})
+            for item in "${cur_list[@]}"; do
+                (( ${base_list[(Ie)$item]} )) && continue
+                if (( ${BASELINE_TRACKED_CONTROLS[(Ie)$control]} )); then new_items+=("+ [$control] $item")
+                else info_changes+=("+ [$control] $item"); fi
+            done
+            for item in "${base_list[@]}"; do
+                (( ${cur_list[(Ie)$item]} )) && continue
+                if (( ${BASELINE_TRACKED_CONTROLS[(Ie)$control]} )); then removed_items+=("- [$control] $item")
+                else info_changes+=("- [$control] $item"); fi
+            done
+        fi
+    done
+
+    local since="${meta_time:-unknown time}${meta_host:+ on $meta_host}"
+    [[ -n "$meta_host" && "$meta_host" != "$COMPUTER_NAME" ]] && since+=" (a different computer)"
+    local -a fw
+    fw=(--recommended 'No unexpected new persistence, privilege or extension items since the baseline'
+        --cis 'CIS 1.1, 2.1, 4.1' --nist 'CM-3, CM-8(3), SI-4' --mitre 'T1543 (Create or Modify System Process), T1098 (Account Manipulation)'
+        --iso27001 'A.8.9' --nis2 'Art.21(2)(d)' --cis-macos 'N/A' --mscp 'N/A')
+    if [[ ${#new_items[@]} -gt 0 ]]; then
+        add_audit_result --category 'Baseline Comparison' --control 'New Privileged & Persistence Items Since Baseline' \
+            --status WARN --severity Medium --current "${#new_items[@]} new item(s) since $since${removed_items:+; ${#removed_items[@]} removed}" \
+            --details "${(F)new_items}${removed_items:+$NL${(F)removed_items}}" "${fw[@]}" \
+            --recommendation 'Confirm each new item was an intended change (software install, admin change, granted permission). Unexplained new autostart items, admin members, Full Disk Access grants or extensions are a common sign of compromise.'
+    else
+        local -a removed_flag
+        (( ${#removed_items[@]} )) && removed_flag=(--details "${(F)removed_items}")
+        add_audit_result --category 'Baseline Comparison' --control 'New Privileged & Persistence Items Since Baseline' \
+            --status PASS --severity Medium --current "No new items in ${#BASELINE_TRACKED_CONTROLS[@]} tracked inventories since $since${removed_items:+ (${#removed_items[@]} removed)}" \
+            "${removed_flag[@]}" "${fw[@]}" --recommendation 'No action required.'
+    fi
+    local -a changes
+    changes=("${regressions[@]/#/worse: }" "${improvements[@]/#/better: }" "${info_changes[@]}")
+    changes=(${changes:#})
+    add_audit_result --category 'Baseline Comparison' --control 'Posture Changes Since Baseline' \
+        --status INFO --severity Informational \
+        --current "${#regressions[@]} control(s) worse, ${#improvements[@]} better since $since" \
+        --details "${(F)changes}" --recommended 'N/A' --cis-macos 'N/A' --mscp 'N/A' \
+        --recommendation 'Informational. Controls that got worse are already scored in this run; review why they changed.'
+    BASELINE_SUMMARY="${#new_items[@]} new tracked item(s), ${#regressions[@]} control(s) worse, ${#improvements[@]} better (baseline: $since)"
+}
+
 # ---- 99-main.zsh ----
 #
 # Main orchestration: version-support check, run every registered audit
@@ -7794,8 +8158,14 @@ main() {
     _run_all_checks
     prefetch_cleanup
 
+    if [[ -n "${BASELINE_PATH:-}" ]]; then
+        write_section_banner 'Baseline Comparison'
+        compare_with_baseline "$BASELINE_PATH"
+    fi
+
     get_compliance_posture
     _print_audit_summary
+    [[ -n "${BASELINE_SUMMARY:-}" ]] && echo "  Baseline: $BASELINE_SUMMARY" && echo ''
 
     _resolve_output_paths
 
@@ -7901,6 +8271,7 @@ AUDIT_CHECKS=(
     check_safari_auto_open_safe_downloads check_safari_developer_menu_note check_safari_fraudulent_site_warning
     check_safari_cross_site_tracking_prevention check_safari_advertising_privacy_protection
     check_safari_show_full_website_address check_safari_show_status_bar check_terminal_secure_keyboard_entry
+    check_browser_extensions_inventory check_browser_extension_risk
     # Domain 24: Ransomware Resilience & Recovery
     check_time_machine_configured_and_recent check_time_machine_encryption check_local_apfs_snapshots
     check_time_machine_auto_backup
