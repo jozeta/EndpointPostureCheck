@@ -56,6 +56,10 @@ after changing the sources.
   with the reason), never a guessed `PASS`/`FAIL`. Statuses are `PASS`, `WARN`, `FAIL`, `INFO`.
 - **Defaults aren't findings:** don't flag normal OS-default states as failures.
 - **No duplicate or contradictory checks** that evaluate the same setting differently.
+- **Never put file- or user-derived values into zsh arithmetic** (`(( ))`, `$(( ))`, or
+  `[[ -lt/-le/-eq ... ]]`): zsh evaluates command substitution inside array subscripts there,
+  so a value like `path[$(cmd)]` from a user's preference or JSON file runs as root during an
+  audit. Validate with `[[ $v == <-> ]]` (digits only) first, or compare as strings.
 - **Performance-bounded:** file and log sweeps are capped, never full-disk recursion.
 - Remediation scripts must support `-WhatIf` and require `-Force` (Windows) before changing
   anything. Never make the auditor itself change system state.

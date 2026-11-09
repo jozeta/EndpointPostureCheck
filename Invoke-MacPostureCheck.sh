@@ -1,5 +1,5 @@
 #!/usr/bin/env zsh
-# EndpointPostureCheck for macOS — built 2026-11-09 21:50:14 from src/*.zsh. Do not edit directly.
+# EndpointPostureCheck for macOS — built 2026-11-09 21:53:06 from src/*.zsh. Do not edit directly.
 
 # ---- 00-header.zsh ----
 #
@@ -5037,7 +5037,11 @@ _screen_lock_state() {
     local managed="" managed_delay="" legacy="" legacy_delay=""
     managed=$(managed_pref_read com.apple.screensaver askForPassword)
     managed_delay=$(managed_pref_read com.apple.screensaver askForPasswordDelay)
+    # Delays reach arithmetic comparisons, and the legacy one comes from a
+    # preference file the user controls: accept digits only (anything else
+    # is "unknown"), never let it be evaluated as an expression.
     if [[ "$managed" == 1 ]]; then
+        [[ -z "$managed_delay" || "$managed_delay" == <-> ]] || { print -r -- "unknown profile"; return 0; }
         print -r -- "${managed_delay:-0} profile"; return 0
     elif [[ "$managed" == 0 ]]; then
         print -r -- "off profile"; return 0
@@ -5054,6 +5058,7 @@ _screen_lock_state() {
         legacy=$(defaults_read_as_user_safe com.apple.screensaver askForPassword '')
         legacy_delay=$(defaults_read_as_user_safe com.apple.screensaver askForPasswordDelay '')
         if [[ "$legacy" == 1 ]]; then
+            [[ -z "$legacy_delay" || "$legacy_delay" == <-> ]] || { print -r -- "unknown legacy-preference"; return 0; }
             print -r -- "${legacy_delay:-0} legacy-preference"; return 0
         elif [[ "$legacy" == 0 ]]; then
             print -r -- "off legacy-preference"; return 0
@@ -5091,6 +5096,7 @@ check_screensaver_grace_period() {
     local -a fw
     fw=(--recommended '<= 5 seconds' --cis 'CIS 4.2' --nist 'AC-11' --cis-macos 'CIS-macOS 2.11.2'
         --mscp 'system_settings_screensaver_ask_for_password_delay_enforce')
+    [[ "$delay" == off || "$delay" == <-> ]] || delay=unknown
     if [[ "$delay" == unknown ]]; then
         add_audit_result --category 'Screen Lock & Physical Access' --control 'Screensaver Password Grace Period' \
             --status WARN --severity Low --current 'Unable to determine the screen lock delay' "${fw[@]}" \
@@ -5099,7 +5105,7 @@ check_screensaver_grace_period() {
         add_audit_result --category 'Screen Lock & Physical Access' --control 'Screensaver Password Grace Period' \
             --status WARN --severity Medium --current "No screen lock (source: $source)" "${fw[@]}" \
             --recommendation 'Turn on the screen lock password (see Screensaver Password Requirement) with a delay of 5 seconds or less.'
-    elif (( delay <= 5 )); then
+    elif [[ "$delay" == <-> ]] && (( delay <= 5 )); then
         add_audit_result --category 'Screen Lock & Physical Access' --control 'Screensaver Password Grace Period' \
             --status PASS --severity Medium --current "$( (( delay == 0 )) && print immediate || print "${delay}s") (source: $source)" "${fw[@]}" \
             --recommendation 'No action required.'
@@ -5717,7 +5723,7 @@ function firefox(prof) {
         if (a.type !== 'extension' || /^app-(builtin|system-defaults|system-addons)$/.test(a.location)) return;
         var up = a.userPermissions || {};
         out.push([a.id, (a.defaultLocale && a.defaultLocale.name) || a.id, a.version, a.location, a.sourceURI || '', a.active ? 1 : 0,
-            a.signedState == null ? '' : a.signedState, (up.permissions || []).join(','), (up.origins || []).join(',')].map(clean).join('\x1f'));
+            typeof a.signedState === 'number' ? String(a.signedState | 0) : '', (up.permissions || []).join(','), (up.origins || []).join(',')].map(clean).join('\x1f'));
     });
     return out.join('\n');
 }
@@ -5780,7 +5786,13 @@ _extension_risk_reasons() {
     local p="" url="" from_store=0 broad=0
     if [[ "$browser" == Firefox ]]; then
         [[ "$location" != app-profile ]] && reasons+=("sideloaded or temporary (location $location)")
-        [[ "$signed" == <-> ]] || [[ "$signed" == -* ]] && (( signed <= 0 )) && reasons+=("unsigned (signedState $signed)")
+        # signedState comes from a file the user controls. Never put it in an
+        # arithmetic context: zsh evaluates arithmetic (including command
+        # substitution in subscripts), which would run user input as root.
+        # Validate the shape, then compare as strings.
+        if [[ "$signed" == (-|)<-> ]] && [[ "$signed" == -* || "$signed" == 0 ]]; then
+            reasons+=("unsigned (signedState $signed)")
+        fi
     else
         for url in "${EXTENSION_STORE_URLS[@]}"; do [[ "$update" == *"$url"* ]] && from_store=1; done
         case "$location" in
@@ -5826,8 +5838,8 @@ check_browser_extensions_inventory() {
         IFS='|' read -r browser prof user rest <<< "$rec"
         IFS=$'\x1f' read -r id name version location update enabled signed perms hosts <<< "$rest"
         profiles[$browser/$prof/$user]=1
-        (( enabled )) && enabled_count=$((enabled_count + 1))
-        lines+=("[$browser $prof, $user] $name ${version:+v$version} ($( (( enabled )) && print on || print off), $(_extension_source_label "$browser" "$location"))")
+        [[ "$enabled" == 1 ]] && enabled_count=$((enabled_count + 1))
+        lines+=("[$browser $prof, $user] $name ${version:+v$version} ($( [[ "$enabled" == 1 ]] && print on || print off), $(_extension_source_label "$browser" "$location"))")
     done
     if [[ -n "$CONSOLE_USER" ]]; then
         run_as_user pluginkit -mA -p com.apple.Safari.web-extension
@@ -5852,7 +5864,7 @@ check_browser_extension_risk() {
         [[ -z "$rec" ]] && continue
         IFS='|' read -r browser prof user rest <<< "$rec"
         IFS=$'\x1f' read -r id name version location update enabled signed perms hosts <<< "$rest"
-        (( enabled )) || continue
+        [[ "$enabled" == 1 ]] || continue
         total=$((total + 1))
         reasons=$(_extension_risk_reasons "$browser" "$location" "$update" "$signed" "$perms" "$hosts")
         [[ -n "$reasons" ]] && flagged+=("[$browser $prof, $user] $name ($id): $reasons")
@@ -8006,6 +8018,8 @@ compare_with_baseline() {
     done
 
     local -a new_items removed_items regressions improvements info_changes
+    # Statuses come from the baseline file: compared through a fixed table,
+    # never in an arithmetic context.
     local -A rank
     rank=(PASS 0 WARN 1 FAIL 2)
     local cur_status="" cur_details="" item="" was="" now=""
@@ -8015,7 +8029,7 @@ compare_with_baseline() {
         [[ -n "${base_status[$control]+x}" ]] || continue
         was="${base_status[$control]}"; now="$cur_status"
         if [[ -n "${rank[$was]:-}" && -n "${rank[$now]:-}" && "$was" != "$now" ]]; then
-            if (( rank[$now] > rank[$was] )); then regressions+=("$control: $was -> $now")
+            if [[ "${rank[$now]}" > "${rank[$was]}" ]]; then regressions+=("$control: $was -> $now")
             else improvements+=("$control: $was -> $now"); fi
         fi
         if (( ${BASELINE_TRACKED_CONTROLS[(Ie)$control]} || ${BASELINE_INFO_CONTROLS[(Ie)$control]} )); then

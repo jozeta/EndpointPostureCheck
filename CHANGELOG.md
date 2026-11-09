@@ -6,6 +6,11 @@ The project has no tagged releases yet, so changes are grouped by date. Entries 
 
 ## Unreleased
 
+- **Security (macOS):** a user-controlled value could run commands as root during an audit. The
+  screen-lock fallback read `askForPasswordDelay` from the user's own preferences and compared it
+  in a zsh arithmetic context, which executes `$(...)` inside an array subscript. Fixed by
+  accepting digits only; regression tests use a working exploit payload. (The same pattern in the
+  new browser-extension check was caught before release.)
 - macOS: XProtect Remediator scan results (7-day unified log): any result other than NoThreatDetected
   is a FAIL, since it means macOS found malware
 - macOS: Electron apps whose Node execution fuses are on (RunAsNode, NODE_OPTIONS, `--inspect`),
