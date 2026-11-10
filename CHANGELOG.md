@@ -6,6 +6,15 @@ The project has no tagged releases yet, so changes are grouped by date. Entries 
 
 ## Unreleased
 
+- Windows: fixed a parse error that stopped the whole script from running since the
+  attack-path batch (`"$pw:"` in the OpenSSH check reads as a drive-qualified variable).
+  PSScriptAnalyzer reported the file clean; CI now parses every .ps1 in both Windows PowerShell
+  5.1 and PowerShell 7 (`ci/Test-PowerShellParse.ps1`) and runs the full audit, which found it.
+- Dashboard (both editions): new Inventory section for structured tables, with tabs, search,
+  tag filters, sorting, row details, links between tables and a CSV download of the current
+  view. The data is embedded as JSON and rendered with textContent only; the JSON export carries
+  the same tables under "Inventory".
+
 - macOS: the "Third-Party Services Listening on the Network" check read the application firewall
   state from `/Library/Preferences/com.apple.alf`, which macOS 15+ no longer uses, so it always
   said "state unknown" and scored Medium. It now asks `socketfilterfw`.

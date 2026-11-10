@@ -8719,7 +8719,7 @@ function Test-OpenSSHServerSecurity {
         }
         $issues = [System.Collections.Generic.List[string]]::new()
         $pw = if ($opts.ContainsKey('passwordauthentication')) { $opts['passwordauthentication'] } else { 'yes (default)' }
-        if ($pw -notmatch '^(?i)no$') { $issues.Add("PasswordAuthentication $pw: passwords can be brute-forced over SSH") }
+        if ($pw -notmatch '^(?i)no$') { $issues.Add("PasswordAuthentication ${pw}: passwords can be brute-forced over SSH") }
         if ($opts['permitemptypasswords'] -match '^(?i)yes$') { $issues.Add('PermitEmptyPasswords yes') }
         if ($opts['permituserenvironment'] -and $opts['permituserenvironment'] -notmatch '^(?i)no$') { $issues.Add("PermitUserEnvironment $($opts['permituserenvironment'])") }
         $state = "service $($svc.State), start mode $($svc.StartMode)"
@@ -9597,8 +9597,8 @@ function New-HtmlReport {
     $scoreText = ([double]$Posture.Score).ToString([System.Globalization.CultureInfo]::InvariantCulture)
 
     $html = Get-HtmlTemplate
-    # Content tokens first; the design-system sprite and CSS go in last, so no text inside
-    # them is ever mistaken for a token.
+    # Content tokens first, then the design-system sprite and CSS, so no text inside them is
+    # ever mistaken for a token; the inventory JSON (collected data) goes in very last.
     $tokens = [ordered]@{
         '{{COMPUTERNAME}}'     = (Get-HtmlEncoded $Script:ComputerName)
         '{{OSINFO}}'           = (Get-HtmlEncoded $osInfo)
@@ -9635,6 +9635,8 @@ function New-HtmlReport {
         '{{TABLE_ROWS}}'       = $rowsSb.ToString()
         '{{LADA_SPRITE}}'      = $assets.Sprite
         '{{LADA_CSS}}'         = $assets.Css
+        # Last: collected data must never be scanned for the other tokens.
+        '{{INVENTORY_JSON}}'   = (ConvertTo-InventoryJson)
     }
     foreach ($t in $tokens.GetEnumerator()) { $html = $html.Replace($t.Key, [string]$t.Value) }
 
@@ -9719,6 +9721,33 @@ button.pc-kpi[aria-pressed="true"] { box-shadow: var(--lg-shadow), 0 0 0 2px var
 .pc-sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
 .pc-empty-row td { text-align: center; color: var(--lg-muted); padding: var(--lg-space-xl); }
 footer.pc-foot { text-align: center; padding: var(--lg-space-s) 0 var(--lg-space-l); }
+/* Inventory tables (processes, services, network, firewall rules) */
+#inventory { scroll-margin-top: var(--lg-space-m); }
+.pc-inv-tabs { flex-wrap: wrap; }
+.pc-inv-flags { display: flex; flex-wrap: wrap; gap: 4px; }
+.pc-inv-flag { font: inherit; font-size: var(--lg-fs-small); cursor: pointer; border-radius: 999px; padding: 1px 9px;
+               border: 1px solid var(--lg-line-2); background: transparent; color: var(--lg-muted); }
+.pc-inv-flag[aria-pressed="true"] { border-color: color-mix(in srgb, var(--lg-accent) 45%, transparent); color: var(--lg-text);
+                                    background: color-mix(in srgb, var(--lg-accent) 14%, transparent); }
+.pc-inv-flag.pc-bad { color: var(--lg-bad-text); } .pc-inv-flag.pc-warn { color: var(--lg-warn-text); }
+.pc-inv-table { font-size: var(--lg-fs-small); }
+.pc-inv-table th { white-space: nowrap; }
+.pc-inv-table th button { font: inherit; color: inherit; letter-spacing: inherit; text-transform: inherit; background: none; border: 0;
+                          padding: 0; cursor: pointer; display: inline-flex; align-items: center; gap: 3px; }
+.pc-inv-table th[aria-sort] button { color: var(--lg-text); }
+.pc-inv-table td { max-width: 34ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: top; }
+.pc-inv-table td.pc-num { text-align: right; font-variant-numeric: tabular-nums; }
+.pc-inv-table td.pc-path { font-family: var(--lg-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace); font-size: 11.5px; }
+.pc-inv-table td.pc-inv-wrap { white-space: normal; overflow: visible; }
+.pc-inv-table .lg-chip { font-size: 10.5px; margin: 0 3px 2px 0; }
+.pc-inv-ref { font: inherit; color: var(--lg-accent); background: none; border: 0; padding: 0; cursor: pointer; text-decoration: underline; }
+.pc-inv-ref + .pc-inv-ref::before { content: ", "; color: var(--lg-muted); text-decoration: none; display: inline-block; white-space: pre; }
+.pc-inv-row { cursor: pointer; }
+.pc-inv-row[aria-expanded="true"] { background: color-mix(in srgb, var(--lg-accent) 8%, transparent); }
+.pc-inv-detail td { max-width: none; white-space: normal; background: color-mix(in srgb, var(--lg-text) 3%, transparent); }
+.pc-inv-detail dl { display: grid; grid-template-columns: minmax(110px, max-content) 1fr; gap: 4px 14px; margin: 4px 0; }
+.pc-inv-detail dt { color: var(--lg-muted); } .pc-inv-detail dd { margin: 0; overflow-wrap: anywhere; white-space: pre-wrap; }
+.pc-inv-foot { display: flex; justify-content: space-between; align-items: center; gap: var(--lg-space-s); flex-wrap: wrap; }
 [hidden] { display: none !important; }
 @media (max-width: 760px) {
   .pc-domains, .pc-domains-label { display: none !important; }
@@ -9732,7 +9761,7 @@ footer.pc-foot { text-align: center; padding: var(--lg-space-s) 0 var(--lg-space
   .pc-table td:first-child::before { display: none; }
 }
 @media print {
-  .lg-sidebar, .pc-toolbar, .pc-theme { display: none !important; }
+  .lg-sidebar, .pc-toolbar, .pc-theme, .pc-inv-flags, #invMore { display: none !important; }
   .lg-app { grid-template-columns: minmax(0, 1fr); }
   .finding-row[hidden] { display: table-row !important; }
 }
@@ -9747,6 +9776,7 @@ footer.pc-foot { text-align: center; padding: var(--lg-space-s) 0 var(--lg-space
       <a href="#sec-overview"><svg class="lg-icon" aria-hidden="true"><use href="#overview"/></svg>Overview</a>
       <a href="#system"><svg class="lg-icon" aria-hidden="true"><use href="#app"/></svg>System</a>
       <a href="#findings"><svg class="lg-icon" aria-hidden="true"><use href="#list"/></svg>Findings</a>
+      <a href="#inventory" id="navInventory"><svg class="lg-icon" aria-hidden="true"><use href="#layers"/></svg>Inventory</a>
     </div>
     <p class="lg-label pc-domains-label" style="margin-top: var(--lg-space-m); padding-left: var(--lg-space-s);">Domains</p>
     <div class="lg-nav pc-domains">
@@ -9832,6 +9862,32 @@ footer.pc-foot { text-align: center; padding: var(--lg-space-s) 0 var(--lg-space
         </table>
       </div>
     </section>
+    <section id="inventory" class="lg-card lg-stack" aria-labelledby="h-inventory" hidden>
+      <div class="lg-header">
+        <div class="lg-row">
+          <h2 class="lg-label" id="h-inventory" style="margin: 0;">Inventory</h2>
+          <button type="button" class="pc-filter-chip" id="invColChip" hidden aria-label="Clear link filter"><span id="invColChipText"></span><svg class="lg-icon" aria-hidden="true"><use href="#x"/></svg></button>
+        </div>
+        <span class="lg-muted lg-small" id="invCount" aria-live="polite"></span>
+      </div>
+      <div class="lg-tabs pc-inv-tabs" role="tablist" aria-label="Inventory" id="invTabs"></div>
+      <p class="lg-muted lg-small" id="invNote" style="margin: 0;"></p>
+      <div class="pc-toolbar">
+        <label class="pc-grow"><span class="pc-sr">Search inventory</span><svg class="lg-icon" aria-hidden="true"><use href="#search"/></svg>
+          <input type="search" class="lg-input" id="invSearch" placeholder="Search this table"></label>
+        <button type="button" class="lg-btn" id="invCsv"><svg class="lg-icon" aria-hidden="true"><use href="#download"/></svg>CSV</button>
+      </div>
+      <div class="pc-inv-flags" id="invFlags" aria-label="Filter by tag"></div>
+      <div class="lg-table-wrap">
+        <table class="lg-table pc-inv-table">
+          <thead><tr id="invHead"></tr></thead>
+          <tbody id="invBody"></tbody>
+        </table>
+      </div>
+      <div class="pc-inv-foot"><span class="lg-muted lg-small">Click a row for every field; linked values open the matching rows in another table.</span>
+        <button type="button" class="lg-btn" id="invMore" hidden>Show more</button></div>
+      <script type="application/json" id="inventoryData">{{INVENTORY_JSON}}</script>
+    </section>
     <footer class="pc-foot lg-muted lg-small">EndpointPostureCheck for Windows &middot; {{CRITICAL_FAILS}} critical and {{HIGH_FAILS}} high-severity failure(s) &middot; read-only audit, no system changes made &middot; L&aring;da Glass {{LADA_VERSION}}</footer>
   </main>
 </div>
@@ -9896,11 +9952,11 @@ footer.pc-foot { text-align: center; padding: var(--lg-space-s) 0 var(--lg-space
   // The current section is the last one whose top has scrolled up to the top
   // edge (the first section wins at the very top of the page).
   // Note: "sec-overview", not "overview", which is a sprite symbol id.
-  var sectionIds = ['sec-overview', 'system', 'findings'], spyQueued = false;
+  var sectionIds = ['sec-overview', 'system', 'findings', 'inventory'], spyQueued = false;
   function spy() {
     spyQueued = false;
     var line = 80, current = sectionIds[0];
-    sectionIds.forEach(function (id) { if (doc.getElementById(id).getBoundingClientRect().top <= line) current = id; });
+    sectionIds.forEach(function (id) { var e = doc.getElementById(id); if (e && !e.hidden && e.getBoundingClientRect().top <= line) current = id; });
     sectionLinks.forEach(function (l) {
       if (l.getAttribute('href') === '#' + current) l.setAttribute('aria-current', 'location'); else l.removeAttribute('aria-current');
     });
@@ -9953,10 +10009,246 @@ footer.pc-foot { text-align: center; padding: var(--lg-space-s) 0 var(--lg-space
 
   apply();
 })();
+// Inventory tables. Data comes from the embedded JSON and is rendered with textContent only.
+(function () {
+  var doc = document;
+  var section = doc.getElementById('inventory'), navLink = doc.getElementById('navInventory');
+  var data = null;
+  try { data = JSON.parse(doc.getElementById('inventoryData').textContent); } catch (e) { data = null; }
+  var tables = (data && data.tables ? data.tables : []).filter(function (t) { return t && t.columns && t.rows; });
+  if (!tables.length) { if (navLink) navLink.hidden = true; return; }
+  section.hidden = false;
+  var $ = function (id) { return doc.getElementById(id); };
+  var tabsEl = $('invTabs'), noteEl = $('invNote'), headEl = $('invHead'), bodyEl = $('invBody'), countEl = $('invCount'),
+      searchEl = $('invSearch'), flagsEl = $('invFlags'), moreBtn = $('invMore'), colChip = $('invColChip');
+  var PAGE = 200;
+  var st = { t: 0, q: '', flags: [], sort: -1, dir: 1, limit: PAGE, link: null };
+  function el(tag, cls, text) { var e = doc.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
+  function cur() { return tables[st.t]; }
+  function colIndex(t, label) { for (var i = 0; i < t.columns.length; i++) if (t.columns[i].label === label) return i; return -1; }
+  function typeIndex(t, type) { for (var i = 0; i < t.columns.length; i++) if (t.columns[i].type === type) return i; return -1; }
+  function splitList(v) { return String(v == null ? '' : v).split(',').map(function (s) { return s.trim(); }).filter(Boolean); }
+  function flagTone(f) { var c = f.charAt(f.length - 1); return c === '!' ? 'bad' : c === '?' ? 'warn' : ''; }
+  function flagText(f) { return /[!?]$/.test(f) ? f.slice(0, -1) : f; }
+  function searchText(r) { if (r._s == null) r._s = r.join(' \u0001 ').toLowerCase(); return r._s; }
+  function rowMatches(t, r, fi) {
+    if (st.link && String(r[st.link.i]) !== st.link.v) return false;
+    if (st.flags.length) { var have = splitList(r[fi]); for (var k = 0; k < st.flags.length; k++) if (have.indexOf(st.flags[k]) < 0) return false; }
+    return !st.q || searchText(r).indexOf(st.q) >= 0;
+  }
+  function filtered() {
+    var t = cur(), fi = typeIndex(t, 'flags'), out = t.rows.filter(function (r) { return rowMatches(t, r, fi); });
+    if (st.sort >= 0) {
+      var i = st.sort, num = t.columns[i].type === 'num';
+      out.sort(function (a, b) {
+        if (num) { var x = parseFloat(a[i]), y = parseFloat(b[i]); x = isNaN(x) ? -Infinity : x; y = isNaN(y) ? -Infinity : y; return (x - y) * st.dir; }
+        return String(a[i]).localeCompare(String(b[i]), undefined, { numeric: true, sensitivity: 'base' }) * st.dir;
+      });
+    }
+    return out;
+  }
+  function openLink(ref, value) {
+    var dot = ref.indexOf('.'), id = ref.slice(0, dot), label = ref.slice(dot + 1);
+    for (var n = 0; n < tables.length; n++) {
+      if (tables[n].id !== id) continue;
+      var ci = colIndex(tables[n], label); if (ci < 0) return;
+      st = { t: n, q: '', flags: [], sort: -1, dir: 1, limit: PAGE, link: { i: ci, v: value, label: label } };
+      searchEl.value = ''; render();
+      var top = section.getBoundingClientRect().top; if (top < 0 || top > window.innerHeight * 0.5) section.scrollIntoView({ block: 'start' });
+      return;
+    }
+  }
+  function cell(t, ci, v) {
+    var c = t.columns[ci], td = el('td');
+    td.setAttribute('data-label', c.label);
+    if (c.type === 'num') td.className = 'pc-num';
+    if (c.type === 'path') td.className = 'pc-path';
+    if (c.type === 'flags') {
+      td.className = 'pc-inv-wrap';
+      splitList(v).forEach(function (f) { var tone = flagTone(f); td.appendChild(el('span', 'lg-chip lg-plain' + (tone ? ' lg-' + tone : ''), flagText(f))); });
+      return td;
+    }
+    if (c.type === 'ref' && c.ref && v) {
+      td.className = 'pc-inv-wrap';
+      String(v).split(', ').forEach(function (part) {
+        if (!part) return;
+        var b = el('button', 'pc-inv-ref', part); b.type = 'button';
+        b.addEventListener('click', function (e) { e.stopPropagation(); openLink(c.ref, part); });
+        td.appendChild(b);
+      });
+      return td;
+    }
+    td.textContent = v == null ? '' : v; td.title = td.textContent;
+    return td;
+  }
+  function toggleDetail(tr, t, r) {
+    var next = tr.nextSibling;
+    if (next && next.className === 'pc-inv-detail') { bodyEl.removeChild(next); tr.setAttribute('aria-expanded', 'false'); return; }
+    var d = el('tr', 'pc-inv-detail'), td = el('td'), dl = el('dl');
+    td.colSpan = t.columns.length;
+    t.columns.forEach(function (c, i) { if (r[i] === '' || r[i] == null) return; dl.appendChild(el('dt', '', c.label)); dl.appendChild(el('dd', '', r[i])); });
+    td.appendChild(dl); d.appendChild(td); bodyEl.insertBefore(d, tr.nextSibling); tr.setAttribute('aria-expanded', 'true');
+  }
+  function renderTabs() {
+    tabsEl.textContent = '';
+    tables.forEach(function (t, n) {
+      var b = el('button', 'lg-tab', t.title + ' (' + t.rows.length + ')'); b.type = 'button';
+      b.setAttribute('role', 'tab'); b.setAttribute('aria-selected', n === st.t ? 'true' : 'false');
+      b.addEventListener('click', function () { st = { t: n, q: '', flags: [], sort: -1, dir: 1, limit: PAGE, link: null }; searchEl.value = ''; render(); });
+      tabsEl.appendChild(b);
+    });
+  }
+  function renderFlags(t) {
+    flagsEl.textContent = '';
+    var fi = typeIndex(t, 'flags'); if (fi < 0) { flagsEl.hidden = true; return; }
+    var counts = {}, order = [];
+    t.rows.forEach(function (r) { splitList(r[fi]).forEach(function (f) { if (!counts[f]) { counts[f] = 0; order.push(f); } counts[f]++; }); });
+    order.sort(function (a, b) { var ta = flagTone(a) ? 0 : 1, tb = flagTone(b) ? 0 : 1; return ta - tb || counts[b] - counts[a]; });
+    flagsEl.hidden = !order.length;
+    order.forEach(function (f) {
+      var tone = flagTone(f), b = el('button', 'pc-inv-flag' + (tone ? ' pc-' + tone : ''), flagText(f) + ' ' + counts[f]); b.type = 'button';
+      b.setAttribute('aria-pressed', st.flags.indexOf(f) >= 0 ? 'true' : 'false');
+      b.addEventListener('click', function () { var k = st.flags.indexOf(f); if (k >= 0) st.flags.splice(k, 1); else st.flags.push(f); st.limit = PAGE; render(); });
+      flagsEl.appendChild(b);
+    });
+  }
+  function render() {
+    var t = cur(), rows = filtered();
+    renderTabs(); renderFlags(t);
+    noteEl.textContent = t.note || ''; noteEl.hidden = !t.note;
+    headEl.textContent = '';
+    t.columns.forEach(function (c, i) {
+      var th = el('th'), b = el('button', '', c.label); th.scope = 'col'; b.type = 'button';
+      if (st.sort === i) th.setAttribute('aria-sort', st.dir > 0 ? 'ascending' : 'descending');
+      b.appendChild(el('span', 'lg-muted', st.sort === i ? (st.dir > 0 ? '\u25B2' : '\u25BC') : ''));
+      b.addEventListener('click', function () { if (st.sort === i) st.dir = -st.dir; else { st.sort = i; st.dir = c.type === 'num' ? -1 : 1; } render(); });
+      th.appendChild(b); headEl.appendChild(th);
+    });
+    bodyEl.textContent = '';
+    rows.slice(0, st.limit).forEach(function (r) {
+      var tr = el('tr', 'pc-inv-row'); tr.tabIndex = 0; tr.setAttribute('aria-expanded', 'false');
+      for (var i = 0; i < t.columns.length; i++) tr.appendChild(cell(t, i, r[i]));
+      tr.addEventListener('click', function () { toggleDetail(tr, t, r); });
+      tr.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleDetail(tr, t, r); } });
+      bodyEl.appendChild(tr);
+    });
+    if (!rows.length) { var tr = el('tr', 'pc-empty-row'), td = el('td', '', 'No rows match.'); td.colSpan = t.columns.length; tr.appendChild(td); bodyEl.appendChild(tr); }
+    moreBtn.hidden = rows.length <= st.limit;
+    countEl.textContent = Math.min(rows.length, st.limit) + ' shown, ' + rows.length + ' match, ' + t.rows.length + ' total';
+    colChip.hidden = !st.link;
+    $('invColChipText').textContent = st.link ? st.link.label + ' = ' + st.link.v : '';
+  }
+  searchEl.addEventListener('input', function () { st.q = searchEl.value.toLowerCase().trim(); st.limit = PAGE; render(); });
+  moreBtn.addEventListener('click', function () { st.limit += PAGE * 5; render(); });
+  colChip.addEventListener('click', function () { st.link = null; render(); });
+  $('invCsv').addEventListener('click', function () {
+    var t = cur();
+    var q = function (v) { v = String(v == null ? '' : v); if (/^[=+\-@\t\r]/.test(v)) v = "'" + v; return '"' + v.replace(/"/g, '""') + '"'; };
+    var lines = [t.columns.map(function (c) { return q(c.label); }).join(',')];
+    filtered().forEach(function (r) { lines.push(t.columns.map(function (c, i) { return q(r[i]); }).join(',')); });
+    var a = el('a'); a.href = URL.createObjectURL(new Blob([lines.join('\r\n')], { type: 'text/csv' })); a.download = t.id + '.csv';
+    doc.body.appendChild(a); a.click(); doc.body.removeChild(a); setTimeout(function () { URL.revokeObjectURL(a.href); }, 1000);
+  });
+  render();
+})();
 </script>
 </body>
 </html>
 '@
+}
+
+#endregion
+
+#region ============================== INVENTORY TABLES ==============================
+
+# Structured lists (processes, services, connections, firewall rules) shown as sortable,
+# filterable tables in the dashboard and carried in the JSON export. Never scored: checks that
+# find something risky in an inventory add a normal finding. Column spec: "Label" or
+# "Label:type", type = num | flags | path | ref=<tableId>.<Label>. Flags are comma-separated
+# tags; a trailing "!" marks a bad tag, "?" a warning tag. Same format as the macOS edition.
+$Script:InventoryTables = [System.Collections.Generic.List[object]]::new()
+$Script:InventoryIndex = @{}
+
+function New-InventoryTable {
+    [CmdletBinding()]
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Builds an in-memory report table')]
+    param(
+        [Parameter(Mandatory = $true)] [string]$Id,
+        [Parameter(Mandatory = $true)] [string]$Title,
+        [string]$Note = '',
+        [Parameter(Mandatory = $true)] [string[]]$Columns
+    )
+    $cols = [System.Collections.Generic.List[object]]::new()
+    foreach ($c in $Columns) {
+        $label = $c; $type = 'text'; $ref = ''
+        $i = $c.IndexOf(':')
+        if ($i -ge 0) { $label = $c.Substring(0, $i); $type = $c.Substring($i + 1) }
+        if ($type.StartsWith('ref=')) { $ref = $type.Substring(4); $type = 'ref' }
+        $cols.Add([ordered]@{ label = $label; type = $type; ref = $ref })
+    }
+    $table = [ordered]@{ id = $Id; title = $Title; note = $Note; columns = $cols; rows = [System.Collections.Generic.List[object]]::new() }
+    if ($Script:InventoryIndex.ContainsKey($Id)) { [void]$Script:InventoryTables.Remove($Script:InventoryIndex[$Id]) }
+    $Script:InventoryIndex[$Id] = $table
+    $Script:InventoryTables.Add($table)
+}
+
+function Add-InventoryRow {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)] [string]$Id,
+        [Parameter(Mandatory = $true)] [AllowEmptyCollection()] [AllowNull()] [object[]]$Values
+    )
+    if (-not $Script:InventoryIndex.ContainsKey($Id)) { return }
+    $row = [string[]]::new($Values.Count)
+    for ($i = 0; $i -lt $Values.Count; $i++) { $row[$i] = if ($null -eq $Values[$i]) { '' } else { [string]$Values[$i] } }
+    $Script:InventoryIndex[$Id].rows.Add($row)
+}
+
+# JSON string literal. "<", ">" and "&" are escaped too, so the JSON can sit inside a <script>
+# element. Only strings that need escaping take the (slower) regex path.
+function ConvertTo-JsonStringLiteral {
+    param([AllowNull()] [AllowEmptyString()] [string]$Value)
+    if ($null -eq $Value) { return '""' }
+    if ($Value -notmatch '[\x00-\x1f"\\<>&\u2028\u2029]') { return '"' + $Value + '"' }
+    $escaped = [regex]::Replace($Value, '[\x00-\x1f"\\<>&\u2028\u2029]', {
+            param($m)
+            switch ($m.Value) {
+                '"' { '\"' } '\' { '\\' } "`n" { '\n' } "`r" { '\r' } "`t" { '\t' }
+                default { '\u{0:x4}' -f [int][char]$m.Value }
+            }
+        })
+    return '"' + $escaped + '"'
+}
+
+function ConvertTo-InventoryJson {
+    $sb = [System.Text.StringBuilder]::new()
+    [void]$sb.Append('{"tables":[')
+    $firstTable = $true
+    foreach ($t in $Script:InventoryTables) {
+        if (-not $firstTable) { [void]$sb.Append(',') }; $firstTable = $false
+        [void]$sb.Append('{"id":').Append((ConvertTo-JsonStringLiteral $t.id)).Append(',"title":').Append((ConvertTo-JsonStringLiteral $t.title))
+        [void]$sb.Append(',"note":').Append((ConvertTo-JsonStringLiteral $t.note)).Append(',"columns":[')
+        $first = $true
+        foreach ($c in $t.columns) {
+            if (-not $first) { [void]$sb.Append(',') }; $first = $false
+            [void]$sb.Append('{"label":').Append((ConvertTo-JsonStringLiteral $c.label)).Append(',"type":').Append((ConvertTo-JsonStringLiteral $c.type))
+            [void]$sb.Append(',"ref":').Append((ConvertTo-JsonStringLiteral $c.ref)).Append('}')
+        }
+        [void]$sb.Append('],"rows":[')
+        $firstRow = $true
+        foreach ($r in $t.rows) {
+            if (-not $firstRow) { [void]$sb.Append(',') }; $firstRow = $false
+            [void]$sb.Append('[')
+            for ($i = 0; $i -lt $r.Count; $i++) {
+                if ($i) { [void]$sb.Append(',') }
+                [void]$sb.Append((ConvertTo-JsonStringLiteral $r[$i]))
+            }
+            [void]$sb.Append(']')
+        }
+        [void]$sb.Append(']}')
+    }
+    [void]$sb.Append(']}')
+    return $sb.ToString()
 }
 
 #endregion
@@ -10001,7 +10293,11 @@ function Export-JsonReport {
         Findings      = $Script:AuditResults
     }
 
-    $exportObject | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $OutputPath -Encoding UTF8 -Force
+    # Inventory is spliced in as already-serialised JSON (same text the dashboard embeds), so
+    # large tables never go through ConvertTo-Json.
+    $json = ($exportObject | ConvertTo-Json -Depth 6).TrimEnd()
+    $json = $json.Substring(0, $json.Length - 1).TrimEnd() + ",`n    `"Inventory`":  " + (ConvertTo-InventoryJson) + "`n}"
+    Set-Content -LiteralPath $OutputPath -Value $json -Encoding UTF8 -Force
 }
 
 #endregion

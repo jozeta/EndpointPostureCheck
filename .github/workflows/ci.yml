@@ -17,6 +17,12 @@ jobs:
         shell: pwsh
     steps:
       - uses: actions/checkout@v7
+      # PSScriptAnalyzer does not fail on parse errors, so parse explicitly in both shells.
+      - name: Parse check (PowerShell 7)
+        run: ./ci/Test-PowerShellParse.ps1
+      - name: Parse check (Windows PowerShell 5.1)
+        shell: powershell
+        run: ./ci/Test-PowerShellParse.ps1
       - name: Install PSScriptAnalyzer
         run: |
           Set-PSRepository PSGallery -InstallationPolicy Trusted
