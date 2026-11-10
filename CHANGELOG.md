@@ -6,6 +6,11 @@ The project has no tagged releases yet, so changes are grouped by date. Entries 
 
 ## Unreleased
 
+- macOS: found on the first sudo run on a real Mac and fixed: "Third-Party Kernel Extension
+  Inventory" counted kmutil's column header as a loaded kext when a stderr warning came first
+  (a WARN High on every Mac with no third-party kexts); firewall app rules in /Applications were
+  reported as replaceable by another account because the folder is the stock root:admin 0775.
+
 - Windows (173 checks): inventories in the dashboard and JSON export: processes (owner, CPU
   sampled over one second, RAM, binary, signature, listeners, hosted services, redacted command
   line), services (binary, ServiceDll, signature, writability), network connections, network

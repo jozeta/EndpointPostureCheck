@@ -1,5 +1,5 @@
 #!/usr/bin/env zsh
-# EndpointPostureCheck for macOS — built 2026-11-10 21:20:15 from src/*.zsh. Do not edit directly.
+# EndpointPostureCheck for macOS — built 2026-11-10 21:52:11 from src/*.zsh. Do not edit directly.
 
 # ---- 00-header.zsh ----
 #
@@ -6646,18 +6646,18 @@ check_nvram_boot_args() {
 check_thirdparty_kext_inventory() {
     run_root kmutil showloaded
 
-    local -a lines data_lines
-    lines=("${(@f)ROOT_CMD_OUTPUT}")
-    data_lines=("${lines[@]:1}")
-
+    # Only numbered rows are kexts: run_root merges stderr, so a "No variant specified" warning
+    # can precede the column header, which then used to be counted as a non-Apple kext.
+    # Columns: Index Refs Address Size Wired Name (Version) UUID <Linked Against>.
     local -a thirdparty=()
     local line
-    for line in "${data_lines[@]}"; do
-        [[ -z "$line" ]] && continue
-        [[ "$line" == *"com.apple."* ]] && continue
+    for line in "${(@f)ROOT_CMD_OUTPUT}"; do
+        [[ "$line" =~ '^ *[0-9]+ +[0-9]+ ' ]] || continue
         local -a words
         words=(${=line})
-        thirdparty+=("${words[-1]}")
+        (( ${#words[@]} >= 6 )) || continue
+        [[ "${words[6]}" == com.apple.* ]] && continue
+        thirdparty+=("${words[6]} ${words[7]:-}")
     done
 
     if (( ${#thirdparty[@]} == 0 )); then
@@ -7936,10 +7936,16 @@ _inv_writable_by_others() {
     local p="$1" om="" target=""
     [[ "$p" == /* && -e "$p" ]] || return 1
     _inv_is_system_path "$p" && return 1
+    local owner="" group="" mode=""
     for target in "$p" "${p:h}"; do
-        om=$(_owner_mode "$target") || continue
-        _mode_group_or_other_writable "${om##* }" && return 0
-        _acl_write_grantees "$target" "${om%% *}" >/dev/null && return 0
+        om=$(stat -f '%Su %Sg %Lp' "$target" 2>/dev/null) || continue
+        owner="${om%% *}"; mode="${om##* }"; group="${${om#* }% *}"
+        [[ "$mode" == <-> ]] || continue
+        # Other-write always counts; group write only for a group that is not already
+        # admin-equivalent (stock /Applications is root:admin 0775).
+        [[ "${mode[-1]}" == [2367] ]] && return 0
+        [[ "${mode[-2]}" == [2367] && "$group" != (admin|wheel) ]] && return 0
+        _acl_write_grantees "$target" "$owner" >/dev/null && return 0
     done
     return 1
 }
