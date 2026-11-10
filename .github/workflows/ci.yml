@@ -41,16 +41,19 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Full audit (${{ matrix.shell }})
-        shell: ${{ matrix.shell }}
-        run: .\Invoke-EndpointPostureCheck.ps1 -ReportPath "$env:RUNNER_TEMP\epc1" -ExportJson -GenerateRemediationScript
+        shell: pwsh
+        run: |
+          & ${{ matrix.shell }} -NoProfile -ExecutionPolicy Bypass -File .\Invoke-EndpointPostureCheck.ps1 -ReportPath "$env:RUNNER_TEMP\epc1" -ExportJson -GenerateRemediationScript
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: Validate report
         shell: pwsh
         run: ./ci/Test-ReportOutput.ps1 -ReportDir "$env:RUNNER_TEMP\epc1" -MinFindings 150 -MinDomains 30 -Label "Windows (${{ matrix.shell }})"
       - name: Second run against the first as baseline (${{ matrix.shell }})
-        shell: ${{ matrix.shell }}
+        shell: pwsh
         run: |
           $base = (Get-ChildItem "$env:RUNNER_TEMP\epc1\*.json" | Select-Object -First 1).FullName
-          .\Invoke-EndpointPostureCheck.ps1 -ReportPath "$env:RUNNER_TEMP\epc2" -ExportJson -BaselinePath $base
+          & ${{ matrix.shell }} -NoProfile -ExecutionPolicy Bypass -File .\Invoke-EndpointPostureCheck.ps1 -ReportPath "$env:RUNNER_TEMP\epc2" -ExportJson -BaselinePath $base
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: Validate baseline report
         shell: pwsh
         run: ./ci/Test-ReportOutput.ps1 -ReportDir "$env:RUNNER_TEMP\epc2" -MinFindings 150 -MinDomains 30 -Label "Windows baseline (${{ matrix.shell }})" -ExpectBaseline
