@@ -6,8 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Two independent, zero-dependency security posture auditors that share one design:
 
-- `Invoke-EndpointPostureCheck.ps1`: Windows 11 Enterprise, PowerShell, 161 checks / 35 domains (plus `-BaselinePath`).
-- `Invoke-MacPostureCheck.sh`: macOS 15/26, zsh, 205 checks / 32 domains.
+- `Invoke-EndpointPostureCheck.ps1`: Windows 11 Enterprise, PowerShell, 173 checks / 35 domains (plus `-BaselinePath` and `-ExceptionPath`).
+- `Invoke-MacPostureCheck.sh`: macOS 15/26, zsh, 206 checks / 32 domains.
 
 Each produces a self-contained HTML dashboard with weighted compliance scoring and framework
 mappings, plus optional JSON export and a generated remediation script.

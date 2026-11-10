@@ -6,6 +6,40 @@ The project has no tagged releases yet, so changes are grouped by date. Entries 
 
 ## Unreleased
 
+- Windows (173 checks): inventories in the dashboard and JSON export: processes (owner, CPU
+  sampled over one second, RAM, binary, signature, listeners, hosted services, redacted command
+  line), services (binary, ServiceDll, signature, writability), network connections, network
+  exposure (listener, matching rules, firewall decision), every firewall rule in the effective
+  policy (inbound and outbound, with program, service, package, ports, addresses, profiles,
+  edge traversal, source store) fetched with one query per filter class instead of one per rule,
+  firewall profiles, named pipes and runtimes. The inbound-rule inventory finding now lists
+  all enabled inbound rules (it showed 80) and is INFO; risky rules are scored by the new
+  "Firewall Rules - Risky Allow Rules" (allow-everything, block overrides, replaceable,
+  unsigned or missing programs, script hosts, edge traversal).
+- Windows: new findings Firewall Profile Advanced Settings, Network Exposure Map, Privileged
+  Processes Running Writable Binaries, Service Folder/ServiceDll/Recovery Command Permissions,
+  Machine-Wide Autorun Target Permissions, Passwords Stored by Admin Tools (PuTTY, WinSCP,
+  FileZilla, mRemoteNG, VNC; counts only), Named Pipes Writable by Everyone, End-of-Life
+  Runtimes, Policy Sources (Group Policy vs MDM).
+- Windows: write-access tests now flag every account that is not admin-equivalent (they
+  checked only Everyone, Authenticated Users and Users), a non-admin owner, and honour deny and
+  inherit-only entries. Privileged scheduled tasks are also checked for writable script
+  arguments and target files, not only folders.
+- Windows: the LOLBAS check failed with a null-method error when no AppLocker policy existed.
+- Found on the first real Windows runs in CI and fixed: Store-app (AppContainer) firewall rules
+  were scored as "allows everything" and matched to every listener; restricted service SIDs
+  (S-1-5-99-*) were treated as non-admin writers; named pipes were not enumerated in PowerShell 7
+  and their ACLs could not be read with Get-Acl; a runtime whose support ends today was
+  reported as already ended (both editions).
+- Both: `-ExceptionPath` / `--exceptions` for accepted risks (reason, approver, expiry). Accepted
+  FAIL/WARN findings stay visible and are left out of the score and risk badge until they expire;
+  the score card also shows the score with them. Expired, unmatched and invalid entries are a WARN.
+- Both: findings can name their source (Evidence). On macOS every managed-preference check says
+  whether a configuration profile forces the setting.
+- macOS (206 checks): End-of-Life Runtimes (python.org, Homebrew, pyenv, nvm, rbenv, asdf, .NET,
+  old JDKs; folder names only, nothing is executed). Windows has the same check from the
+  Uninstall registry and the .NET shared folders.
+
 - macOS (205 checks): inventories in the dashboard's Inventory section and the JSON export:
   processes (PID, parent, user, CPU, RAM, uptime, binary, signature, listeners, connections,
   launchd label, redacted command line), launchd services (every daemon and agent with status,

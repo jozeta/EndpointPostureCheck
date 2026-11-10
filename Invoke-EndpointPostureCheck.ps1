@@ -2894,11 +2894,11 @@ function Test-DNSSecurity {
 
 # Accounts that already hold (or can trivially take) SYSTEM: a write grant to one of them is not
 # an escalation path. SYSTEM, Administrators, TrustedInstaller and every per-service SID
-# (S-1-5-80-*), LocalService/NetworkService (SeImpersonate), CREATOR OWNER (a placeholder),
+# (S-1-5-80-*) and restricted service SID (S-1-5-99-*), LocalService/NetworkService (SeImpersonate), CREATOR OWNER (a placeholder),
 # Server/Backup Operators, and domain Administrator/Domain/Schema/Enterprise Admins.
 $Script:AdminEquivalentSidPatterns = @(
     '^S-1-5-18$', '^S-1-5-19$', '^S-1-5-20$', '^S-1-5-32-544$', '^S-1-5-32-549$', '^S-1-5-32-551$',
-    '^S-1-5-80-', '^S-1-3-0$', '^S-1-5-21-[\d-]+-(500|512|518|519)$'
+    '^S-1-5-80-', '^S-1-5-99-', '^S-1-3-0$', '^S-1-5-21-[\d-]+-(500|512|518|519)$'
 )
 $Script:LocalAdminMemberSids = $null
 
@@ -10458,6 +10458,10 @@ function Get-FirewallSnapshot {
             $app = $filters.App[$id]; $port = $filters.Port[$id]; $addr = $filters.Addr[$id]; $svc = $filters.Svc[$id]; $sec = $filters.Sec[$id]
             if ($port -or $app) { $fw.Joined++ }
             $program = if ($app -and $app.Program) { [string]$app.Program } else { 'Any' }
+            # Store-app (AppContainer) rules apply only inside that package's sandbox. The package
+            # condition does not always come back in the application filter, so the rule owner
+            # and the package-family suffix in the rule ID (Name_cw5n1h2txyewy-In-...) count too.
+            $isPackage = [bool](($app -and [string]$app.Package) -or [string]$r.Owner -or $id -match '_[0-9a-z]{13}-(In|Out)-')
             $list.Add([PSCustomObject]@{
                     Name          = [string]$r.Name
                     DisplayName   = [string]$r.DisplayName
@@ -10478,6 +10482,7 @@ function Get-FirewallSnapshot {
                     LocalAddress  = $(if ($addr -and $addr.LocalAddress) { @($addr.LocalAddress | ForEach-Object { [string]$_ }) } else { @('Any') })
                     RemoteAddress = $(if ($addr -and $addr.RemoteAddress) { @($addr.RemoteAddress | ForEach-Object { [string]$_ }) } else { @('Any') })
                     OverrideBlock = [bool]($sec -and [string]$sec.OverrideBlockRules -eq 'True')
+                    IsPackage     = $isPackage
                 })
         }
         $fw.Rules = @($list)
@@ -10529,6 +10534,7 @@ function Get-ListenerRuleMatch {
     param($Fw, [string]$Protocol, [int]$Port, [string]$ProcessPath, [string[]]$Services, [int]$ProcessId)
     $allow = [System.Collections.Generic.List[object]]::new(); $block = [System.Collections.Generic.List[object]]::new()
     foreach ($r in $Fw.InboundEnabled) {
+        if ($r.IsPackage) { continue }   # AppContainer rules do not admit ordinary processes
         if (-not (Test-FirewallProfileOverlap $r.Profile $Fw.CurrentProfiles)) { continue }
         if ($r.Protocol -notin @('Any', $Protocol, $(if ($Protocol -eq 'TCP') { '6' } else { '17' }))) { continue }
         if (-not (Test-FirewallPortMatch $r.LocalPort $Port)) { continue }
@@ -10729,6 +10735,7 @@ function Get-FirewallRuleFlag {
     if (-not $r.Enabled) { $tags.Add('disabled'); return @{ Tags = @($tags); Bad = @(); Weak = @() } }
     if ($r.SourceType -match 'GroupPolicy|MDM' -or $r.Source -match 'MDM') { $tags.Add('managed') }
     if ($r.Action -ne 'Allow') { $tags.Add('block'); return @{ Tags = @($tags); Bad = @(); Weak = @() } }
+    if ($r.IsPackage) { $tags.Add('app package'); return @{ Tags = @($tags); Bad = @(); Weak = @() } }
     $prog = Get-ExpandedRuleProgram $r.Program
     $isIn = $r.Direction -eq 'Inbound'
     if ($isIn -and $r.Program -eq 'Any' -and $r.Service -eq 'Any' -and $r.Package -eq '' -and ($r.LocalPort -contains 'Any') -and ($r.RemoteAddress -contains 'Any') -and $r.Protocol -eq 'Any') {
@@ -11089,7 +11096,9 @@ function Test-NamedPipePermission {
         MITRE_Technique = 'T1559 (Inter-Process Communication), T1134.001 (Token Impersonation/Theft)'; ISO27001_Control = 'A.8.2'; NIS2_Article = 'Art.21(2)(i)'
         RecommendedValue = 'Non-default named pipes do not grant write access to Everyone or Anonymous' }
     try {
-        $pipes = @([System.IO.Directory]::GetFiles('\\.\pipe\') | Select-Object -First 600)
+        $pipes = @([System.IO.Directory]::GetFiles('\\.\pipe\'))
+        if (-not $pipes.Count) { $pipes = @(Get-ChildItem -Path '\\.\pipe\' -Force -ErrorAction SilentlyContinue | ForEach-Object { '\\.\pipe\' + $_.Name }) }
+        $pipes = @($pipes | Select-Object -First 600)
         New-InventoryTable -Id 'pipes' -Title 'Named pipes' -Note 'Named pipes and the broad groups that can write to them. Pipe server processes cannot be named without opening each pipe, which the audit does not do.' `
             -Columns @('Pipe', 'Broad write access', 'Flags:flags')
         $broadSids = @{ 'S-1-1-0' = 'Everyone'; 'S-1-5-7' = 'Anonymous'; 'S-1-5-11' = 'Authenticated Users'; 'S-1-5-32-545' = 'Users' }
@@ -11099,7 +11108,9 @@ function Test-NamedPipePermission {
             $name = $p.Substring(9)
             $grants = [System.Collections.Generic.List[string]]::new()
             try {
-                $acl = Get-Acl -LiteralPath $p -ErrorAction Stop
+                # Get-Acl refuses pipe paths; the .NET file security API (GetNamedSecurityInfo) reads them.
+                $acl = if ($PSVersionTable.PSVersion.Major -ge 6) { [System.IO.FileSystemAclExtensions]::GetAccessControl([System.IO.FileInfo]::new($p)) }
+                else { [System.IO.File]::GetAccessControl($p) }
                 foreach ($ace in $acl.Access) {
                     if ($ace.AccessControlType -ne 'Allow') { continue }
                     $sid = ConvertTo-SidString $ace.IdentityReference
@@ -11181,7 +11192,7 @@ function Test-EndOfLifeRuntime {
             $flag = ''
             if ($date) {
                 $end = [datetime]::ParseExact($date, 'yyyy-MM-dd', [System.Globalization.CultureInfo]::InvariantCulture)
-                if ($end -le $today) { $flag = 'end of life!'; $eol.Add("$($r.Product) ($($r.Version)): support ended $date - $($r.Source)") }
+                if ($end -lt $today) { $flag = 'end of life!'; $eol.Add("$($r.Product) ($($r.Version)): support ended $date - $($r.Source)") }
                 elseif ($end -le $today.AddDays(90)) { $flag = 'ends soon?'; $soon.Add("$($r.Product) ($($r.Version)): support ends $date - $($r.Source)") }
                 else { $flag = 'supported' }
             }

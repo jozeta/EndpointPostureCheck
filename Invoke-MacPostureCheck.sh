@@ -1,5 +1,5 @@
 #!/usr/bin/env zsh
-# EndpointPostureCheck for macOS — built 2026-11-10 21:14:18 from src/*.zsh. Do not edit directly.
+# EndpointPostureCheck for macOS — built 2026-11-10 21:20:15 from src/*.zsh. Do not edit directly.
 
 # ---- 00-header.zsh ----
 #
@@ -8376,7 +8376,7 @@ check_end_of_life_runtimes() {
         date="${RUNTIME_EOL[$product]:-}"
         flag=""
         if [[ "$version" == *'(Apple Command Line Tools)'* ]]; then flag="apple"
-        elif [[ -n "$date" && ! "$date" > "$today" ]]; then flag="end of life!"; eol+=("$product ($version): support ended $date - $where")
+        elif [[ -n "$date" && "$date" < "$today" ]]; then flag="end of life!"; eol+=("$product ($version): support ended $date - $where")
         elif [[ -n "$date" && ! "$date" > "$soon" ]]; then flag="ends soon?"; near+=("$product ($version): support ends $date - $where")
         elif [[ -n "$date" ]]; then flag="supported"
         fi
