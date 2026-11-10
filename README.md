@@ -4,8 +4,8 @@
 
 This repository contains two independent tools sharing one design philosophy (fault-isolated checks, weighted compliance scoring, a self-contained HTML dashboard, optional JSON export and generated remediation script):
 
-- [`Invoke-EndpointPostureCheck.ps1`](#endpointposturecheck-for-windows) — Windows 11 Enterprise, 173 checks across 35 domains.
-- [`Invoke-MacPostureCheck.sh`](#endpointposturecheck-for-macos) — macOS 15 (Sequoia) / 26 (Tahoe), 206 checks across 32 domains.
+- [`Invoke-EndpointPostureCheck.ps1`](#endpointposturecheck-for-windows) — Windows 11 Enterprise, 177 checks across 36 domains.
+- [`Invoke-MacPostureCheck.sh`](#endpointposturecheck-for-macos) — macOS 15 (Sequoia) / 26 (Tahoe), 212 checks across 32 domains.
 
 ---
 
@@ -13,7 +13,7 @@ This repository contains two independent tools sharing one design philosophy (fa
 
 **A comprehensive, standalone PowerShell security posture auditor for Windows 11 Enterprise endpoints.**
 
-`EndpointPostureCheck` runs **173 read-only security controls** across 35 hardening domains — from firmware and virtualization-based security through privilege-escalation vectors, AppLocker bypass paths, ransomware resilience, and modern cloud-identity token security — and renders the results as a single-file, interactive HTML dashboard. Every finding is mapped to CIS Controls v8, NIST SP 800-53 Rev.5, MITRE ATT&CK, ISO/IEC 27001:2022, the NIS2 Directive, and NSA/CISA guidance, and the tool can generate a companion remediation script for everything it finds wrong.
+`EndpointPostureCheck` runs **177 read-only security controls** across 36 hardening domains — from firmware and virtualization-based security through privilege-escalation vectors, AppLocker bypass paths, ransomware resilience, and modern cloud-identity token security — and renders the results as a single-file, interactive HTML dashboard. Every finding is mapped to CIS Controls v8, NIST SP 800-53 Rev.5, MITRE ATT&CK, ISO/IEC 27001:2022, the NIS2 Directive, and NSA/CISA guidance, and the tool can generate a companion remediation script for everything it finds wrong.
 
 It is designed to run standalone with zero external dependencies — no modules to install, no internet access required, just PowerShell and the Windows APIs already on the box.
 
@@ -39,7 +39,7 @@ It is designed to run standalone with zero external dependencies — no modules 
 
 ## Highlights
 
-- **173 checks, zero dependencies.** Everything runs on native PowerShell, CIM/WMI, and built-in Windows command-line tools (`bcdedit`, `reagentc`, `vssadmin`, `netsh`, `auditpol`, `wevtutil`, `sc`, `secedit`). Nothing to install.
+- **177 checks, zero dependencies.** Everything runs on native PowerShell, CIM/WMI, and built-in Windows command-line tools (`bcdedit`, `reagentc`, `vssadmin`, `netsh`, `auditpol`, `wevtutil`, `sc`, `secedit`). Nothing to install.
 - **Fault-tolerant by design.** Every single check runs inside its own `try/catch` boundary. A missing subsystem, an unsupported SKU, or an access-denied condition is logged as a `WARN`/`INFO` finding — it never aborts the run.
 - **Executive HTML dashboard.** A self-contained, single-file dashboard in the Låda Glass family design (frosted glass, dark theme with a light theme that follows the system, and a theme switch). It shows a compliance score ring, risk badge, KPI cards that filter by status, a sidebar listing every domain with its FAIL/WARN count, a **System Overview** panel (hostname, domain/Entra ID join state, uptime, IP, disk space, RAM/CPU, installed app count, BitLocker status), and a searchable, filterable findings table. Long item lists open in a popover. On a phone the table becomes stacked cards, and it has print styles. The design system's CSS and icons are inlined, so the report makes no network requests.
 - **Weighted compliance scoring.** Critical/High severity failures are penalized more heavily than Medium/Low ones; the result is a single 0–100% score and a `LOW`/`MEDIUM`/`HIGH`/`CRITICAL` risk badge.
@@ -144,21 +144,21 @@ Pass `-ExceptionPath` (Windows) or `--exceptions` (macOS) a JSON file like [`ci/
 
 ## Audit Domains
 
-173 checks organized across 35 domains (plus the optional baseline comparison):
+177 checks organized across 36 domains (plus the optional baseline comparison):
 
 | # | Domain |
 |---|---|
 | 1 | Hardware, Firmware & Platform Integrity (TPM, Secure Boot, Kernel DMA Protection) |
 | 2 | Virtualization-Based Security & Kernel Isolation (VBS, HVCI, Credential Guard, System Guard, LSA Protection) |
 | 3 | Volume Encryption & Data-at-Rest Security (BitLocker status, cipher, key protectors, encryption type) |
-| 4 | Next-Gen Antivirus & EDR (Defender real-time/cloud protection, Controlled Folder Access, Network Protection, exclusions, MDE onboarding) |
+| 4 | Next-Gen Antivirus & EDR (Defender real-time/cloud protection, Controlled Folder Access, Network Protection, exclusions, MDE onboarding, scan and remediation settings from the CIS Defender benchmark) |
 | 5 | Attack Surface Reduction & Exploit Prevention (ASR rules, DEP/ASLR/CFG/Heap/SEHOP/CET) |
 | 6 | Application Control & Software Whitelisting (WDAC, AppLocker baseline, installer security) |
 | 7 | Identity, Privilege Management & Access Control (accounts, LAPS, password/lockout policy, UAC) |
 | 8 | Network Architecture & Protocol Hardening (firewall profiles and logging, every firewall rule with risky allow rules scored, network exposure map, legacy protocols, RDP, SMB, DNS) |
 | 9 | Cryptography, Schannel & Secure Channels (TLS/SSL protocol state, cipher suites) |
 | 10 | PowerShell Subsystem & Execution Security (logging, execution policy, Constrained Language Mode) |
-| 11 | Advanced Security Auditing & Event Logging (audit policy, process-creation command-line logging) |
+| 11 | Advanced Security Auditing & Event Logging (all 27 CIS audit policy subcategories with their exact Success/Failure requirement, process-creation command-line logging) |
 | 12 | Network Authentication & Credential Exposure Hardening (NTLM, anonymous access, Restrict NTLM, remote UAC for local accounts, RDP Restricted Admin, CredSSP delegation, Kerberos encryption types, LM hashes, stored network credentials, WebClient/WebDAV relay exposure) |
 | 13 | Privileged Access, User Rights & Session Hardening |
 | 14 | Legacy Service Exposure & Remote Management Hardening (Print Spooler, WinRM, Remote Registry) |
@@ -182,7 +182,8 @@ Pass `-ExceptionPath` (Windows) or `--exceptions` (macOS) a JSON file like [`ci/
 | 32 | Targeted Gap Checks — Defender, Network, Accounts & Awareness |
 | 33 | Targeted Gap Closure — Credential, Kernel, Network & Privacy |
 | 34 | System Inventory & Asset Information (process and service inventories, end-of-life runtimes) |
-| 35 | Browser & Application Hardening (browser extension inventory and risk review for Chrome, Edge, Brave, Vivaldi, Chromium and Firefox) |
+| 35 | Browser & Application Hardening (browser extension inventory and risk review for Chrome, Edge, Brave, Vivaldi, Chromium and Firefox; Edge and Chrome security policies; Office macro and Protected View policies) |
+| 36 | CIS Benchmark Policy Settings (about 290 settings of the CIS Microsoft Windows 11 Enterprise Benchmark v5.0.1 that no other check reads: security options, user rights, account policies, services and Administrative Templates, one finding per area) |
 
 ---
 
@@ -225,7 +226,7 @@ A few choices worth knowing about if you're extending this tool:
 
 ## Performance Notes
 
-A full run typically takes **60–90 seconds** depending on hardware and installed feature set (WSL, Hyper-V, AppLocker, and Wi-Fi profile checks each add a few seconds). All 173 checks run sequentially in a single process for fault-tolerance and predictable console output ordering.
+A full run typically takes **60–90 seconds** depending on hardware and installed feature set (WSL, Hyper-V, AppLocker, and Wi-Fi profile checks each add a few seconds). All 177 checks run sequentially in a single process for fault-tolerance and predictable console output ordering.
 
 ---
 
@@ -243,7 +244,7 @@ This tool includes deep-inspection checks — LSASS/credential exposure, ACL/pri
 
 **A comprehensive, standalone zsh security posture auditor for macOS 15 (Sequoia) and 26 (Tahoe) endpoints.**
 
-`Invoke-MacPostureCheck.sh` runs **206 read-only security controls** across 32 hardening domains — from Secure Enclave/T2 platform integrity and System Integrity Protection through Gatekeeper, TCC privacy controls, FileVault, credential exposure, and ransomware resilience — and renders the results as a single-file, interactive HTML dashboard, in the same visual language as the Windows edition. Every finding is mapped to CIS Controls v8, NIST SP 800-53 Rev.5, MITRE ATT&CK, ISO/IEC 27001:2022, the NIS2 Directive, NSA/CISA guidance, the CIS Apple macOS Benchmark, and the macOS Security Compliance Project (mSCP) — two mappings the Windows edition doesn't carry, since they're macOS-specific authoritative baselines. Findings backed by a real item list (installed apps, listening ports, admin group members, TCC grants, and more) show a popover in the HTML dashboard with the full list, one item per line, instead of cluttering the table with a long inline value. Both editions share the same dashboard (Låda Glass design, sidebar domain filter, KPI filters, theme switch).
+`Invoke-MacPostureCheck.sh` runs **212 read-only security controls** across 32 hardening domains — from Secure Enclave/T2 platform integrity and System Integrity Protection through Gatekeeper, TCC privacy controls, FileVault, credential exposure, and ransomware resilience — and renders the results as a single-file, interactive HTML dashboard, in the same visual language as the Windows edition. Every finding is mapped to CIS Controls v8, NIST SP 800-53 Rev.5, MITRE ATT&CK, ISO/IEC 27001:2022, the NIS2 Directive, NSA/CISA guidance, the CIS Apple macOS Benchmark, and the macOS Security Compliance Project (mSCP) — two mappings the Windows edition doesn't carry, since they're macOS-specific authoritative baselines. Findings backed by a real item list (installed apps, listening ports, admin group members, TCC grants, and more) show a popover in the HTML dashboard with the full list, one item per line, instead of cluttering the table with a long inline value. Both editions share the same dashboard (Låda Glass design, sidebar domain filter, KPI filters, theme switch).
 
 It runs standalone with zero external dependencies: no Homebrew packages, no Python, nothing beyond the zsh shell and command-line tools Apple ships on every Mac.
 
@@ -292,7 +293,7 @@ Identical `PASS`/`FAIL`/`WARN`/`INFO` status semantics, `Critical`/`High`/`Mediu
 
 ### Audit Domains
 
-206 checks organized across 32 domains:
+212 checks organized across 32 domains:
 
 | # | Domain |
 |---|---|
@@ -331,7 +332,7 @@ Identical `PASS`/`FAIL`/`WARN`/`INFO` status semantics, `Critical`/`High`/`Mediu
 
 ### CIS Apple macOS 26 Tahoe Benchmark v1.0.0 Coverage
 
-Every **Automated** recommendation in the CIS Apple macOS 26 Tahoe Benchmark v1.0.0 has a corresponding check, tagged with its Tahoe section number (e.g. `CIS-macOS 2.6.8`) and, where one exists, its mSCP rule ID. The benchmark's **Manual**/"Audit" recommendations (Find My Mac, Lockdown Mode, Touch ID, Internet Accounts, …) are not scored, since they need human judgement rather than a deterministic CLI signal.
+Every **Automated** recommendation in the CIS Apple macOS 26 Tahoe Benchmark v1.0.0 has a corresponding check, tagged with its Tahoe section number (e.g. `CIS-macOS 2.6.8`) and, where one exists, its mSCP rule ID. Most of the benchmark's **Manual**/"Audit" recommendations (Find My Mac, Touch ID, Internet Accounts, …) are not scored, since they need human judgement rather than a deterministic CLI signal. The Manual ones that do have such a signal are checked: Lockdown Mode (INFO), all data volumes encrypted (5.3.1/5.3.2), filename extensions shown (6.1.1), the FileVault standby key policy on Intel laptops (2.10.1.1), and a few that score PASS/WARN/FAIL (2.1.1.1, 2.1.1.2, 2.1.1.6, 2.6.2.1).
 
 A few behaviors worth knowing:
 
@@ -343,6 +344,11 @@ A few behaviors worth knowing:
   - *5.2.8 Password history* requires ≥ 24, per the recommendation title and mSCP. The benchmark's audit one-liner only tests ≥ 1.
   - *4.3 NFS server*: `nfsd` reporting "enabled" with no `/etc/exports` and nothing running (the stock state) is a `WARN`; a running server or an exports file is a `FAIL`.
 - **Time Machine backup encryption** is now a real `PASS`/`FAIL` check, using each destination's `LastKnownEncryptionState` (the CIS 2.3.4.2 method), instead of an informational note.
+
+### CIS benchmarks beyond the macOS one
+
+- **Chrome and Edge** (CIS Google Chrome v3.0.0, Microsoft Edge v5.0.0): the security policies (Safe Browsing/SmartScreen without click-through, download restrictions, no certificate-error override, extension block list, remote debugging off, site isolation) on both editions. A browser with no policy gets one WARN, and on macOS only a value forced by a configuration profile counts.
+- **MDM payloads** (CIS Apple macOS 26 Tahoe Intune Benchmark): FileVault, passcode, restriction, Gatekeeper, system-extension and profile-removal settings from the installed profiles, on MDM-enrolled Macs only.
 
 ### Persistence & Autostart Coverage
 

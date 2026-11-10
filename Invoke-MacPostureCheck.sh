@@ -1,5 +1,5 @@
 #!/usr/bin/env zsh
-# EndpointPostureCheck for macOS — built 2026-11-10 21:52:11 from src/*.zsh. Do not edit directly.
+# EndpointPostureCheck for macOS — built 2026-11-10 22:33:07 from src/*.zsh. Do not edit directly.
 
 # ---- 00-header.zsh ----
 #
@@ -1881,7 +1881,7 @@ check_password_policy_configured() {
             --status INFO --severity Informational \
             --current "${#unique_rules[@]} password content rule(s) configured" --details "$joined" --recommended 'N/A' \
             --cis 'CIS 5.2' --nist 'IA-5' --mitre 'T1110 (Brute Force)' --iso27001 'A.8.5' \
-            --nis2 'Art.21(2)(i)' --cis-macos 'CIS-macOS 5.2' --mscp 'os_policy_banner_loginwindow_enforce' \
+            --nis2 'Art.21(2)(i)' --cis-macos 'CIS-macOS 5.2.3, 5.2.4, 5.2.5, 5.2.6' --mscp 'pwpolicy_alpha_numeric_enforce, pwpolicy_special_character_enforce' \
             --recommendation 'Informational only. Review the policy content matches organizational requirements.'
     else
         add_audit_result --category 'Identity, Accounts & Privilege Management' \
@@ -1890,7 +1890,7 @@ check_password_policy_configured() {
             --current 'No explicit password content policy configured' \
             --recommended 'A password content policy is configured' \
             --cis 'CIS 5.2' --nist 'IA-5' --mitre 'T1110 (Brute Force)' --iso27001 'A.8.5' \
-            --nis2 'Art.21(2)(i)' --cis-macos 'CIS-macOS 5.2' --mscp 'os_policy_banner_loginwindow_enforce' \
+            --nis2 'Art.21(2)(i)' --cis-macos 'CIS-macOS 5.2.3, 5.2.4, 5.2.5, 5.2.6' --mscp 'pwpolicy_alpha_numeric_enforce, pwpolicy_special_character_enforce' \
             --recommendation 'Configure a password content policy via "pwpolicy", or deploy one through an MDM Passcode payload.'
     fi
 }
@@ -8409,6 +8409,311 @@ check_end_of_life_runtimes() {
     fi
 }
 
+# ---- 44-managed-policies.zsh ----
+#
+# Managed browser policies (CIS Google Chrome v3.0.0 / Microsoft Edge v5.0.0), MDM security
+# payloads (CIS Apple macOS 26 Tahoe Intune Benchmark), and Tahoe "Manual" recommendations that
+# still have a deterministic on-device signal. Values read from profiles, plists and command
+# output are data: compared as strings, and checked as digits before any numeric comparison.
+
+# Evaluates one row "<value>|<op>|<expected>" against a value. Ops: eq, in (a,b), le, ge, list
+# (comma-joined array contains the expected item). Returns 0 when it matches.
+_mp_value_ok() {
+    local value="$1" op="$2" expected="$3" e=""
+    case "$op" in
+        eq) [[ "$value" == "$expected" ]] ;;
+        in) for e in ${(s:,:)expected}; do [[ "$value" == "$e" ]] && return 0; done; return 1 ;;
+        le) [[ "$value" == <-> && "$expected" == <-> ]] && (( value <= expected )) ;;
+        ge) [[ "$value" == <-> && "$expected" == <-> ]] && (( value >= expected )) ;;
+        list) [[ ",$value," == *",$expected,"* ]] ;;
+        *) return 1 ;;
+    esac
+}
+
+# ---------------------------------------------------------------- Chrome & Edge policies
+
+typeset -ga MP_CHROME_ROWS MP_EDGE_ROWS
+MP_CHROME_ROWS=('SafeBrowsingProtectionLevel|in|1,2' 'DisableSafeBrowsingProceedAnyway|eq|1' 'DownloadRestrictions|in|1,2,3,4'
+    'SSLErrorOverrideAllowed|eq|0' 'BlockExternalExtensions|eq|1' 'ExtensionInstallBlocklist|list|*' 'RemoteDebuggingAllowed|eq|0' 'SitePerProcess|eq|1')
+MP_EDGE_ROWS=('SmartScreenEnabled|eq|1' 'PreventSmartScreenPromptOverride|eq|1' 'PreventSmartScreenPromptOverrideForFiles|eq|1' 'SmartScreenPuaEnabled|eq|1'
+    'DownloadRestrictions|in|1,2,3,4' 'SSLErrorOverrideAllowed|eq|0' 'BlockExternalExtensions|eq|1' 'ExtensionInstallBlocklist|list|*'
+    'RemoteDebuggingAllowed|eq|0' 'SitePerProcess|eq|1' 'TyposquattingCheckerEnabled|eq|1' 'EnhanceSecurityMode|in|1,2')
+
+_browser_policy_check() {   # _browser_policy_check <name> <app path> <suite> <rows array name>
+    local name="$1" app="$2" suite="$3" row="" key="" op="" expected="" out="" src="" value="" rc=0 ok=0
+    local -a rows bad unset fw
+    rows=("${(@P)4}")
+    [[ -d "$app" ]] || return 0
+    fw=(--category 'Browser & Application Hardening' --control "Browser Security Policy - $name"
+        --recommended "Security policies of the CIS $name benchmark enforced by a configuration profile"
+        --cis 'CIS 9.1, 9.4' --nist 'CM-6, SC-18' --mitre 'T1566 (Phishing), T1176 (Browser Extensions), T1539 (Steal Web Session Cookie)'
+        --iso27001 'A.8.9' --nis2 'Art.21(2)(d)' --cis-macos 'N/A' --mscp 'N/A' --evidence "Managed preferences: $suite")
+    for row in "${rows[@]}"; do
+        key="${row%%|*}"; op="${${row#*|}%%|*}"; expected="${row##*|}"
+        out=$(managed_pref_read_with_source "$suite" "$key"); rc=$?
+        src="${out%%$'\x1f'*}"; value="${out#*$'\x1f'}"
+        if (( rc != 0 )) || [[ -z "$value" ]]; then unset+=("$key: not set (expected $expected)"); continue; fi
+        if [[ "$src" != managed ]]; then unset+=("$key = $value set locally, not by a configuration profile (expected $expected)"); continue; fi
+        if _mp_value_ok "$value" "$op" "$expected"; then ok=$((ok + 1)); else bad+=("$key = $value (expected $expected)"); fi
+    done
+    local -a all
+    all=("${bad[@]}" "${unset[@]}")
+    if (( ${#bad[@]} )); then
+        add_audit_result "${fw[@]}" --status FAIL --severity Medium --current "${#bad[@]} policy(ies) weakened, ${#unset[@]} not set, $ok as recommended" \
+            --details "${(F)all}" --recommendation "Correct the listed $name policies in the configuration profile that sets them."
+    elif (( ok == 0 )); then
+        add_audit_result "${fw[@]}" --status WARN --severity Low --current "$name is installed but not managed by a configuration profile (${#rows[@]} recommended security policies unset)" \
+            --details "${(F)all}" \
+            --recommendation "Manage $name with a configuration profile (payload $suite) that enforces Safe Browsing/SmartScreen without click-through, download restrictions, no certificate-error override, an extension block list with an allow list, and remote debugging off."
+    elif (( ${#unset[@]} )); then
+        add_audit_result "${fw[@]}" --status WARN --severity Medium --current "${#unset[@]} recommended policy(ies) not set, $ok as recommended" \
+            --details "${(F)all}" --recommendation "Add the listed policies to the $name configuration profile."
+    else
+        add_audit_result "${fw[@]}" --status PASS --severity Medium --current "All $ok checked security policies enforced" --recommendation 'No action required.'
+    fi
+}
+
+check_browser_security_policies() {
+    write_section_banner 'Browser & Application Hardening - Chrome & Edge Security Policies'
+    _browser_policy_check 'Google Chrome' "${CHROME_APP:-/Applications/Google Chrome.app}" com.google.Chrome MP_CHROME_ROWS
+    _browser_policy_check 'Microsoft Edge' "${EDGE_APP:-/Applications/Microsoft Edge.app}" com.microsoft.Edge MP_EDGE_ROWS
+}
+
+# ---------------------------------------------------------------- MDM payloads (CIS Intune)
+
+# Every installed profile's payload settings as "<PayloadType>|<key>|<value>" lines (booleans as
+# 1/0, arrays comma-joined), plus "__profile__|ProfileRemovalDisallowed|1" for locked profiles.
+# The JXA walks whatever structure profiles prints instead of assuming its exact layout.
+_profile_payload_lines() {
+    local xml="${MP_PROFILES_XML:-}"
+    if [[ -z "$xml" ]]; then
+        # mktemp: random name, created exclusively with mode 0600. A predictable name in a
+        # shared temp folder would let a local user plant a symlink that root then writes through.
+        xml=$(mktemp "${TMPDIR:-/tmp}/epc-profiles.XXXXXXXX") || return 1
+        profiles show -output stdout-xml >| "$xml" 2>/dev/null || { command rm -f "$xml"; return 1; }
+    fi
+    osascript -l JavaScript - "$xml" <<'JXA' 2>/dev/null
+ObjC.import('Foundation');
+function run(argv) {
+  var d = $.NSDictionary.dictionaryWithContentsOfFile(argv[0]);
+  if (!d || d.isNil()) return '';
+  var out = [];
+  function scalar(v) {
+    if (v === true) return '1'; if (v === false) return '0';
+    if (Array.isArray(v)) return v.map(scalar).join(',');
+    if (v !== null && typeof v === 'object') return '';
+    return String(v).replace(/[\r\n|]/g, ' ');
+  }
+  function walk(o) {
+    if (Array.isArray(o)) { o.forEach(walk); return; }
+    if (o === null || typeof o !== 'object') return;
+    if (o.ProfileRemovalDisallowed === true || o.ProfileRemovalDisallowed === 'TRUE' || o.ProfileUninstallPolicy === 'disallowed') out.push('__profile__|ProfileRemovalDisallowed|1');
+    if (typeof o.PayloadType === 'string' && o.PayloadContent && typeof o.PayloadContent === 'object' && !Array.isArray(o.PayloadContent)) {
+      Object.keys(o.PayloadContent).forEach(function (k) { var s = scalar(o.PayloadContent[k]); if (s !== '') out.push(o.PayloadType + '|' + k + '|' + s); });
+    }
+    if (o.PayloadType === 'com.apple.profileRemovalPassword') out.push('__profile__|RemovalPassword|1');
+    Object.keys(o).forEach(function (k) { walk(o[k]); });
+  }
+  walk(ObjC.deepUnwrap(d));
+  return out.join('\n');
+}
+JXA
+    [[ -z "${MP_PROFILES_XML:-}" ]] && command rm -f "$xml"
+    return 0
+}
+
+typeset -ga MP_PAYLOAD_ROWS
+MP_PAYLOAD_ROWS=(
+    'com.apple.MCX.FileVault2|ForceEnableInSetupAssistant|eq|1|FileVault forced in Setup Assistant'
+    'com.apple.MCX.FileVault2|DeferForceAtUserLoginMaxBypassAttempts|eq|0|no FileVault bypass at login'
+    'com.apple.MCX.FileVault2|ShowRecoveryKey|eq|0|recovery key not shown to the user'
+    'com.apple.MCX|dontAllowFDEDisable|eq|1|users cannot turn FileVault off'
+    'com.apple.MCX|DestroyFVKeyOnStandby|eq|1|FileVault key destroyed on standby'
+    '__profile__|ProfileRemovalDisallowed|eq|1|profiles cannot be removed by the user'
+    'com.apple.applicationaccess|allowPasswordSharing|eq|0|password sharing off'
+    'com.apple.applicationaccess|allowEraseContentAndSettings|eq|0|Erase All Content and Settings off'
+    'com.apple.applicationaccess|allowUIConfigurationProfileInstallation|eq|0|users cannot install profiles'
+    'com.apple.applicationaccess|allowPasswordProximityRequests|eq|0|password proximity requests off'
+    'com.apple.applicationaccess|allowAutoUnlock|eq|0|Apple Watch auto unlock off'
+    'com.apple.mobiledevice.passwordpolicy|minLength|ge|15|passcode at least 15 characters'
+    'com.apple.mobiledevice.passwordpolicy|requireAlphanumeric|eq|1|alphanumeric passcode'
+    'com.apple.mobiledevice.passwordpolicy|minComplexChars|ge|1|at least one complex character'
+    'com.apple.mobiledevice.passwordpolicy|maxInactivity|le|15|lock after at most 15 minutes'
+    'com.apple.mobiledevice.passwordpolicy|maxGracePeriod|eq|0|no passcode grace period'
+    'com.apple.mobiledevice.passwordpolicy|minutesUntilFailedLoginReset|ge|15|failed-login counter reset after at least 15 minutes'
+    'com.apple.systempolicy.managed|DisableOverride|eq|1|users cannot override Gatekeeper'
+    'com.apple.systempolicy.control|EnableAssessment|eq|1|Gatekeeper assessment on'
+    'com.apple.system-extension-policy|AllowUserOverrides|eq|0|users cannot approve system extensions'
+)
+
+check_mdm_security_payloads() {
+    write_section_banner 'MDM, Profiles & Supervision - Security Payloads'
+    local enrolled="" lines="" row="" type="" key="" op="" expected="" label="" value="" ok=0
+    local -a bad unset fw
+    local -A seen
+    fw=(--category 'MDM, Profiles & Supervision' --control 'MDM Security Payloads'
+        --recommended 'FileVault, passcode, restriction, Gatekeeper and profile-removal payloads as the CIS macOS Intune benchmark recommends'
+        --cis 'CIS 4.1, 4.2' --nist 'CM-6, IA-5' --mitre 'T1562 (Impair Defenses)' --iso27001 'A.8.9' --nis2 'Art.21(2)(d)'
+        --cis-macos 'N/A' --mscp 'N/A' --evidence 'profiles show -output stdout-xml (payload settings of installed profiles)')
+    enrolled=$(profiles status -type enrollment 2>/dev/null)
+    if [[ "$enrolled" != *"MDM enrollment: Yes"* ]]; then
+        add_audit_result "${fw[@]}" --status INFO --severity Informational --current 'Not enrolled in MDM: payload settings are not applicable' \
+            --recommendation 'Informational only. On MDM-managed Macs this check verifies the FileVault, passcode, restriction, Gatekeeper and profile-removal payloads.'
+        return 0
+    fi
+    lines=$(_profile_payload_lines)
+    local k=""
+    # Keys built in a variable: a literal "|" inside a zsh subscript breaks the parse.
+    for row in "${(@f)lines}"; do [[ -n "$row" ]] || continue; k="${row%|*}"; seen[$k]="${row##*|}"; done
+    for row in "${MP_PAYLOAD_ROWS[@]}"; do
+        type="${row%%|*}"; row="${row#*|}"; key="${row%%|*}"; row="${row#*|}"; op="${row%%|*}"; row="${row#*|}"; expected="${row%%|*}"; label="${row#*|}"
+        k="$type|$key"; value="${seen[$k]:-}"
+        [[ "$value" == true ]] && value=1; [[ "$value" == false ]] && value=0
+        if [[ -z "$value" ]]; then unset+=("$label: $type $key not set (expected $expected)")
+        elif _mp_value_ok "$value" "$op" "$expected"; then ok=$((ok + 1))
+        else bad+=("$label: $type $key = $value (expected $expected)")
+        fi
+    done
+    local -a all
+    all=("${bad[@]}" "${unset[@]}")
+    if (( ${#bad[@]} )); then
+        add_audit_result "${fw[@]}" --status FAIL --severity Medium --current "${#bad[@]} payload setting(s) weaker than recommended, ${#unset[@]} not set, $ok as recommended" \
+            --details "${(F)all}" --recommendation 'Correct the listed settings in the MDM (Intune: Devices > macOS > Configuration). Each line names the payload type and key.'
+    elif (( ${#unset[@]} )); then
+        add_audit_result "${fw[@]}" --status WARN --severity Medium --current "${#unset[@]} recommended payload setting(s) not delivered by MDM, $ok as recommended" \
+            --details "${(F)all}" --recommendation 'Add the listed settings to the MDM configuration profiles for this Mac.'
+    else
+        add_audit_result "${fw[@]}" --status PASS --severity Medium --current "All $ok checked payload settings as recommended" --recommendation 'No action required.'
+    fi
+}
+
+# ---------------------------------------------------------------- Tahoe Manual recommendations
+
+# A user's ~/Library/Preferences/.GlobalPreferences.plist value (plutil, not defaults: the
+# file belongs to another user and cfprefsd would not see it from root).
+_user_global_pref() {
+    plutil -extract "$2" raw -o - "$1/Library/Preferences/.GlobalPreferences.plist" 2>/dev/null
+}
+
+check_lockdown_mode_state() {
+    local entry="" user="" home="" v=""
+    local -a on off
+    for entry in "${(@f)$(_local_user_homes)}"; do
+        [[ -z "$entry" ]] && continue
+        user="${entry%%$'\t'*}"; home="${entry#*$'\t'}"
+        v=$(_user_global_pref "$home" LDMGlobalEnabled)
+        [[ "$v" == (1|true) ]] && on+=("$user") || off+=("$user")
+    done
+    add_audit_result --category 'Screen Lock & Physical Access' --control 'Lockdown Mode' \
+        --status INFO --severity Informational \
+        --current "Lockdown Mode on for ${#on[@]} account(s), off for ${#off[@]}" \
+        --details "$( (( ${#on[@]} )) && print -r -- "On: ${(j:, :)on}"; (( ${#off[@]} )) && print -r -- "Off: ${(j:, :)off}")" \
+        --recommended 'On for accounts at high risk of targeted attacks' --cis 'CIS 4.1' --nist 'SC-7' --iso27001 'A.8.9' \
+        --nis2 'Art.21(2)(d)' --cis-macos 'CIS-macOS 2.6.7' --mscp 'N/A' --evidence '~/Library/Preferences/.GlobalPreferences.plist LDMGlobalEnabled' \
+        --recommendation 'Informational only. Lockdown Mode (System Settings > Privacy & Security) is for people who may be targeted by mercenary spyware; it disables several features.'
+}
+
+check_all_data_volumes_encrypted() {
+    run_root diskutil apfs list
+    local line="" vol="" name="" role="" fv="" sealed="" n=0
+    local -a plain
+    _flush_volume() {
+        [[ -z "$vol" ]] && return
+        # Skip the sealed system, Preboot, Recovery, VM and Update volumes.
+        # Backup volumes are Time Machine's (its own encryption check covers them).
+        # Sealed volumes are signed and read-only (the system, simulator runtimes, cryptexes).
+        if [[ "$role" != (System|Preboot|Recovery|VM|Update|Hardware|xART|iSCPreboot|Backup) && "$sealed" != Yes* ]]; then
+            n=$((n + 1))
+            [[ "$fv" == Yes* ]] || plain+=("$name ($vol${role:+, role $role}): FileVault ${fv:-unknown}")
+        fi
+    }
+    for line in "${(@f)ROOT_CMD_OUTPUT}"; do
+        if [[ "$line" =~ 'Volume (disk[0-9]+s[0-9]+)' ]]; then _flush_volume; vol="${match[1]}"; name=""; role=""; fv=""; sealed=""
+        elif [[ "$line" =~ 'Name: +(.*[^ ]) +\(' || "$line" =~ 'Name: +(.*[^ ]) *$' ]] && [[ -n "$vol" && -z "$name" ]]; then name="${match[1]}"
+        elif [[ "$line" =~ 'Volume Disk \(Role\): +[^ ]+ \(([^)]*)\)' ]]; then role="${match[1]}"
+        elif [[ "$line" =~ 'FileVault: +([A-Za-z]+)' ]]; then fv="${match[1]}"
+        elif [[ "$line" =~ 'Sealed: +([A-Za-z]+)' ]]; then sealed="${match[1]}"
+        fi
+    done
+    _flush_volume
+    unfunction _flush_volume
+    local -a fw
+    fw=(--category 'Volume Encryption & Data-at-Rest (FileVault)' --control 'All User Data Volumes Encrypted'
+        --recommended 'Every APFS volume holding user data is encrypted' --cis 'CIS 3.6, 3.9' --nist 'SC-28' --mitre 'T1005 (Data from Local System)'
+        --iso27001 'A.8.24' --nis2 'Art.21(2)(h)' --cis-macos 'CIS-macOS 5.3.1, 5.3.2' --mscp 'N/A' --evidence 'diskutil apfs list')
+    if [[ $ROOT_CMD_STATUS -ne 0 || $n -eq 0 ]]; then
+        add_audit_result "${fw[@]}" --status WARN --severity Low --current "Could not list APFS volumes: ${ROOT_CMD_OUTPUT[1,120]}" \
+            --recommendation 'Verify with "diskutil apfs list" that every data volume shows FileVault: Yes.'
+    elif (( ${#plain[@]} )); then
+        add_audit_result "${fw[@]}" --status WARN --severity Medium --current "${#plain[@]} of $n data volume(s) not encrypted" --details "${(F)plain}" \
+            --recommendation 'Encrypt each listed volume (Finder: right-click the volume > Encrypt, or "diskutil apfs encryptVolume <disk> -user disk"). Non-APFS external drives are not listed here; encrypt or reformat them as APFS (Encrypted).'
+    else
+        add_audit_result "${fw[@]}" --status PASS --severity Medium --current "All $n APFS data volume(s) encrypted" --recommendation 'No action required.'
+    fi
+}
+
+check_show_all_filename_extensions() {
+    local entry="" user="" home="" v=""
+    local -a off
+    local n=0
+    for entry in "${(@f)$(_local_user_homes)}"; do
+        [[ -z "$entry" ]] && continue
+        user="${entry%%$'\t'*}"; home="${entry#*$'\t'}"
+        [[ -f "$home/Library/Preferences/.GlobalPreferences.plist" ]] || continue
+        n=$((n + 1))
+        v=$(_user_global_pref "$home" AppleShowAllExtensions)
+        [[ "$v" == (1|true) ]] || off+=("$user")
+    done
+    local -a fw
+    fw=(--category 'Browser & Application Hardening' --control 'Show All Filename Extensions'
+        --recommended 'Finder shows every filename extension' --cis 'CIS 9.7' --nist 'SI-3' --mitre 'T1036.007 (Double File Extension)'
+        --iso27001 'A.8.7' --nis2 'Art.21(2)(g)' --cis-macos 'CIS-macOS 6.1.1' --mscp 'os_show_filename_extensions_enable'
+        --evidence '~/Library/Preferences/.GlobalPreferences.plist AppleShowAllExtensions')
+    if (( ${#off[@]} )); then
+        add_audit_result "${fw[@]}" --status WARN --severity Low --current "Extensions hidden for ${#off[@]} of $n account(s)" --details "${(F)off}" \
+            --recommendation 'Finder > Settings > Advanced > Show all filename extensions (or "defaults write NSGlobalDomain AppleShowAllExtensions -bool true" as each user). Hidden extensions let "invoice.pdf.app" pass as a PDF.'
+    else
+        add_audit_result "${fw[@]}" --status PASS --severity Low --current "Extensions shown for all $n account(s)" --recommendation 'No action required.'
+    fi
+}
+
+check_filevault_standby_key_policy() {
+    local arm="" out="" sect="" line="" k="" v=""
+    local -A batt
+    local -a issues fw
+    fw=(--category "$POWER_CATEGORY" --control 'FileVault Key Destroyed on Standby (Intel)'
+        --recommended 'standbydelaylow/high <= 900, highstandbythreshold >= 90, hibernatemode 25 on battery'
+        --cis 'CIS 3.11' --nist 'SC-28' --mitre 'T1005 (Data from Local System)' --iso27001 'A.8.24' --nis2 'Art.21(2)(h)'
+        --cis-macos 'CIS-macOS 2.10.1.1' --mscp 'N/A' --evidence 'pmset -g custom (Battery Power)')
+    arm=$(sysctl -n hw.optional.arm64 2>/dev/null)
+    if [[ "$arm" == 1 ]]; then
+        add_audit_result "${fw[@]}" --status INFO --severity Informational --current 'Apple silicon: the FileVault key is protected by the Secure Enclave in standby' \
+            --recommendation 'Not applicable on Apple silicon.'
+        return 0
+    fi
+    out=$(pmset -g custom 2>/dev/null)
+    for line in "${(@f)out}"; do
+        [[ "$line" == Battery\ Power:* ]] && { sect=battery; continue; }
+        [[ "$line" == AC\ Power:* ]] && { sect=ac; continue; }
+        [[ "$sect" == battery && "$line" =~ '^ *([a-z]+) +([0-9]+)' ]] && batt[${match[1]}]="${match[2]}"
+    done
+    if (( ${#batt[@]} == 0 )); then
+        add_audit_result "${fw[@]}" --status INFO --severity Informational --current 'No battery power profile (desktop Mac)' --recommendation 'Not applicable without a battery.'
+        return 0
+    fi
+    for k in standbydelaylow standbydelayhigh; do
+        v="${batt[$k]:-}"; [[ "$v" == <-> ]] && (( v > 900 )) && issues+=("$k = $v (expected <= 900)")
+    done
+    v="${batt[highstandbythreshold]:-}"; [[ "$v" == <-> ]] && (( v < 90 )) && issues+=("highstandbythreshold = $v (expected >= 90)")
+    v="${batt[hibernatemode]:-}"; [[ "$v" != 25 ]] && issues+=("hibernatemode = ${v:-not set} (expected 25)")
+    if (( ${#issues[@]} )); then
+        add_audit_result "${fw[@]}" --status WARN --severity Low --current "${#issues[@]} standby setting(s) keep the FileVault key in memory longer" --details "${(F)issues}" \
+            --recommendation 'sudo pmset -b standbydelaylow 900 standbydelayhigh 900 highstandbythreshold 90 hibernatemode 25 (destroys the FileVault key on standby; wake takes longer).'
+    else
+        add_audit_result "${fw[@]}" --status PASS --severity Low --current 'Standby destroys the FileVault key on battery' --recommendation 'No action required.'
+    fi
+}
+
 # ---- 90-scoring.zsh ----
 #
 # Scoring & risk engine. Direct port of Get-CompliancePosture from the
@@ -10490,6 +10795,7 @@ AUDIT_CHECKS=(
     check_sip_status check_sip_custom_configuration check_third_party_system_extensions check_nvram_csr_override
     # Domain 3: Volume Encryption & Data-at-Rest (FileVault)
     check_filevault_status check_filevault_deferred_enablement check_filevault_enabled_user_count check_filevault_recovery_key_escrow
+    check_all_data_volumes_encrypted
     # Domain 4: Gatekeeper, Notarization & Application Control
     check_gatekeeper_status check_quarantine_enforcement_telemetry check_applications_quarantine_flag_survey check_download_quarantine_disabled
     # Domain 5: Malware Defense (XProtect / MRT / EDR)
@@ -10527,7 +10833,7 @@ AUDIT_CHECKS=(
     check_macos_updates_auto_install check_app_store_updates_auto_install check_security_responses_install_enabled
     check_software_update_deferral
     # Domain 14: MDM, Profiles & Supervision
-    check_mdm_enrollment_and_supervision check_installed_profiles_inventory
+    check_mdm_enrollment_and_supervision check_installed_profiles_inventory check_mdm_security_payloads
     # Domain 15: Persistence Mechanisms & Auto-Runs
     check_system_launch_daemons_integrity check_system_launch_agents_integrity check_user_launch_agents_integrity check_login_items_inventory
     check_login_logout_hooks
@@ -10545,6 +10851,7 @@ AUDIT_CHECKS=(
     check_ssh_private_key_permissions check_cloud_cli_credential_files check_shell_history_secret_sweep check_sensitive_filename_sweep check_privileged_and_other_user_history_secrets
     # Domain 19: Screen Lock & Physical Access
     check_screensaver_password_required check_screensaver_grace_period check_auto_login_disabled check_login_window_hardening
+    check_lockdown_mode_state
     check_screen_saver_corners_secure check_screensaver_idle_time check_login_window_custom_message
     check_login_window_password_hints_disabled check_login_window_policy_banner
     # Domain 20: Removable Media & Peripheral Control
@@ -10558,6 +10865,7 @@ AUDIT_CHECKS=(
     check_safari_auto_open_safe_downloads check_safari_developer_menu_note check_safari_fraudulent_site_warning
     check_safari_cross_site_tracking_prevention check_safari_advertising_privacy_protection
     check_safari_show_full_website_address check_safari_show_status_bar check_terminal_secure_keyboard_entry
+    check_browser_security_policies check_show_all_filename_extensions
     check_browser_extensions_inventory check_browser_extension_risk
     # Domain 24: Ransomware Resilience & Recovery
     check_time_machine_configured_and_recent check_time_machine_encryption check_local_apfs_snapshots
@@ -10582,6 +10890,7 @@ AUDIT_CHECKS=(
     check_on_device_dictation_enforced
     # Domain 32: Power Management & Sleep
     check_sleep_enabled_apple_silicon check_power_nap_disabled_intel check_wake_for_network_access_disabled
+    check_filevault_standby_key_policy
     # Domain 30: System Inventory & Asset Information
     check_system_hardware_summary check_os_version_and_build check_disk_space_utilization
     check_installed_application_count check_uptime_and_last_boot

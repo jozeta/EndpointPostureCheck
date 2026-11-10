@@ -6,6 +6,32 @@ The project has no tagged releases yet, so changes are grouped by date. Entries 
 
 ## Unreleased
 
+- Windows (177 checks, 36 domains), from a gap analysis against the CIS Windows 11 Enterprise
+  v5.0.1 benchmark and a real CIS-CAT scan:
+  - CIS policy engine: about 290 settings no other check reads (security options, user rights,
+    account policies, services, Administrative Templates), one finding per area. Level 1 is
+    scored: unset = WARN; a weaker value is a FAIL only where it can only come from someone
+    configuring it (a value under a Policies key, reversible password storage, a privilege
+    granted to a broad group), otherwise a WARN, since it may be the Windows default. Level 2 is
+    listed as INFO. Only recommendation
+    numbers and registry names are used, no benchmark text.
+  - Advanced Audit Policy now covers all 27 CIS subcategories with their exact Success/Failure
+    requirement, matched by GUID so it works on non-English Windows. A Success-only Logon
+    subcategory used to pass.
+  - New: Defender scan and remediation settings (CIS Defender benchmark), Edge and Chrome
+    security policies, Office macro and Protected View policies per user, firewall logging of
+    allowed connections.
+  - Fixed: the Kernel DMA Protection values were mislabelled (1 is "only after logon", 2 is
+    "allow all") and a non-existent value 3 passed; the lockout threshold passed up to 10 (CIS
+    requires 5 or fewer); deny network/RDP logon now also requires "Local account"; the firewall
+    profile checks read the effective policy store; 47 findings carried benchmark section
+    numbers (CIS 18.3/18.4/18.9) as CIS Controls v8 tags.
+- macOS (212 checks): Chrome and Edge security policies from configuration profiles; MDM
+  security payloads (CIS Tahoe Intune benchmark) on enrolled Macs; Lockdown Mode, all data
+  volumes encrypted, filename extensions shown, and the FileVault standby key policy on Intel.
+  The "Password Policy Configured" check was tagged with a section heading (5.2) and the
+  login-banner mSCP rule; it now names 5.2.3–5.2.6 and the pwpolicy content rules.
+
 - macOS: found on the first sudo run on a real Mac and fixed: "Third-Party Kernel Extension
   Inventory" counted kmutil's column header as a loaded kext when a stderr warning came first
   (a WARN High on every Mac with no third-party kexts); firewall app rules in /Applications were

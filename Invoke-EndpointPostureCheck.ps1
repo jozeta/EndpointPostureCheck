@@ -11241,8 +11241,10 @@ function Test-PolicySourceConflict {
 # Ops: eq, in (a,b), ge, le, lenz (<= n, not 0), ne, range (a-b), sz (string), empty, absent,
 # contains (all comma-separated tokens), grant (assignees within the SID list; * = prefix),
 # deny (all SIDs present), disabled (service disabled or not installed).
-# Unset values are "not configured" (WARN), as the macOS edition scores unset profile keys; a
-# value set to something else is a FAIL. Level 2 rows are listed in one unscored INFO finding.
+# Unset values are "not configured" (WARN), as the macOS edition scores unset profile keys. A
+# weaker value is a FAIL only where it can only come from someone configuring it (a value under
+# a \Policies\ key, reversible password storage, a privilege granted to a broad group); other
+# differences may be Windows defaults and are a WARN. Level 2 rows are one unscored INFO finding.
 # Only recommendation numbers and registry names are used here, never benchmark text.
 $Script:CisRows = @'
 1.1.3|L1|Account Policies|secedit|MinimumPasswordAge|ge|1
@@ -11537,9 +11539,9 @@ $Script:CisRows = @'
 
 $Script:CisGroups = [ordered]@{
     'Account Policies'        = @{ Severity = 'High'; Mitre = 'T1110 (Brute Force)'; Nist = 'AC-7, IA-5'; Cis8 = 'CIS 5.2' }
-    'User Rights Assignment'  = @{ Severity = 'High'; Mitre = 'T1078 (Valid Accounts), T1134 (Access Token Manipulation)'; Nist = 'AC-6'; Cis8 = 'CIS 5.4'; SoftMismatch = $true }
+    'User Rights Assignment'  = @{ Severity = 'High'; Mitre = 'T1078 (Valid Accounts), T1134 (Access Token Manipulation)'; Nist = 'AC-6'; Cis8 = 'CIS 5.4' }
     'Security Options'        = @{ Severity = 'High'; Mitre = 'T1557 (Adversary-in-the-Middle), T1087 (Account Discovery)'; Nist = 'AC-3, IA-2, SC-8'; Cis8 = 'CIS 4.1' }
-    'System Services'         = @{ Severity = 'Medium'; Mitre = 'T1210 (Exploitation of Remote Services)'; Nist = 'CM-7'; Cis8 = 'CIS 4.8'; SoftMismatch = $true }
+    'System Services'         = @{ Severity = 'Medium'; Mitre = 'T1210 (Exploitation of Remote Services)'; Nist = 'CM-7'; Cis8 = 'CIS 4.8' }
     'MS Security Guide'       = @{ Severity = 'High'; Mitre = 'T1557.001 (LLMNR/NBT-NS Poisoning and SMB Relay)'; Nist = 'SC-8, SI-7'; Cis8 = 'CIS 4.1' }
     'Legacy Network Settings' = @{ Severity = 'Medium'; Mitre = 'T1557 (Adversary-in-the-Middle)'; Nist = 'SC-7'; Cis8 = 'CIS 4.1' }
     'Network'                 = @{ Severity = 'High'; Mitre = 'T1557 (Adversary-in-the-Middle), T1021.002 (SMB/Windows Admin Shares)'; Nist = 'SC-8, SC-23'; Cis8 = 'CIS 4.1, 3.10' }
@@ -11618,7 +11620,10 @@ function Get-CisRowResult {
             $sec = Get-SeceditSetting
             if (-not $sec.ContainsKey($name)) { return @{ State = 'UNSET'; Shown = 'not set' } }
             $v = $sec[$name]
-            return @{ State = $(if (Test-CisValueMatch $op $expected $v) { 'OK' } else { 'BAD' }); Shown = $v }
+            # secedit always lists account policies, defaults included; only reversible password
+            # storage is a deliberate weakening, the rest differ from CIS by default (SOFT).
+            $miss = if ($name -eq 'ClearTextPassword') { 'BAD' } else { 'SOFT' }
+            return @{ State = $(if (Test-CisValueMatch $op $expected $v) { 'OK' } else { $miss }); Shown = $v }
         }
         'right' {
             $sec = Get-SeceditSetting
@@ -11628,20 +11633,20 @@ function Get-CisRowResult {
             if ($op -eq 'deny') {
                 $missing = @($want | Where-Object { $assigned -notcontains $_ })
                 if (-not $missing.Count) { return @{ State = 'OK'; Shown = ($assigned -join ', ') } }
-                return @{ State = $(if ($assigned.Count) { 'BAD' } else { 'UNSET' }); Shown = "missing $($missing -join ', ')" }
+                return @{ State = $(if ($assigned.Count) { 'SOFT' } else { 'UNSET' }); Shown = "missing $($missing -join ', ')" }
             }
             $extra = @($assigned | Where-Object { -not (Test-CisSidAllowed $_ $want) })
             if (-not $extra.Count) { return @{ State = 'OK'; Shown = $(if ($assigned.Count) { $assigned -join ', ' } else { 'No One' }) } }
             # A privilege (not a logon right) granted to a broad group is a real hole, not a default.
             $broad = @($extra | Where-Object { $_ -in @('S-1-1-0', 'S-1-5-11', 'S-1-5-32-545', 'S-1-5-32-546', 'S-1-5-7', 'S-1-5-4') })
             $hard = ($name -like '*Privilege') -and $broad.Count -and -not ($name -in @('SeShutdownPrivilege', 'SeChangeNotifyPrivilege'))
-            return @{ State = $(if ($hard) { 'HARD' } else { 'BAD' }); Shown = "also granted to $($extra -join ', ')" }
+            return @{ State = $(if ($hard) { 'BAD' } else { 'SOFT' }); Shown = "also granted to $($extra -join ', ')" }
         }
         'service' {
             $svc = $Services | Where-Object { $_.Name -eq $name } | Select-Object -First 1
             if (-not $svc) { return @{ State = 'OK'; Shown = 'not installed' } }
             if ([string]$svc.StartMode -eq 'Disabled') { return @{ State = 'OK'; Shown = 'Disabled' } }
-            return @{ State = 'BAD'; Shown = "$($svc.StartMode), $($svc.State)" }
+            return @{ State = 'SOFT'; Shown = "$($svc.StartMode), $($svc.State)" }
         }
         default {
             $regPath = 'Registry::' + ($source -replace '^HKLM\\', 'HKEY_LOCAL_MACHINE\')
@@ -11651,7 +11656,10 @@ function Get-CisRowResult {
             if (-not $exists) { return @{ State = $(if ($op -eq 'empty') { 'OK' } else { 'UNSET' }); Shown = 'not set' } }
             $v = $key.GetValue($name, $null, 'DoNotExpandEnvironmentNames')
             $shown = if ($v -is [array]) { (@($v) | Where-Object { "$_" -ne '' }) -join ',' } else { [string]$v }
-            return @{ State = $(if (Test-CisValueMatch $op $expected $v) { 'OK' } else { 'BAD' }); Shown = $shown }
+            # A value under a \Policies\ key exists only when someone configured it (BAD); values
+            # elsewhere (Lsa, LanmanServer, Winlogon ...) may be Windows defaults (SOFT).
+            $miss = if ($source -match '\\Policies\\') { 'BAD' } else { 'SOFT' }
+            return @{ State = $(if (Test-CisValueMatch $op $expected $v) { 'OK' } else { $miss }); Shown = $shown }
         }
     }
 }
@@ -11676,14 +11684,14 @@ function Test-CisBenchmarkPolicies {
         $want = switch ($op) { 'grant' { "only $(if ($expected) { $expected -replace ';', ', ' } else { 'No One' })" } 'deny' { "includes $($expected -replace ';', ', ')" } 'disabled' { 'Disabled or not installed' } 'absent' { 'not present' } 'empty' { 'empty' } 'in' { "one of $expected" } 'ge' { ">= $expected" } 'le' { "<= $expected" } 'lenz' { "1 to $expected" } 'range' { $expected } 'ne' { "not $expected" } 'contains' { "contains $expected" } default { $expected } }
         $detail = "${id}: $where = $($r.Shown) (expected $want)"
         if ($level -eq 'L2') {
-            if ($r.State -eq 'OK') { $l2ok++ } else { $level2.Add("$(if ($r.State -eq 'UNSET') { 'NOT SET' } else { 'DIFFERS' }) $detail") }
+            if ($r.State -eq 'OK') { $l2ok++ } else { $level2.Add("$(switch ($r.State) { 'UNSET' { 'NOT SET' } 'BAD' { 'WEAKENED' } default { 'DIFFERS' } }) $detail") }
             continue
         }
         if (-not $byGroup.ContainsKey($group)) { $byGroup[$group] = @{ Ok = 0; Hard = [System.Collections.Generic.List[string]]::new(); Bad = [System.Collections.Generic.List[string]]::new(); Unset = [System.Collections.Generic.List[string]]::new() } }
         switch ($r.State) {
             'OK' { $byGroup[$group].Ok++ }
-            'HARD' { $byGroup[$group].Hard.Add("DIFFERS $detail") }
-            'BAD' { $byGroup[$group].Bad.Add("DIFFERS $detail") }
+            'BAD' { $byGroup[$group].Hard.Add("WEAKENED $detail") }
+            'SOFT' { $byGroup[$group].Bad.Add("DIFFERS $detail") }
             default { $byGroup[$group].Unset.Add("NOT SET $detail") }
         }
     }
@@ -11696,9 +11704,11 @@ function Test-CisBenchmarkPolicies {
             ISO27001_Control = 'A.8.9'; NIS2_Article = 'Art.21(2)(d)'; RecommendedValue = 'Every Level 1 setting as the CIS Windows 11 Enterprise Benchmark v5.0.1 recommends'
             Evidence = 'Policy registry keys, secedit /export and Win32_Service; one line per CIS recommendation number' }
         $details = (@($b.Hard) + @($b.Bad) + @($b.Unset)) -join "`n"
-        $current = "$($b.Ok) of $total Level 1 setting(s) as recommended; $differs set differently, $($b.Unset.Count) not configured"
+        $current = "$($b.Ok) of $total Level 1 setting(s) as recommended; $($b.Hard.Count) weakened by policy, $($b.Bad.Count) at a weaker value (often the Windows default), $($b.Unset.Count) not configured"
         $rec = 'Configure each listed setting through Group Policy (Computer Configuration > Windows Settings > Security Settings, or Administrative Templates) or the matching Intune setting, so it stays enforced. Each line gives the CIS recommendation number and the registry value or policy it maps to.'
-        if ($b.Hard.Count -or ($differs -and -not $meta.SoftMismatch)) {
+        # FAIL only for settings someone weakened on purpose (a policy value, reversible password
+        # storage, a privilege granted to a broad group); a default that differs from CIS is WARN.
+        if ($b.Hard.Count) {
             Add-AuditResult @fwc -Status 'FAIL' -Severity $meta.Severity -CurrentValue $current -Details $details -Recommendation $rec
         } elseif ($differs -or $b.Unset.Count) {
             Add-AuditResult @fwc -Status 'WARN' -Severity $meta.Severity -CurrentValue $current -Details $details -Recommendation $rec
@@ -11802,28 +11812,29 @@ function Test-DefenderScanAndRemediationSettings {
         MITRE_Technique = 'T1562.001 (Disable or Modify Tools), T1027 (Obfuscated Files or Information)'; ISO27001_Control = 'A.8.7'; NIS2_Article = 'Art.21(2)(e)'
         RecommendedValue = 'Every listed Defender setting as the CIS Defender Antivirus Benchmark recommends'; Evidence = 'Get-MpPreference and HKLM\SOFTWARE\Policies\Microsoft\Windows Defender' }
     $pol = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender'
-    # Id, preference property (or ''), policy subkey, value name, expected (as a string), op
+    # Id|preference property (or empty)|policy subkey|value name|expected|op. Strings, not nested
+    # arrays: @( @(..) @(..) ) flattens into one list of strings in PowerShell.
     $items = @(
-        @('1.5.1', '', 'Spynet', 'LocalSettingOverrideSpynetReporting', '0', 'eq')
-        @('1.5.2', 'DisableBlockAtFirstSeen', 'Spynet', 'DisableBlockAtFirstSeen', 'False', 'bool')
-        @('1.7.1', '', 'MpEngine', 'EnableFileHashComputation', '1', 'eq')
-        @('1.8.1', '', 'NIS', 'EnableConvertWarnToBlock', '1', 'eq')
-        @('1.10.1', 'RealTimeScanDirection', 'Real-Time Protection', 'RealtimeScanDirection', '0', 'eq')
-        @('1.10.7', '', 'Real-Time Protection', 'DisableScanOnRealtimeEnable', '0', 'eqdefault')
-        @('1.13.1', 'CheckForSignaturesBeforeRunningScan', 'Scan', 'CheckForSignaturesBeforeRunningScan', 'True', 'bool')
-        @('1.13.2', 'DisableArchiveScanning', 'Scan', 'DisableArchiveScanning', 'False', 'bool')
-        @('1.13.4', '', 'Scan', 'DisablePackedExeScanning', '0', 'eqdefault')
-        @('1.13.5', 'DisableRemovableDriveScanning', 'Scan', 'DisableRemovableDriveScanning', 'False', 'bool')
-        @('1.13.11', 'DisableEmailScanning', 'Scan', 'DisableEmailScanning', 'False', 'bool')
-        @('1.14.1', '', 'Signature Updates', 'SignatureUpdateInterval', '1-4', 'range')
-        @('1.17', '', '', 'HideExclusionsFromLocalUsers', '1', 'eq')
-        @('1.18', '', '', 'DisableRoutinelyTakingAction', '0', 'eqdefault')
+        '1.5.1||Spynet|LocalSettingOverrideSpynetReporting|0|eq'
+        '1.5.2|DisableBlockAtFirstSeen|Spynet|DisableBlockAtFirstSeen|False|bool'
+        '1.7.1||MpEngine|EnableFileHashComputation|1|eq'
+        '1.8.1||NIS|EnableConvertWarnToBlock|1|eq'
+        '1.10.1|RealTimeScanDirection|Real-Time Protection|RealtimeScanDirection|0|eq'
+        '1.10.7||Real-Time Protection|DisableScanOnRealtimeEnable|0|eqdefault'
+        '1.13.1|CheckForSignaturesBeforeRunningScan|Scan|CheckForSignaturesBeforeRunningScan|True|bool'
+        '1.13.2|DisableArchiveScanning|Scan|DisableArchiveScanning|False|bool'
+        '1.13.4||Scan|DisablePackedExeScanning|0|eqdefault'
+        '1.13.5|DisableRemovableDriveScanning|Scan|DisableRemovableDriveScanning|False|bool'
+        '1.13.11|DisableEmailScanning|Scan|DisableEmailScanning|False|bool'
+        '1.14.1||Signature Updates|SignatureUpdateInterval|1-4|range'
+        '1.17|||HideExclusionsFromLocalUsers|1|eq'
+        '1.18|||DisableRoutinelyTakingAction|0|eqdefault'
     )
     try {
         $pref = Get-MpPreference -ErrorAction Stop
         $bad = [System.Collections.Generic.List[string]]::new(); $weak = [System.Collections.Generic.List[string]]::new(); $ok = 0
         foreach ($it in $items) {
-            $id, $prop, $sub, $name, $expected, $op = $it
+            $id, $prop, $sub, $name, $expected, $op = $it.Split('|')
             $key = if ($sub) { "$pol\$sub" } else { $pol }
             $policy = Get-RegistryValueSafe -Path $key -Name $name -DefaultValue $null
             $effective = $null
