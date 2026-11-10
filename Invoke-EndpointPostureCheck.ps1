@@ -360,17 +360,20 @@ function Test-DMAProtection {
 
 
         if ($null -ne $policyValue) {
-            $policyMap = @{ 0 = 'Block all (most secure)'; 1 = 'Allow all (least secure)'; 2 = 'Allow only backward-compatible devices'; 3 = 'Allow only external devices with UEFI DMA protection' }
+            # DeviceEnumerationPolicy (Microsoft Kernel DMA Protection docs): 0 = Block all,
+            # 1 = Only after logon / screen unlock (the default), 2 = Allow all. CIS 18.9.24.1: 0.
+            $policyMap = @{ 0 = 'Block all (most secure)'; 1 = 'Only after logon/unlock (default)'; 2 = 'Allow all (least secure)' }
             $desc = $policyMap[[int]$policyValue]
-            if ([int]$policyValue -eq 0 -or [int]$policyValue -eq 3) {
+            if (-not $desc) { $desc = 'unknown value' }
+            if ([int]$policyValue -eq 0) {
                 Add-AuditResult -Category 'Hardware, Firmware & Platform Integrity' -Control 'Hardware-Enforced Kernel DMA Protection' `
-                    -Status 'PASS' -Severity 'High' -CurrentValue "Policy=$policyValue ($desc)" -RecommendedValue 'Block all, or Allow only UEFI DMA-protected devices' `
+                    -Status 'PASS' -Severity 'High' -CurrentValue "Policy=$policyValue ($desc)" -RecommendedValue 'Block all (DeviceEnumerationPolicy = 0)' `
                     -CIS_Control 'CIS 10.5' -NIST_Control 'SC-28, SC-41' -MITRE_Technique 'T1200 (Hardware Additions)' -ISO27001_Control 'A.8.24' `
                     -NIS2_Article 'Art.21(2)(d)' -NSA_Guidance 'NSA/CISA Stop Malicious Cyber Activity - Physical Access Vectors' `
                     -Recommendation 'No action required.'
             } else {
                 Add-AuditResult -Category 'Hardware, Firmware & Platform Integrity' -Control 'Hardware-Enforced Kernel DMA Protection' `
-                    -Status 'FAIL' -Severity 'High' -CurrentValue "Policy=$policyValue ($desc)" -RecommendedValue 'Block all, or Allow only UEFI DMA-protected devices' `
+                    -Status 'FAIL' -Severity 'High' -CurrentValue "Policy=$policyValue ($desc)" -RecommendedValue 'Block all (DeviceEnumerationPolicy = 0)' `
                     -CIS_Control 'CIS 10.5' -NIST_Control 'SC-28, SC-41' -MITRE_Technique 'T1200 (Hardware Additions)' -ISO27001_Control 'A.8.24' `
                     -NIS2_Article 'Art.21(2)(d)' -NSA_Guidance 'NSA/CISA Stop Malicious Cyber Activity - Physical Access Vectors' `
                     -Recommendation 'Set GPO "Enumeration policy for external devices incompatible with Kernel DMA Protection" to Block All under Administrative Templates > Device Guard.'
@@ -483,19 +486,19 @@ function Test-CredentialGuard {
         if ($cgRunning) {
             Add-AuditResult -Category 'Virtualization-Based Security' -Control 'Credential Guard (LSASS Secrets Isolation)' `
                 -Status 'PASS' -Severity 'Critical' -CurrentValue 'Running' -RecommendedValue 'Running' `
-                -CIS_Control 'CIS 18.4' -NIST_Control 'IA-5, SC-28' -MITRE_Technique 'T1003.001 (LSASS Memory)' -ISO27001_Control 'A.8.5' `
+                -CIS_Control 'CIS 4.1' -NIST_Control 'IA-5, SC-28' -MITRE_Technique 'T1003.001 (LSASS Memory)' -ISO27001_Control 'A.8.5' `
                 -NIS2_Article 'Art.21(2)(i)' -NSA_Guidance 'NSA CSI: Mitigating Credential Theft' `
                 -Recommendation 'No action required.'
         } elseif ($cgConfigured) {
             Add-AuditResult -Category 'Virtualization-Based Security' -Control 'Credential Guard (LSASS Secrets Isolation)' `
                 -Status 'WARN' -Severity 'High' -CurrentValue 'Configured but not yet running (reboot pending)' -RecommendedValue 'Running' `
-                -CIS_Control 'CIS 18.4' -NIST_Control 'IA-5, SC-28' -MITRE_Technique 'T1003.001 (LSASS Memory)' -ISO27001_Control 'A.8.5' `
+                -CIS_Control 'CIS 4.1' -NIST_Control 'IA-5, SC-28' -MITRE_Technique 'T1003.001 (LSASS Memory)' -ISO27001_Control 'A.8.5' `
                 -NIS2_Article 'Art.21(2)(i)' -NSA_Guidance 'NSA CSI: Mitigating Credential Theft' `
                 -Recommendation 'Reboot the endpoint to complete Credential Guard activation.'
         } else {
             Add-AuditResult -Category 'Virtualization-Based Security' -Control 'Credential Guard (LSASS Secrets Isolation)' `
                 -Status 'FAIL' -Severity 'Critical' -CurrentValue 'Not Configured / Not Running' -RecommendedValue 'Running' `
-                -CIS_Control 'CIS 18.4' -NIST_Control 'IA-5, SC-28' -MITRE_Technique 'T1003.001 (LSASS Memory)' -ISO27001_Control 'A.8.5' `
+                -CIS_Control 'CIS 4.1' -NIST_Control 'IA-5, SC-28' -MITRE_Technique 'T1003.001 (LSASS Memory)' -ISO27001_Control 'A.8.5' `
                 -NIS2_Article 'Art.21(2)(i)' -NSA_Guidance 'NSA CSI: Mitigating Credential Theft' `
                 -Recommendation 'Enable via GPO: Computer Configuration > Administrative Templates > System > Device Guard > "Turn On Virtualization Based Security" > Credential Guard Configuration = Enabled with UEFI lock. Requires VBS.'
         }
@@ -554,12 +557,12 @@ function Test-LSAProtection {
             $mode = if ([int]$runAsPPL -eq 2) { 'Enabled without UEFI lock' } else { 'Enabled with UEFI lock' }
             Add-AuditResult -Category 'Virtualization-Based Security' -Control 'LSA Protection (RunAsPPL)' `
                 -Status 'PASS' -Severity 'Critical' -CurrentValue "RunAsPPL=$runAsPPL ($mode)" -RecommendedValue 'RunAsPPL=1' `
-                -CIS_Control 'CIS 18.4' -NIST_Control 'SC-39, AC-6' -MITRE_Technique 'T1003.001 (LSASS Memory)' -ISO27001_Control 'A.8.5' `
+                -CIS_Control 'CIS 4.1' -NIST_Control 'SC-39, AC-6' -MITRE_Technique 'T1003.001 (LSASS Memory)' -ISO27001_Control 'A.8.5' `
                 -NIS2_Article 'Art.21(2)(i)' -NSA_Guidance 'NSA CSI: Mitigating Credential Theft' -Recommendation 'No action required.'
         } else {
             Add-AuditResult -Category 'Virtualization-Based Security' -Control 'LSA Protection (RunAsPPL)' `
                 -Status 'FAIL' -Severity 'Critical' -CurrentValue 'RunAsPPL=0 (Disabled)' -RecommendedValue 'RunAsPPL=1' `
-                -CIS_Control 'CIS 18.4' -NIST_Control 'SC-39, AC-6' -MITRE_Technique 'T1003.001 (LSASS Memory)' -ISO27001_Control 'A.8.5' `
+                -CIS_Control 'CIS 4.1' -NIST_Control 'SC-39, AC-6' -MITRE_Technique 'T1003.001 (LSASS Memory)' -ISO27001_Control 'A.8.5' `
                 -NIS2_Article 'Art.21(2)(i)' -NSA_Guidance 'NSA CSI: Mitigating Credential Theft' `
                 -Recommendation 'Set HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\RunAsPPL (DWORD) = 1, then reboot. Tools such as Mimikatz cannot read LSASS memory once this protection is active.'
         }
@@ -1371,14 +1374,14 @@ function Test-PasswordAndLockoutPolicy {
         $maxPwdAge        = Get-SeceditValue $cfg 'MaximumPasswordAge'
         $pwdHistory       = Get-SeceditValue $cfg 'PasswordHistorySize'
 
-        if ($lockoutThreshold -and [int]$lockoutThreshold -gt 0 -and [int]$lockoutThreshold -le 10) {
+        if ($lockoutThreshold -and [int]$lockoutThreshold -gt 0 -and [int]$lockoutThreshold -le 5) {
             Add-AuditResult -Category 'Identity, Privilege Management & Access Control' -Control 'Account Lockout Threshold' -Status 'PASS' -Severity 'High' `
-                -CurrentValue "$lockoutThreshold invalid attempts" -RecommendedValue '<= 10 (CIS: 5 recommended)' -CIS_Control 'CIS 4.4' -NIST_Control 'AC-7' `
+                -CurrentValue "$lockoutThreshold invalid attempts" -RecommendedValue '1 to 5 invalid attempts (CIS 1.2.2)' -CIS_Control 'CIS 4.4' -NIST_Control 'AC-7' `
                 -MITRE_Technique 'T1110 (Brute Force)' -ISO27001_Control 'A.8.5' -NIS2_Article 'Art.21(2)(i)' `
                 -NSA_Guidance 'NSA/CISA Selecting Secure Multifactor Authentication' -Recommendation 'No action required.'
         } else {
             Add-AuditResult -Category 'Identity, Privilege Management & Access Control' -Control 'Account Lockout Threshold' -Status 'FAIL' -Severity 'High' `
-                -CurrentValue "$lockoutThreshold invalid attempts (0 = never locks out)" -RecommendedValue '<= 10 (CIS: 5 recommended)' -CIS_Control 'CIS 4.4' `
+                -CurrentValue "$lockoutThreshold invalid attempts (0 = never locks out)" -RecommendedValue '1 to 5 invalid attempts (CIS 1.2.2)' -CIS_Control 'CIS 4.4' `
                 -NIST_Control 'AC-7' -MITRE_Technique 'T1110 (Brute Force)' -ISO27001_Control 'A.8.5' -NIS2_Article 'Art.21(2)(i)' `
                 -NSA_Guidance 'NSA/CISA Selecting Secure Multifactor Authentication' `
                 -Recommendation 'Set Account Lockout Threshold to 5 invalid attempts via Local Security Policy > Account Policies > Account Lockout Policy, or GPO equivalent.'
@@ -1506,7 +1509,8 @@ function Test-Firewall {
     #>
     Write-SectionBanner 'Network Architecture - Host Firewall'
     try {
-        $profiles = Get-NetFirewallProfile -ErrorAction Stop
+        # ActiveStore: the effective policy, including Group Policy and MDM settings.
+        $profiles = Get-NetFirewallProfile -PolicyStore ActiveStore -ErrorAction Stop
         foreach ($p in $profiles) {
             if ($p.Enabled) {
                 Add-AuditResult -Category 'Network Architecture & Protocol Hardening' -Control "Windows Firewall - $($p.Name) Profile State" -Status 'PASS' -Severity 'High' `
@@ -1956,58 +1960,6 @@ function Test-PowerShellSecurity {
 
 #region ============================== 11. ADVANCED SECURITY AUDITING & EVENT LOGGING ==============================
 
-function Test-AdvancedAuditPolicy {
-    <#
-        Audits Advanced Audit Policy Configuration subcategories via auditpol.exe across the
-        critical categories: Logon/Logoff, Privilege Use, Account Management, and Object
-        Access. Also verifies command-line argument capture for process creation (Event ID
-        4688).
-    #>
-    Write-SectionBanner 'Advanced Security Auditing & Event Logging'
-    try {
-        $auditCsv = & auditpol.exe /get /category:* /r 2>$null | ConvertFrom-Csv
-        if (-not $auditCsv) { throw 'auditpol returned no data' }
-
-        # Map of subcategory name -> (Category, Severity, MITRE, CIS)
-        $subcategoriesToCheck = @(
-            @{ Name = 'Logon'; Severity = 'High'; Mitre = 'T1078 (Valid Accounts)' }
-            @{ Name = 'Logoff'; Severity = 'Low'; Mitre = 'T1078 (Valid Accounts)' }
-            @{ Name = 'Account Lockout'; Severity = 'Medium'; Mitre = 'T1110 (Brute Force)' }
-            @{ Name = 'Special Logon'; Severity = 'High'; Mitre = 'T1078.003 (Local Accounts)' }
-            @{ Name = 'Sensitive Privilege Use'; Severity = 'High'; Mitre = 'T1548 (Abuse Elevation Control Mechanism)' }
-            @{ Name = 'User Account Management'; Severity = 'High'; Mitre = 'T1136 (Create Account), T1098 (Account Manipulation)' }
-            @{ Name = 'Security Group Management'; Severity = 'High'; Mitre = 'T1098 (Account Manipulation)' }
-            @{ Name = 'Process Creation'; Severity = 'High'; Mitre = 'T1059 (Command and Scripting Interpreter)' }
-            @{ Name = 'Audit Policy Change'; Severity = 'Medium'; Mitre = 'T1562.002 (Disable Windows Event Logging)' }
-            @{ Name = 'Removable Storage'; Severity = 'Medium'; Mitre = 'T1052.001 (Exfiltration over USB)' }
-        )
-
-        foreach ($sub in $subcategoriesToCheck) {
-            $row = $auditCsv | Where-Object { $_.Subcategory -eq $sub.Name } | Select-Object -First 1
-            if ($row) {
-                $setting = $row.'Inclusion Setting'
-                $isConfigured = $setting -match 'Success' -or $setting -match 'Failure'
-                if ($isConfigured) {
-                    Add-AuditResult -Category 'Advanced Security Auditing & Event Logging' -Control "Advanced Audit Policy - $($sub.Name)" -Status 'PASS' -Severity $sub.Severity `
-                        -CurrentValue "$setting" -RecommendedValue 'Success and Failure' -CIS_Control 'CIS 8.5' -NIST_Control 'AU-2, AU-12' -MITRE_Technique $sub.Mitre `
-                        -ISO27001_Control 'A.8.15' -NIS2_Article 'Art.21(2)(b)' -NSA_Guidance 'NSA/CISA Audit Logging Best Practices' -Recommendation 'No action required.'
-                } else {
-                    Add-AuditResult -Category 'Advanced Security Auditing & Event Logging' -Control "Advanced Audit Policy - $($sub.Name)" -Status 'FAIL' -Severity $sub.Severity `
-                        -CurrentValue "$setting" -RecommendedValue 'Success and Failure' -CIS_Control 'CIS 8.5' -NIST_Control 'AU-2, AU-12' -MITRE_Technique $sub.Mitre `
-                        -ISO27001_Control 'A.8.15' -NIS2_Article 'Art.21(2)(b)' -NSA_Guidance 'NSA/CISA Audit Logging Best Practices' `
-                        -Recommendation "Enable via: auditpol /set /subcategory:`"$($sub.Name)`" /success:enable /failure:enable, or the equivalent GPO under Advanced Audit Policy Configuration."
-                }
-            } else {
-                Add-AuditResult -Category 'Advanced Security Auditing & Event Logging' -Control "Advanced Audit Policy - $($sub.Name)" -Status 'WARN' -Severity 'Low' `
-                    -CurrentValue 'Subcategory not found in auditpol output' -RecommendedValue 'Success and Failure' -Recommendation 'Verify subcategory name/OS build compatibility and re-run auditpol /get /category:* manually.'
-            }
-        }
-    } catch {
-        Add-AuditResult -Category 'Advanced Security Auditing & Event Logging' -Control 'Advanced Audit Policy Configuration' -Status 'WARN' -Severity 'Low' `
-            -CurrentValue 'Query failed' -Recommendation "Unable to query auditpol.exe: $($_.Exception.Message)"
-    }
-}
-
 function Test-ProcessCreationLogging {
     <#
         Audits whether command-line arguments are captured in process creation events
@@ -2067,12 +2019,12 @@ function Test-NTLMAndAnonymousAccessHardening {
 
         if ([int]$lmLevel -eq 5) {
             Add-AuditResult -Category 'Network Authentication & Credential Exposure' -Control 'LAN Manager Authentication Level' -Status 'PASS' -Severity 'High' `
-                -CurrentValue "LmCompatibilityLevel=$lmLevel (Send NTLMv2 response only, refuse LM & NTLM)" -RecommendedValue '5' -CIS_Control 'CIS 18.3' `
+                -CurrentValue "LmCompatibilityLevel=$lmLevel (Send NTLMv2 response only, refuse LM & NTLM)" -RecommendedValue '5' -CIS_Control 'CIS 4.1' `
                 -NIST_Control 'IA-5, SC-8' -MITRE_Technique 'T1557 (Adversary-in-the-Middle), T1550 (Use Alternate Authentication Material)' -ISO27001_Control 'A.8.24' `
                 -NIS2_Article 'Art.21(2)(h)' -NSA_Guidance 'NSA/CISA CNSA 2.0 Cryptographic Guidance' -Recommendation 'No action required.'
         } else {
             Add-AuditResult -Category 'Network Authentication & Credential Exposure' -Control 'LAN Manager Authentication Level' -Status 'FAIL' -Severity 'High' `
-                -CurrentValue "LmCompatibilityLevel=$lmLevel" -RecommendedValue '5 (Send NTLMv2 response only, refuse LM & NTLM)' -CIS_Control 'CIS 18.3' `
+                -CurrentValue "LmCompatibilityLevel=$lmLevel" -RecommendedValue '5 (Send NTLMv2 response only, refuse LM & NTLM)' -CIS_Control 'CIS 4.1' `
                 -NIST_Control 'IA-5, SC-8' -MITRE_Technique 'T1557 (Adversary-in-the-Middle), T1550 (Use Alternate Authentication Material)' -ISO27001_Control 'A.8.24' `
                 -NIS2_Article 'Art.21(2)(h)' -NSA_Guidance 'NSA/CISA CNSA 2.0 Cryptographic Guidance' `
                 -Recommendation 'Set "Network security: LAN Manager authentication level" to "Send NTLMv2 response only. Refuse LM & NTLM" (LmCompatibilityLevel=5). Legacy LM/NTLMv1 are trivially crackable and vulnerable to relay attacks.'
@@ -2080,23 +2032,23 @@ function Test-NTLMAndAnonymousAccessHardening {
 
         if ([int]$noLmHash -eq 1) {
             Add-AuditResult -Category 'Network Authentication & Credential Exposure' -Control 'LM Hash Storage Prevention' -Status 'PASS' -Severity 'Medium' `
-                -CurrentValue 'NoLmHash=1 (LM hashes not stored)' -RecommendedValue '1' -CIS_Control 'CIS 18.3' -NIST_Control 'IA-5' `
+                -CurrentValue 'NoLmHash=1 (LM hashes not stored)' -RecommendedValue '1' -CIS_Control 'CIS 4.1' -NIST_Control 'IA-5' `
                 -MITRE_Technique 'T1003 (OS Credential Dumping)' -ISO27001_Control 'A.8.24' -NIS2_Article 'Art.21(2)(h)' -Recommendation 'No action required.'
         } else {
             Add-AuditResult -Category 'Network Authentication & Credential Exposure' -Control 'LM Hash Storage Prevention' -Status 'FAIL' -Severity 'Medium' `
-                -CurrentValue 'NoLmHash=0 or not configured' -RecommendedValue '1' -CIS_Control 'CIS 18.3' -NIST_Control 'IA-5' -MITRE_Technique 'T1003 (OS Credential Dumping)' `
+                -CurrentValue 'NoLmHash=0 or not configured' -RecommendedValue '1' -CIS_Control 'CIS 4.1' -NIST_Control 'IA-5' -MITRE_Technique 'T1003 (OS Credential Dumping)' `
                 -ISO27001_Control 'A.8.24' -NIS2_Article 'Art.21(2)(h)' `
                 -Recommendation 'Set "Network security: Do not store LAN Manager hash value on next password change" to Enabled (NoLmHash=1), then force a password change to purge any existing LM hash.'
         }
 
         if ([int]$restrictAnon -eq 1 -and [int]$restrictAnonSam -eq 1) {
             Add-AuditResult -Category 'Network Authentication & Credential Exposure' -Control 'Anonymous SAM/Share Enumeration Restriction' -Status 'PASS' -Severity 'High' `
-                -CurrentValue "RestrictAnonymous=$restrictAnon; RestrictAnonymousSAM=$restrictAnonSam" -RecommendedValue 'Both = 1' -CIS_Control 'CIS 18.3' `
+                -CurrentValue "RestrictAnonymous=$restrictAnon; RestrictAnonymousSAM=$restrictAnonSam" -RecommendedValue 'Both = 1' -CIS_Control 'CIS 4.1' `
                 -NIST_Control 'AC-6, IA-5' -MITRE_Technique 'T1087 (Account Discovery), T1135 (Network Share Discovery)' -ISO27001_Control 'A.8.3' -NIS2_Article 'Art.21(2)(i)' `
                 -NSA_Guidance 'NSA/CISA Identity and Access Management Best Practices' -Recommendation 'No action required.'
         } else {
             Add-AuditResult -Category 'Network Authentication & Credential Exposure' -Control 'Anonymous SAM/Share Enumeration Restriction' -Status 'FAIL' -Severity 'High' `
-                -CurrentValue "RestrictAnonymous=$restrictAnon; RestrictAnonymousSAM=$restrictAnonSam" -RecommendedValue 'Both = 1' -CIS_Control 'CIS 18.3' `
+                -CurrentValue "RestrictAnonymous=$restrictAnon; RestrictAnonymousSAM=$restrictAnonSam" -RecommendedValue 'Both = 1' -CIS_Control 'CIS 4.1' `
                 -NIST_Control 'AC-6, IA-5' -MITRE_Technique 'T1087 (Account Discovery), T1135 (Network Share Discovery)' -ISO27001_Control 'A.8.3' -NIS2_Article 'Art.21(2)(i)' `
                 -NSA_Guidance 'NSA/CISA Identity and Access Management Best Practices' `
                 -Recommendation 'Enable "Network access: Do not allow anonymous enumeration of SAM accounts" and "...SAM accounts and shares" (RestrictAnonymousSAM=1, RestrictAnonymous=1) to prevent unauthenticated account/share reconnaissance.'
@@ -2104,11 +2056,11 @@ function Test-NTLMAndAnonymousAccessHardening {
 
         if ([int]$everyoneIncludesAnon -eq 0) {
             Add-AuditResult -Category 'Network Authentication & Credential Exposure' -Control 'Everyone Permissions Applied to Anonymous Users' -Status 'PASS' -Severity 'Medium' `
-                -CurrentValue 'EveryoneIncludesAnonymous=0 (Disabled)' -RecommendedValue '0' -CIS_Control 'CIS 18.3' -NIST_Control 'AC-6' `
+                -CurrentValue 'EveryoneIncludesAnonymous=0 (Disabled)' -RecommendedValue '0' -CIS_Control 'CIS 4.1' -NIST_Control 'AC-6' `
                 -MITRE_Technique 'T1087 (Account Discovery)' -ISO27001_Control 'A.8.3' -NIS2_Article 'Art.21(2)(i)' -Recommendation 'No action required.'
         } else {
             Add-AuditResult -Category 'Network Authentication & Credential Exposure' -Control 'Everyone Permissions Applied to Anonymous Users' -Status 'FAIL' -Severity 'Medium' `
-                -CurrentValue 'EveryoneIncludesAnonymous=1 (Enabled)' -RecommendedValue '0' -CIS_Control 'CIS 18.3' -NIST_Control 'AC-6' -MITRE_Technique 'T1087 (Account Discovery)' `
+                -CurrentValue 'EveryoneIncludesAnonymous=1 (Enabled)' -RecommendedValue '0' -CIS_Control 'CIS 4.1' -NIST_Control 'AC-6' -MITRE_Technique 'T1087 (Account Discovery)' `
                 -ISO27001_Control 'A.8.3' -NIS2_Article 'Art.21(2)(i)' `
                 -Recommendation 'Disable "Network access: Let Everyone permissions apply to anonymous users" (EveryoneIncludesAnonymous=0) so anonymous connections do not inherit Everyone-group ACL access.'
         }
@@ -2131,12 +2083,12 @@ function Test-SMBInsecureGuestLogon {
 
         if ($allowInsecureGuest -eq 0) {
             Add-AuditResult -Category 'Network Authentication & Credential Exposure' -Control 'SMB Insecure Guest Logon' -Status 'PASS' -Severity 'High' `
-                -CurrentValue 'Disabled' -RecommendedValue 'Disabled' -CIS_Control 'CIS 18.3' -NIST_Control 'IA-2, SC-8' `
+                -CurrentValue 'Disabled' -RecommendedValue 'Disabled' -CIS_Control 'CIS 4.1' -NIST_Control 'IA-2, SC-8' `
                 -MITRE_Technique 'T1021.002 (SMB/Windows Admin Shares), T1557 (Adversary-in-the-Middle)' -ISO27001_Control 'A.8.20' -NIS2_Article 'Art.21(2)(d)' `
                 -NSA_Guidance 'NSA/CISA Guidance on SMB Signing' -Recommendation 'No action required.'
         } else {
             Add-AuditResult -Category 'Network Authentication & Credential Exposure' -Control 'SMB Insecure Guest Logon' -Status 'FAIL' -Severity 'High' `
-                -CurrentValue 'Enabled / Not Configured' -RecommendedValue 'Disabled' -CIS_Control 'CIS 18.3' -NIST_Control 'IA-2, SC-8' `
+                -CurrentValue 'Enabled / Not Configured' -RecommendedValue 'Disabled' -CIS_Control 'CIS 4.1' -NIST_Control 'IA-2, SC-8' `
                 -MITRE_Technique 'T1021.002 (SMB/Windows Admin Shares), T1557 (Adversary-in-the-Middle)' -ISO27001_Control 'A.8.20' -NIS2_Article 'Art.21(2)(d)' `
                 -NSA_Guidance 'NSA/CISA Guidance on SMB Signing' `
                 -Recommendation 'Set GPO "Enable insecure guest logons" (Computer Configuration > Administrative Templates > Network > Lanman Workstation) to Disabled, writing AllowInsecureGuestAuth=0.'
@@ -2161,24 +2113,24 @@ function Test-RestrictNTLMUsage {
 
         if ($null -ne $outgoing -and [int]$outgoing -ge 1) {
             Add-AuditResult -Category 'Network Authentication & Credential Exposure' -Control 'Restrict NTLM - Outgoing Traffic' -Status 'PASS' -Severity 'Medium' `
-                -CurrentValue "RestrictSendingNTLMTraffic=$outgoing" -RecommendedValue '>=1 (Audit or Deny All)' -CIS_Control 'CIS 18.3' -NIST_Control 'IA-2, AC-17' `
+                -CurrentValue "RestrictSendingNTLMTraffic=$outgoing" -RecommendedValue '>=1 (Audit or Deny All)' -CIS_Control 'CIS 4.1' -NIST_Control 'IA-2, AC-17' `
                 -MITRE_Technique 'T1550 (Use Alternate Authentication Material), T1557 (Adversary-in-the-Middle)' -ISO27001_Control 'A.8.5' -NIS2_Article 'Art.21(2)(i)' `
                 -NSA_Guidance 'NSA/CISA Advancing Zero Trust Maturity - Device Pillar' -Recommendation 'No action required.'
         } else {
             Add-AuditResult -Category 'Network Authentication & Credential Exposure' -Control 'Restrict NTLM - Outgoing Traffic' -Status 'INFO' -Severity 'Informational' `
-                -CurrentValue 'Not Configured (NTLM outgoing unrestricted)' -RecommendedValue 'Audit, then Deny All once exception list is validated' -CIS_Control 'CIS 18.3' `
+                -CurrentValue 'Not Configured (NTLM outgoing unrestricted)' -RecommendedValue 'Audit, then Deny All once exception list is validated' -CIS_Control 'CIS 4.1' `
                 -NIST_Control 'IA-2, AC-17' -ISO27001_Control 'A.8.5' -NIS2_Article 'Art.21(2)(i)' -NSA_Guidance 'NSA/CISA Advancing Zero Trust Maturity - Device Pillar' `
                 -Recommendation 'Consider "Network security: Restrict NTLM: Outgoing NTLM traffic to remote servers" starting in Audit mode to build an exception list, then move to Deny All in mature Kerberos-first environments.'
         }
 
         if ($null -ne $incoming -and [int]$incoming -ge 1) {
             Add-AuditResult -Category 'Network Authentication & Credential Exposure' -Control 'Restrict NTLM - Incoming Traffic' -Status 'PASS' -Severity 'Medium' `
-                -CurrentValue "RestrictReceivingNTLMTraffic=$incoming" -RecommendedValue '>=1 (Deny domain accounts or Deny All)' -CIS_Control 'CIS 18.3' -NIST_Control 'IA-2, AC-17' `
+                -CurrentValue "RestrictReceivingNTLMTraffic=$incoming" -RecommendedValue '>=1 (Deny domain accounts or Deny All)' -CIS_Control 'CIS 4.1' -NIST_Control 'IA-2, AC-17' `
                 -MITRE_Technique 'T1550 (Use Alternate Authentication Material)' -ISO27001_Control 'A.8.5' -NIS2_Article 'Art.21(2)(i)' `
                 -NSA_Guidance 'NSA/CISA Advancing Zero Trust Maturity - Device Pillar' -Recommendation 'No action required.'
         } else {
             Add-AuditResult -Category 'Network Authentication & Credential Exposure' -Control 'Restrict NTLM - Incoming Traffic' -Status 'INFO' -Severity 'Informational' `
-                -CurrentValue 'Not Configured (NTLM incoming unrestricted)' -RecommendedValue 'Deny domain accounts or Deny All once validated' -CIS_Control 'CIS 18.3' `
+                -CurrentValue 'Not Configured (NTLM incoming unrestricted)' -RecommendedValue 'Deny domain accounts or Deny All once validated' -CIS_Control 'CIS 4.1' `
                 -NIST_Control 'IA-2, AC-17' -ISO27001_Control 'A.8.5' -NIS2_Article 'Art.21(2)(i)' -NSA_Guidance 'NSA/CISA Advancing Zero Trust Maturity - Device Pillar' `
                 -Recommendation 'Consider "Network security: Restrict NTLM: Incoming NTLM traffic" to reduce this host''s acceptance of legacy NTLM authentication as part of a Zero Trust, Kerberos-first posture.'
         }
@@ -2214,34 +2166,35 @@ function Test-UserRightsAssignment {
         }
 
         $guestSid = 'S-1-5-32-546'
+        $localAccountSid = 'S-1-5-113'   # "Local account": blocks pass-the-hash with local accounts
         $denyNetwork = Get-PrivilegeLine $cfg 'SeDenyNetworkLogonRight'
         $denyRemoteInteractive = Get-PrivilegeLine $cfg 'SeDenyRemoteInteractiveLogonRight'
         $debugPrivilege = Get-PrivilegeLine $cfg 'SeDebugPrivilege'
 
-        if ($denyNetwork -match [regex]::Escape($guestSid)) {
-            Add-AuditResult -Category 'Identity, Privilege Management & Access Control' -Control 'User Right - Deny Network Logon for Guest' -Status 'PASS' -Severity 'Medium' `
-                -CurrentValue 'Guests group present in SeDenyNetworkLogonRight' -RecommendedValue 'Guests group present' -CIS_Control 'CIS 5.2' -NIST_Control 'AC-6, AC-2' `
+        if ($denyNetwork -match [regex]::Escape($guestSid) -and $denyNetwork -match [regex]::Escape($localAccountSid)) {
+            Add-AuditResult -Category 'Identity, Privilege Management & Access Control' -Control 'User Right - Deny Network Logon for Guests and Local Accounts' -Status 'PASS' -Severity 'Medium' `
+                -CurrentValue 'Guests and Local account present in SeDenyNetworkLogonRight' -RecommendedValue 'Guests and Local account (S-1-5-113) present (CIS 2.2.15/2.2.19)' -CIS_Control 'CIS 5.2' -NIST_Control 'AC-6, AC-2' `
                 -MITRE_Technique 'T1078.001 (Default Accounts)' -ISO27001_Control 'A.8.2' -NIS2_Article 'Art.21(2)(i)' `
                 -NSA_Guidance 'NSA/CISA Identity and Access Management Best Practices' -Recommendation 'No action required.'
         } else {
-            Add-AuditResult -Category 'Identity, Privilege Management & Access Control' -Control 'User Right - Deny Network Logon for Guest' -Status 'FAIL' -Severity 'Medium' `
-                -CurrentValue 'Guests group NOT present in SeDenyNetworkLogonRight' -RecommendedValue 'Guests group present' -CIS_Control 'CIS 5.2' -NIST_Control 'AC-6, AC-2' `
+            Add-AuditResult -Category 'Identity, Privilege Management & Access Control' -Control 'User Right - Deny Network Logon for Guests and Local Accounts' -Status 'FAIL' -Severity 'Medium' `
+                -CurrentValue "SeDenyNetworkLogonRight: Guests $(if ($denyNetwork -match [regex]::Escape($guestSid)) { 'present' } else { 'missing' }), Local account $(if ($denyNetwork -match [regex]::Escape($localAccountSid)) { 'present' } else { 'missing' })" -RecommendedValue 'Guests and Local account (S-1-5-113) present (CIS 2.2.15/2.2.19)' -CIS_Control 'CIS 5.2' -NIST_Control 'AC-6, AC-2' `
                 -MITRE_Technique 'T1078.001 (Default Accounts)' -ISO27001_Control 'A.8.2' -NIS2_Article 'Art.21(2)(i)' `
                 -NSA_Guidance 'NSA/CISA Identity and Access Management Best Practices' `
-                -Recommendation 'Add the Guests group to "Deny access to this computer from the network" (SeDenyNetworkLogonRight) via Local Security Policy > User Rights Assignment.'
+                -Recommendation 'Add Guests and "Local account" to "Deny access to this computer from the network" (SeDenyNetworkLogonRight) via Local Security Policy > User Rights Assignment. Denying local accounts network logon stops pass-the-hash with a local administrator hash.'
         }
 
-        if ($denyRemoteInteractive -match [regex]::Escape($guestSid)) {
-            Add-AuditResult -Category 'Identity, Privilege Management & Access Control' -Control 'User Right - Deny Remote Interactive Logon for Guest' -Status 'PASS' -Severity 'Medium' `
-                -CurrentValue 'Guests group present in SeDenyRemoteInteractiveLogonRight' -RecommendedValue 'Guests group present' -CIS_Control 'CIS 5.2' -NIST_Control 'AC-6, AC-17' `
+        if ($denyRemoteInteractive -match [regex]::Escape($guestSid) -and $denyRemoteInteractive -match [regex]::Escape($localAccountSid)) {
+            Add-AuditResult -Category 'Identity, Privilege Management & Access Control' -Control 'User Right - Deny Remote Interactive Logon for Guests and Local Accounts' -Status 'PASS' -Severity 'Medium' `
+                -CurrentValue 'Guests and Local account present in SeDenyRemoteInteractiveLogonRight' -RecommendedValue 'Guests and Local account (S-1-5-113) present (CIS 2.2.15/2.2.19)' -CIS_Control 'CIS 5.2' -NIST_Control 'AC-6, AC-17' `
                 -MITRE_Technique 'T1078.001 (Default Accounts), T1021.001 (Remote Desktop Protocol)' -ISO27001_Control 'A.8.2' -NIS2_Article 'Art.21(2)(i)' `
                 -NSA_Guidance 'NSA/CISA Identity and Access Management Best Practices' -Recommendation 'No action required.'
         } else {
-            Add-AuditResult -Category 'Identity, Privilege Management & Access Control' -Control 'User Right - Deny Remote Interactive Logon for Guest' -Status 'FAIL' -Severity 'Medium' `
-                -CurrentValue 'Guests group NOT present in SeDenyRemoteInteractiveLogonRight' -RecommendedValue 'Guests group present' -CIS_Control 'CIS 5.2' -NIST_Control 'AC-6, AC-17' `
+            Add-AuditResult -Category 'Identity, Privilege Management & Access Control' -Control 'User Right - Deny Remote Interactive Logon for Guests and Local Accounts' -Status 'FAIL' -Severity 'Medium' `
+                -CurrentValue "SeDenyRemoteInteractiveLogonRight: Guests $(if ($denyRemoteInteractive -match [regex]::Escape($guestSid)) { 'present' } else { 'missing' }), Local account $(if ($denyRemoteInteractive -match [regex]::Escape($localAccountSid)) { 'present' } else { 'missing' })" -RecommendedValue 'Guests and Local account (S-1-5-113) present (CIS 2.2.15/2.2.19)' -CIS_Control 'CIS 5.2' -NIST_Control 'AC-6, AC-17' `
                 -MITRE_Technique 'T1078.001 (Default Accounts), T1021.001 (Remote Desktop Protocol)' -ISO27001_Control 'A.8.2' -NIS2_Article 'Art.21(2)(i)' `
                 -NSA_Guidance 'NSA/CISA Identity and Access Management Best Practices' `
-                -Recommendation 'Add the Guests group to "Deny log on through Remote Desktop Services" (SeDenyRemoteInteractiveLogonRight) via Local Security Policy > User Rights Assignment.'
+                -Recommendation 'Add Guests and "Local account" to "Deny log on through Remote Desktop Services" (SeDenyRemoteInteractiveLogonRight) via Local Security Policy > User Rights Assignment.'
         }
 
         $debugAssignees = ($debugPrivilege -split ',') | Where-Object { $_ -ne '' }
@@ -2336,11 +2289,11 @@ function Test-InteractiveLogonHardening {
         [void][int]::TryParse([string]$cachedLogons, [ref]$cachedLogonsInt)
         if ($cachedLogonsInt -le 4) {
             Add-AuditResult -Category 'Identity, Privilege Management & Access Control' -Control 'Cached Domain Credentials Count' -Status 'PASS' -Severity 'Low' `
-                -CurrentValue "$cachedLogonsInt cached logon(s)" -RecommendedValue '<= 4 (0-2 for high-security endpoints)' -CIS_Control 'CIS 18.3' -NIST_Control 'IA-5' `
+                -CurrentValue "$cachedLogonsInt cached logon(s)" -RecommendedValue '<= 4 (0-2 for high-security endpoints)' -CIS_Control 'CIS 4.1' -NIST_Control 'IA-5' `
                 -MITRE_Technique 'T1003 (OS Credential Dumping)' -ISO27001_Control 'A.8.5' -NIS2_Article 'Art.21(2)(i)' -Recommendation 'No action required.'
         } else {
             Add-AuditResult -Category 'Identity, Privilege Management & Access Control' -Control 'Cached Domain Credentials Count' -Status 'WARN' -Severity 'Low' `
-                -CurrentValue "$cachedLogonsInt cached logon(s)" -RecommendedValue '<= 4 (0-2 for high-security endpoints)' -CIS_Control 'CIS 18.3' -NIST_Control 'IA-5' `
+                -CurrentValue "$cachedLogonsInt cached logon(s)" -RecommendedValue '<= 4 (0-2 for high-security endpoints)' -CIS_Control 'CIS 4.1' -NIST_Control 'IA-5' `
                 -MITRE_Technique 'T1003 (OS Credential Dumping)' -ISO27001_Control 'A.8.5' -NIS2_Article 'Art.21(2)(i)' `
                 -Recommendation 'Reduce "Interactive logon: Number of previous logons to cache" to 4 or fewer via GPO (CachedLogonsCount) to limit the offline-crackable credential cache footprint on this device.'
         }
@@ -3285,12 +3238,12 @@ function Test-WDigestCredentialCaching {
 
         if ([int]$useLogonCredential -eq 0) {
             Add-AuditResult -Category 'Credential Exposure & Secret Leaks' -Control 'WDigest Plaintext Credential Caching' -Status 'PASS' -Severity 'Critical' `
-                -CurrentValue 'UseLogonCredential=0 (Disabled)' -RecommendedValue '0' -CIS_Control 'CIS 18.3' -NIST_Control 'IA-5, SC-28' `
+                -CurrentValue 'UseLogonCredential=0 (Disabled)' -RecommendedValue '0' -CIS_Control 'CIS 4.1' -NIST_Control 'IA-5, SC-28' `
                 -MITRE_Technique 'T1003.001 (LSASS Memory)' -ISO27001_Control 'A.8.5' -NIS2_Article 'Art.21(2)(h)' -NSA_Guidance 'NSA CSI: Mitigating Credential Theft' `
                 -Recommendation 'No action required.'
         } else {
             Add-AuditResult -Category 'Credential Exposure & Secret Leaks' -Control 'WDigest Plaintext Credential Caching' -Status 'FAIL' -Severity 'Critical' `
-                -CurrentValue 'UseLogonCredential=1 (Enabled)' -RecommendedValue '0' -CIS_Control 'CIS 18.3' -NIST_Control 'IA-5, SC-28' `
+                -CurrentValue 'UseLogonCredential=1 (Enabled)' -RecommendedValue '0' -CIS_Control 'CIS 4.1' -NIST_Control 'IA-5, SC-28' `
                 -MITRE_Technique 'T1003.001 (LSASS Memory)' -ISO27001_Control 'A.8.5' -NIS2_Article 'Art.21(2)(h)' -NSA_Guidance 'NSA CSI: Mitigating Credential Theft' `
                 -Recommendation 'Set HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest\UseLogonCredential (DWORD) = 0. With this enabled, any LSASS memory dump yields plaintext-equivalent passwords for every logged-on user, regardless of LSA Protection status.'
         }
@@ -3317,17 +3270,17 @@ function Test-PlaintextAutologonCredentials {
         if ([string]$autoAdminLogon -eq '1' -and -not [string]::IsNullOrWhiteSpace($defaultPassword)) {
             Add-AuditResult -Category 'Credential Exposure & Secret Leaks' -Control 'Plaintext Autologon Credentials in Registry' -Status 'FAIL' -Severity 'Critical' `
                 -CurrentValue "AutoAdminLogon=1; DefaultUserName=$defaultUserName; DefaultPassword=<present, redacted>" -RecommendedValue 'AutoAdminLogon=0, no DefaultPassword value present' `
-                -CIS_Control 'CIS 18.3' -NIST_Control 'IA-5, SC-28' -MITRE_Technique 'T1552.002 (Credentials in Registry)' -ISO27001_Control 'A.8.5' -NIS2_Article 'Art.21(2)(h)' `
+                -CIS_Control 'CIS 4.1' -NIST_Control 'IA-5, SC-28' -MITRE_Technique 'T1552.002 (Credentials in Registry)' -ISO27001_Control 'A.8.5' -NIS2_Article 'Art.21(2)(h)' `
                 -NSA_Guidance 'NSA CSI: Mitigating Credential Theft' `
                 -Recommendation 'Remove DefaultPassword from HKLM:\...\Winlogon and disable AutoAdminLogon (set to 0). This registry key is world-readable, exposing the plaintext password to every local account. Use a credential vault or Autologon (Sysinternals), which stores the secret via LSA Secrets rather than plaintext, if autologon is truly required.'
         } elseif ([string]$autoAdminLogon -eq '1') {
             Add-AuditResult -Category 'Credential Exposure & Secret Leaks' -Control 'Plaintext Autologon Credentials in Registry' -Status 'WARN' -Severity 'Medium' `
                 -CurrentValue "AutoAdminLogon=1; DefaultUserName=$defaultUserName; no plaintext DefaultPassword found in this key" -RecommendedValue 'AutoAdminLogon=0' `
-                -CIS_Control 'CIS 18.3' -NIST_Control 'IA-5, SC-28' -MITRE_Technique 'T1552.002 (Credentials in Registry)' -ISO27001_Control 'A.8.5' -NIS2_Article 'Art.21(2)(h)' `
+                -CIS_Control 'CIS 4.1' -NIST_Control 'IA-5, SC-28' -MITRE_Technique 'T1552.002 (Credentials in Registry)' -ISO27001_Control 'A.8.5' -NIS2_Article 'Art.21(2)(h)' `
                 -Recommendation 'AutoAdminLogon is enabled without a plaintext DefaultPassword value present (the credential may be stored via LSA Secrets instead, which is less exposed but still bypasses interactive authentication). Disable autologon unless there is a specific, documented business justification (e.g. a kiosk device).'
         } else {
             Add-AuditResult -Category 'Credential Exposure & Secret Leaks' -Control 'Plaintext Autologon Credentials in Registry' -Status 'PASS' -Severity 'Critical' `
-                -CurrentValue 'AutoAdminLogon not enabled' -RecommendedValue 'AutoAdminLogon=0' -CIS_Control 'CIS 18.3' -NIST_Control 'IA-5, SC-28' `
+                -CurrentValue 'AutoAdminLogon not enabled' -RecommendedValue 'AutoAdminLogon=0' -CIS_Control 'CIS 4.1' -NIST_Control 'IA-5, SC-28' `
                 -MITRE_Technique 'T1552.002 (Credentials in Registry)' -ISO27001_Control 'A.8.5' -NIS2_Article 'Art.21(2)(h)' -Recommendation 'No action required.'
         }
     } catch {
@@ -3412,12 +3365,12 @@ function Test-GPPCachedCredentials {
 
         if ($foundFiles.Count -eq 0) {
             Add-AuditResult -Category 'Credential Exposure & Secret Leaks' -Control 'GPP Cached Credentials (cpassword)' -Status 'PASS' -Severity 'Critical' `
-                -CurrentValue 'No cpassword-bearing files found in the local GPP history cache' -RecommendedValue 'None present' -CIS_Control 'CIS 18.3' -NIST_Control 'IA-5, SC-28' `
+                -CurrentValue 'No cpassword-bearing files found in the local GPP history cache' -RecommendedValue 'None present' -CIS_Control 'CIS 4.1' -NIST_Control 'IA-5, SC-28' `
                 -MITRE_Technique 'T1552.006 (Group Policy Preferences)' -ISO27001_Control 'A.8.5' -NIS2_Article 'Art.21(2)(h)' -NSA_Guidance 'NSA CSI: Mitigating Credential Theft' `
                 -Recommendation 'No action required locally. This check only covers the local CSE cache - if the organization still deploys GPP-based credentials from SYSVOL, that must be remediated centrally at the domain level (MS14-025) regardless of this endpoint''s result.'
         } else {
             Add-AuditResult -Category 'Credential Exposure & Secret Leaks' -Control 'GPP Cached Credentials (cpassword)' -Status 'FAIL' -Severity 'Critical' `
-                -CurrentValue "$($foundFiles.Count) file(s) with a cpassword attribute: $($foundFiles -join ' | ')" -RecommendedValue 'None present' -CIS_Control 'CIS 18.3' `
+                -CurrentValue "$($foundFiles.Count) file(s) with a cpassword attribute: $($foundFiles -join ' | ')" -RecommendedValue 'None present' -CIS_Control 'CIS 4.1' `
                 -NIST_Control 'IA-5, SC-28' -MITRE_Technique 'T1552.006 (Group Policy Preferences)' -ISO27001_Control 'A.8.5' -NIS2_Article 'Art.21(2)(h)' `
                 -NSA_Guidance 'NSA CSI: Mitigating Credential Theft' `
                 -Recommendation 'The AES key Microsoft used to encrypt GPP cpassword values has been public since 2012 (MS14-025); any cpassword value is equivalent to a plaintext password. Remove the offending GPP policy at the domain level (Group Policy Preferences credential-based items), then purge this local cache and rotate every credential that was ever distributed this way.'
@@ -3446,12 +3399,12 @@ function Test-SAMSystemHiveProtection {
             if ($check.IsVulnerable) {
                 $anyVulnerable = $true
                 Add-AuditResult -Category 'Credential Exposure & Secret Leaks' -Control "Registry Hive File Permissions - $(Split-Path $hive -Leaf)" -Status 'FAIL' -Severity 'Critical' `
-                    -CurrentValue "Grants: $($check.Principals -join '; ')" -RecommendedValue 'No Everyone/Authenticated Users/Users grant' -CIS_Control 'CIS 18.3' -NIST_Control 'AC-6, SC-28' `
+                    -CurrentValue "Grants: $($check.Principals -join '; ')" -RecommendedValue 'No Everyone/Authenticated Users/Users grant' -CIS_Control 'CIS 4.1' -NIST_Control 'AC-6, SC-28' `
                     -MITRE_Technique 'T1003.002 (Security Account Manager)' -ISO27001_Control 'A.8.5' -NIS2_Article 'Art.21(2)(h)' -NSA_Guidance 'NSA CSI: Mitigating Credential Theft' `
                     -Recommendation "Restore default NTFS permissions on `"$hive`" (SYSTEM/Administrators only): icacls `"$hive`" /reset, then re-apply inheritance from the parent System32\config folder."
             } else {
                 Add-AuditResult -Category 'Credential Exposure & Secret Leaks' -Control "Registry Hive File Permissions - $(Split-Path $hive -Leaf)" -Status 'PASS' -Severity 'Critical' `
-                    -CurrentValue 'Default-restrictive ACL (no low-privilege grant found)' -RecommendedValue 'No Everyone/Authenticated Users/Users grant' -CIS_Control 'CIS 18.3' `
+                    -CurrentValue 'Default-restrictive ACL (no low-privilege grant found)' -RecommendedValue 'No Everyone/Authenticated Users/Users grant' -CIS_Control 'CIS 4.1' `
                     -NIST_Control 'AC-6, SC-28' -MITRE_Technique 'T1003.002 (Security Account Manager)' -ISO27001_Control 'A.8.5' -NIS2_Article 'Art.21(2)(h)' -Recommendation 'No action required.'
             }
         } catch {
@@ -3463,7 +3416,7 @@ function Test-SAMSystemHiveProtection {
     if (-not $anyHiveFound) {
         Add-AuditResult -Category 'Credential Exposure & Secret Leaks' -Control 'Registry Hive File Permissions (SAM/SYSTEM/SECURITY)' -Status 'WARN' -Severity 'Low' `
             -CurrentValue 'None of SAM, SYSTEM, or SECURITY were found at the standard System32\config path' -RecommendedValue 'Hive files present with default-restrictive ACLs' `
-            -CIS_Control 'CIS 18.3' -NIST_Control 'AC-6, SC-28' -Recommendation 'Unexpected on a standard Windows 11 installation - verify this endpoint''s System32\config directory is intact, or that this scan is not running inside a restricted/virtualized context that hides the path.'
+            -CIS_Control 'CIS 4.1' -NIST_Control 'AC-6, SC-28' -Recommendation 'Unexpected on a standard Windows 11 installation - verify this endpoint''s System32\config directory is intact, or that this scan is not running inside a restricted/virtualized context that hides the path.'
     }
 
     try {
@@ -3472,7 +3425,7 @@ function Test-SAMSystemHiveProtection {
         if ($shadowOutput) { $shadowCount = @($shadowOutput | Select-String -Pattern 'Shadow Copy ID' -SimpleMatch).Count }
         if ($shadowCount -gt 0) {
             Add-AuditResult -Category 'Credential Exposure & Secret Leaks' -Control 'Volume Shadow Copy Exposure (SAM/SYSTEM Backup Vector)' -Status 'INFO' -Severity 'Informational' `
-                -CurrentValue "$shadowCount shadow copy/copies present on C:" -RecommendedValue 'Awareness item - not inherently a misconfiguration' -CIS_Control 'CIS 18.3' `
+                -CurrentValue "$shadowCount shadow copy/copies present on C:" -RecommendedValue 'Awareness item - not inherently a misconfiguration' -CIS_Control 'CIS 4.1' `
                 -NIST_Control 'AC-6, SC-28' -MITRE_Technique 'T1003.002 (Security Account Manager)' -ISO27001_Control 'A.8.5' -NIS2_Article 'Art.21(2)(h)' `
                 -Recommendation 'Shadow copies can be used to extract SAM/SYSTEM/NTDS.dit via "reg save" against a mounted shadow copy path, bypassing the live-file lock. This is expected on many systems (System Restore/backup software) - ensure only Administrators can invoke vssadmin/wmic shadowcopy and that EDR alerts on shadow-copy-based hive extraction attempts.'
         }
@@ -3511,12 +3464,12 @@ function Test-LSASecurityPackages {
         if ($unexpectedSecurity.Count -eq 0 -and $unexpectedAuth.Count -eq 0) {
             Add-AuditResult -Category 'Credential Exposure & Secret Leaks' -Control 'LSA Security Package / Authentication Package Registration' -Status 'PASS' -Severity 'High' `
                 -CurrentValue "Security Packages: $($securityPackages -join ', '); Authentication Packages: $($authPackages -join ', ')" -RecommendedValue 'Only known Microsoft-provided packages registered' `
-                -CIS_Control 'CIS 18.3' -NIST_Control 'CM-7, SI-7' -MITRE_Technique 'T1556.002 (Security Support Provider)' -ISO27001_Control 'A.8.19' -NIS2_Article 'Art.21(2)(e)' `
+                -CIS_Control 'CIS 4.1' -NIST_Control 'CM-7, SI-7' -MITRE_Technique 'T1556.002 (Security Support Provider)' -ISO27001_Control 'A.8.19' -NIS2_Article 'Art.21(2)(e)' `
                 -NSA_Guidance 'NSA CSI: Mitigating Credential Theft' -Recommendation 'No action required.'
         } else {
             Add-AuditResult -Category 'Credential Exposure & Secret Leaks' -Control 'LSA Security Package / Authentication Package Registration' -Status 'WARN' -Severity 'High' `
                 -CurrentValue "Unexpected Security Packages: $($unexpectedSecurity -join ', '); Unexpected Authentication Packages: $($unexpectedAuth -join ', ')" `
-                -RecommendedValue 'Only known Microsoft-provided packages registered' -CIS_Control 'CIS 18.3' -NIST_Control 'CM-7, SI-7' -MITRE_Technique 'T1556.002 (Security Support Provider)' `
+                -RecommendedValue 'Only known Microsoft-provided packages registered' -CIS_Control 'CIS 4.1' -NIST_Control 'CM-7, SI-7' -MITRE_Technique 'T1556.002 (Security Support Provider)' `
                 -ISO27001_Control 'A.8.19' -NIS2_Article 'Art.21(2)(e)' -NSA_Guidance 'NSA CSI: Mitigating Credential Theft' `
                 -Recommendation 'Investigate each unrecognized package: locate its backing DLL (via the corresponding value under HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\SecurityProviders or the package''s own registration key), verify it is signed by a trusted vendor (smartcard middleware, VPN clients, and some AV suites legitimately register SSPs), and remove it if it cannot be attributed to approved software - malicious SSPs can intercept every credential that passes through LSA in plaintext.'
         }
@@ -4955,7 +4908,7 @@ function Test-SeamlessSSOAndKerberosCloudTGT {
         }
 
         Add-AuditResult -Category 'Modern Identity & Cloud Token Security' -Control 'Kerberos TGT Lifetime (Domain Policy)' -Status 'INFO' -Severity 'Informational' `
-            -CurrentValue 'Not evaluable from this endpoint' -RecommendedValue 'Maximum ticket age <= 10 hours, enforced via Default Domain Policy' -CIS_Control 'CIS 18.3' -NIST_Control 'IA-5' `
+            -CurrentValue 'Not evaluable from this endpoint' -RecommendedValue 'Maximum ticket age <= 10 hours, enforced via Default Domain Policy' -CIS_Control 'CIS 4.1' -NIST_Control 'IA-5' `
             -ISO27001_Control 'A.8.5' -NIS2_Article 'Art.21(2)(i)' `
             -Recommendation 'Kerberos ticket lifetime (MaxTicketAge/MaxRenewAge) is a Kerberos Policy setting enforced by domain controllers via the Default Domain Policy, not a per-workstation setting this audit can read locally. Verify TGT lifetime centrally on the domain (Group Policy Management > Default Domain Policy > Account Policies > Kerberos Policy) rather than on individual endpoints.'
     } catch {
@@ -6069,12 +6022,12 @@ function Test-WindowsCopilotPolicy {
 
         if ($turnOffCopilot -eq 1) {
             Add-AuditResult -Category 'AI & Telemetry Hardening' -Control 'Windows Copilot Policy' -Status 'PASS' -Severity 'Medium' `
-                -CurrentValue 'Turned off via policy' -RecommendedValue 'Turned off, unless explicitly approved for this data-sensitivity tier' -CIS_Control 'CIS 18.9' -NIST_Control 'SC-7, PT-2' `
+                -CurrentValue 'Turned off via policy' -RecommendedValue 'Turned off, unless explicitly approved for this data-sensitivity tier' -CIS_Control 'CIS 4.1' -NIST_Control 'SC-7, PT-2' `
                 -MITRE_Technique 'T1213 (Data from Information Repositories)' -ISO27001_Control 'A.8.11' -NIS2_Article 'Art.21(2)(h)' -Recommendation 'No action required.'
         } else {
             Add-AuditResult -Category 'AI & Telemetry Hardening' -Control 'Windows Copilot Policy' -Status 'INFO' -Severity 'Informational' `
                 -CurrentValue 'Not explicitly turned off (default OS behavior applies)' -RecommendedValue 'Turned off via GPO/Intune if the organization has not completed a data-handling/DLP review for AI-assistant features' `
-                -CIS_Control 'CIS 18.9' -NIST_Control 'SC-7, PT-2' -ISO27001_Control 'A.8.11' -NIS2_Article 'Art.21(2)(h)' `
+                -CIS_Control 'CIS 4.1' -NIST_Control 'SC-7, PT-2' -ISO27001_Control 'A.8.11' -NIS2_Article 'Art.21(2)(h)' `
                 -Recommendation 'This is a policy/business decision, not a universal defect. If the organization has not completed a data-handling review for AI-assistant features that can process on-screen/clipboard/file content, set "Turn off Windows Copilot" (Computer Configuration > Administrative Templates > Windows Components > Windows Copilot) to Enabled.'
         }
     } catch {
@@ -6154,16 +6107,16 @@ function Test-TelemetryLevel {
 
         if ($null -eq $allowTelemetry) {
             Add-AuditResult -Category 'AI & Telemetry Hardening' -Control 'Diagnostic Data Collection Level (AllowTelemetry)' -Status 'INFO' -Severity 'Informational' `
-                -CurrentValue 'Not Configured (OS default applies)' -RecommendedValue '0 (Security, Enterprise/Education only) or 1 (Required/Basic)' -CIS_Control 'CIS 18.9' -NIST_Control 'PT-2, SC-7' `
+                -CurrentValue 'Not Configured (OS default applies)' -RecommendedValue '0 (Security, Enterprise/Education only) or 1 (Required/Basic)' -CIS_Control 'CIS 4.1' -NIST_Control 'PT-2, SC-7' `
                 -ISO27001_Control 'A.8.11' -NIS2_Article 'Art.21(2)(h)' `
                 -Recommendation 'Set "Allow Diagnostic Data" (Computer Configuration > Administrative Templates > Windows Components > Data Collection and Preview Builds) to Diagnostic data off (Security, Enterprise/Education edition only) or Required diagnostic data, to minimize the diagnostic data footprint leaving the endpoint.'
         } elseif ([int]$allowTelemetry -le 1) {
             Add-AuditResult -Category 'AI & Telemetry Hardening' -Control 'Diagnostic Data Collection Level (AllowTelemetry)' -Status 'PASS' -Severity 'Medium' `
-                -CurrentValue "AllowTelemetry=$allowTelemetry" -RecommendedValue '0 (Security) or 1 (Required/Basic)' -CIS_Control 'CIS 18.9' -NIST_Control 'PT-2, SC-7' -ISO27001_Control 'A.8.11' `
+                -CurrentValue "AllowTelemetry=$allowTelemetry" -RecommendedValue '0 (Security) or 1 (Required/Basic)' -CIS_Control 'CIS 4.1' -NIST_Control 'PT-2, SC-7' -ISO27001_Control 'A.8.11' `
                 -NIS2_Article 'Art.21(2)(h)' -Recommendation 'No action required.'
         } else {
             Add-AuditResult -Category 'AI & Telemetry Hardening' -Control 'Diagnostic Data Collection Level (AllowTelemetry)' -Status 'FAIL' -Severity 'Medium' `
-                -CurrentValue "AllowTelemetry=$allowTelemetry (Optional/Full diagnostic data)" -RecommendedValue '0 (Security) or 1 (Required/Basic)' -CIS_Control 'CIS 18.9' -NIST_Control 'PT-2, SC-7' `
+                -CurrentValue "AllowTelemetry=$allowTelemetry (Optional/Full diagnostic data)" -RecommendedValue '0 (Security) or 1 (Required/Basic)' -CIS_Control 'CIS 4.1' -NIST_Control 'PT-2, SC-7' `
                 -ISO27001_Control 'A.8.11' -NIS2_Article 'Art.21(2)(h)' `
                 -Recommendation 'Reduce "Allow Diagnostic Data" to Required diagnostic data (1) or, on Enterprise/Education editions, Diagnostic data off (0). The Optional/Full tier collects substantially more diagnostic content, which can be a compliance concern for regulated data environments.'
         }
@@ -6718,7 +6671,7 @@ function Test-FirewallLoggingConfiguration {
     #>
     Write-SectionBanner 'Network & Share Hardening - Windows Firewall Logging Configuration'
     try {
-        $profiles = @(Get-NetFirewallProfile -ErrorAction Stop)
+        $profiles = @(Get-NetFirewallProfile -PolicyStore ActiveStore -ErrorAction Stop)
         foreach ($p in $profiles) {
             if ($p.LogBlocked -eq $true) {
                 Add-AuditResult -Category 'Network Architecture & Protocol Hardening' -Control "Firewall Logging - $($p.Name) Profile (Blocked Connections)" -Status 'PASS' -Severity 'Medium' `
@@ -6729,6 +6682,17 @@ function Test-FirewallLoggingConfiguration {
                     -CurrentValue 'LogBlocked=False' -RecommendedValue 'True' -CIS_Control 'CIS 4.4' -NIST_Control 'AU-2, AU-12' -MITRE_Technique 'T1562.004 (Disable or Modify System Firewall)' `
                     -ISO27001_Control 'A.8.15' -NIS2_Article 'Art.21(2)(b)' -NSA_Guidance 'NSA/CISA Audit Logging Best Practices' `
                     -Recommendation "Set-NetFirewallProfile -Profile $($p.Name) -LogBlocked True. Blocked-connection logging provides network reconnaissance/scan visibility that is otherwise invisible - it is off by default and frequently overlooked."
+            }
+
+            # CIS 9.1.7 / 9.2.7 / 9.3.9: log successful connections too (lateral movement that
+            # the firewall allowed is otherwise invisible). Off by default, so WARN, not FAIL.
+            if ([string]$p.LogAllowed -eq 'True') {
+                Add-AuditResult -Category 'Network Architecture & Protocol Hardening' -Control "Firewall Logging - $($p.Name) Profile (Allowed Connections)" -Status 'PASS' -Severity 'Low' `
+                    -CurrentValue 'LogAllowed=True' -RecommendedValue 'True' -CIS_Control 'CIS 8.2' -NIST_Control 'AU-2, AU-12' -ISO27001_Control 'A.8.15' -NIS2_Article 'Art.21(2)(b)' -Recommendation 'No action required.'
+            } else {
+                Add-AuditResult -Category 'Network Architecture & Protocol Hardening' -Control "Firewall Logging - $($p.Name) Profile (Allowed Connections)" -Status 'WARN' -Severity 'Low' `
+                    -CurrentValue "LogAllowed=$($p.LogAllowed)" -RecommendedValue 'True' -CIS_Control 'CIS 8.2' -NIST_Control 'AU-2, AU-12' -ISO27001_Control 'A.8.15' -NIS2_Article 'Art.21(2)(b)' `
+                    -Recommendation "Set-NetFirewallProfile -Profile $($p.Name) -LogAllowed True (or the Group Policy equivalent). Logged allowed connections show what reached this machine, not only what was stopped."
             }
 
             $logSizeKb = $p.LogMaxSizeKilobytes
@@ -6846,17 +6810,17 @@ function Test-LSASSCrashDumpExposure {
 
         if ($null -eq $effectiveDumpType) {
             Add-AuditResult -Category 'Credential Exposure & Secret Leaks' -Control 'LSASS Crash Dump (WER) Exposure' -Status 'PASS' -Severity 'High' `
-                -CurrentValue 'No LocalDumps policy configured for LSASS or globally' -RecommendedValue 'Not configured, or DumpType != Full (2) for lsass.exe' -CIS_Control 'CIS 18.3' `
+                -CurrentValue 'No LocalDumps policy configured for LSASS or globally' -RecommendedValue 'Not configured, or DumpType != Full (2) for lsass.exe' -CIS_Control 'CIS 4.1' `
                 -NIST_Control 'SC-28, AU-4' -MITRE_Technique 'T1003.001 (LSASS Memory)' -ISO27001_Control 'A.8.5' -NIS2_Article 'Art.21(2)(h)' -NSA_Guidance 'NSA CSI: Mitigating Credential Theft' `
                 -Recommendation 'No action required.'
         } elseif ([int]$effectiveDumpType -eq 2) {
             Add-AuditResult -Category 'Credential Exposure & Secret Leaks' -Control 'LSASS Crash Dump (WER) Exposure' -Status 'FAIL' -Severity 'High' `
-                -CurrentValue 'DumpType=2 (Full dump) configured for LSASS or globally' -RecommendedValue 'Not configured, or DumpType != Full (2) for lsass.exe' -CIS_Control 'CIS 18.3' `
+                -CurrentValue 'DumpType=2 (Full dump) configured for LSASS or globally' -RecommendedValue 'Not configured, or DumpType != Full (2) for lsass.exe' -CIS_Control 'CIS 4.1' `
                 -NIST_Control 'SC-28, AU-4' -MITRE_Technique 'T1003.001 (LSASS Memory)' -ISO27001_Control 'A.8.5' -NIS2_Article 'Art.21(2)(h)' -NSA_Guidance 'NSA CSI: Mitigating Credential Theft' `
                 -Recommendation 'Remove or reduce the WER LocalDumps DumpType for lsass.exe. A full crash dump of LSASS contains the same in-memory secrets a live memory dump would, and the resulting .dmp file can be exfiltrated at leisure from the configured DumpFolder if a crash is ever triggered.'
         } else {
             Add-AuditResult -Category 'Credential Exposure & Secret Leaks' -Control 'LSASS Crash Dump (WER) Exposure' -Status 'PASS' -Severity 'High' `
-                -CurrentValue "DumpType=$effectiveDumpType (not Full)" -RecommendedValue 'Not configured, or DumpType != Full (2) for lsass.exe' -CIS_Control 'CIS 18.3' -NIST_Control 'SC-28, AU-4' `
+                -CurrentValue "DumpType=$effectiveDumpType (not Full)" -RecommendedValue 'Not configured, or DumpType != Full (2) for lsass.exe' -CIS_Control 'CIS 4.1' -NIST_Control 'SC-28, AU-4' `
                 -ISO27001_Control 'A.8.5' -NIS2_Article 'Art.21(2)(h)' -Recommendation 'No action required.'
         }
     } catch {
@@ -6886,11 +6850,11 @@ function Test-CredentialGuardUEFILock {
 
         if ($lsaCfgFlags -eq 1) {
             Add-AuditResult -Category 'Virtualization-Based Security' -Control 'Credential Guard UEFI Lock Mode' -Status 'PASS' -Severity 'High' `
-                -CurrentValue 'LsaCfgFlags=1 (Enabled with UEFI Lock)' -RecommendedValue '1 (UEFI Lock)' -CIS_Control 'CIS 18.4' -NIST_Control 'IA-5, SC-28' `
+                -CurrentValue 'LsaCfgFlags=1 (Enabled with UEFI Lock)' -RecommendedValue '1 (UEFI Lock)' -CIS_Control 'CIS 4.1' -NIST_Control 'IA-5, SC-28' `
                 -MITRE_Technique 'T1562.001 (Disable or Modify Tools)' -ISO27001_Control 'A.8.5' -NIS2_Article 'Art.21(2)(i)' -NSA_Guidance 'NSA CSI: Mitigating Credential Theft' -Recommendation 'No action required.'
         } else {
             Add-AuditResult -Category 'Virtualization-Based Security' -Control 'Credential Guard UEFI Lock Mode' -Status 'WARN' -Severity 'Medium' `
-                -CurrentValue "LsaCfgFlags=$lsaCfgFlags (Enabled without UEFI Lock)" -RecommendedValue '1 (UEFI Lock)' -CIS_Control 'CIS 18.4' -NIST_Control 'IA-5, SC-28' -ISO27001_Control 'A.8.5' `
+                -CurrentValue "LsaCfgFlags=$lsaCfgFlags (Enabled without UEFI Lock)" -RecommendedValue '1 (UEFI Lock)' -CIS_Control 'CIS 4.1' -NIST_Control 'IA-5, SC-28' -ISO27001_Control 'A.8.5' `
                 -NIS2_Article 'Art.21(2)(i)' `
                 -Recommendation 'Set LsaCfgFlags=1 via GPO "Turn On Virtualization Based Security" > Credential Guard Configuration = "Enabled with UEFI lock". Without the lock, a registry change plus reboot alone can disable Credential Guard.'
         }
@@ -6914,11 +6878,11 @@ function Test-SafeDllSearchMode {
 
         if ([int]$safeMode -eq 1) {
             Add-AuditResult -Category 'Privilege Escalation - Service & File Permissions' -Control 'Safe DLL Search Mode' -Status 'PASS' -Severity 'High' `
-                -CurrentValue 'Enabled (default)' -RecommendedValue 'Enabled' -CIS_Control 'CIS 18.3' -NIST_Control 'CM-7, SI-7' -MITRE_Technique 'T1574.001 (DLL Search Order Hijacking)' `
+                -CurrentValue 'Enabled (default)' -RecommendedValue 'Enabled' -CIS_Control 'CIS 4.1' -NIST_Control 'CM-7, SI-7' -MITRE_Technique 'T1574.001 (DLL Search Order Hijacking)' `
                 -ISO27001_Control 'A.8.19' -NIS2_Article 'Art.21(2)(e)' -Recommendation 'No action required.'
         } else {
             Add-AuditResult -Category 'Privilege Escalation - Service & File Permissions' -Control 'Safe DLL Search Mode' -Status 'FAIL' -Severity 'High' `
-                -CurrentValue 'SafeDllSearchMode=0 (Disabled)' -RecommendedValue 'Enabled (1, or not present)' -CIS_Control 'CIS 18.3' -NIST_Control 'CM-7, SI-7' `
+                -CurrentValue 'SafeDllSearchMode=0 (Disabled)' -RecommendedValue 'Enabled (1, or not present)' -CIS_Control 'CIS 4.1' -NIST_Control 'CM-7, SI-7' `
                 -MITRE_Technique 'T1574.001 (DLL Search Order Hijacking)' -ISO27001_Control 'A.8.19' -NIS2_Article 'Art.21(2)(e)' `
                 -Recommendation 'Remove the SafeDllSearchMode value (or set it to 1) under HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager. With this disabled, the current working directory is searched for DLLs before the system directories, making DLL search-order hijacking dramatically easier.'
         }
@@ -11268,6 +11232,784 @@ function Test-PolicySourceConflict {
 
 #endregion
 
+#region ============================== 39. CIS WINDOWS 11 BENCHMARK POLICY ENGINE ==============================
+
+# Settings from the CIS Microsoft Windows 11 Enterprise Benchmark v5.0.1 that no other check in
+# this script reads (settings already covered elsewhere are deliberately absent, so nothing is
+# scored twice). One row per setting: Id|Level|Group|Source|Name|Op|Expected, where Source is a
+# registry key, 'secedit' ([System Access] key), 'right' (user right constant) or 'service'.
+# Ops: eq, in (a,b), ge, le, lenz (<= n, not 0), ne, range (a-b), sz (string), empty, absent,
+# contains (all comma-separated tokens), grant (assignees within the SID list; * = prefix),
+# deny (all SIDs present), disabled (service disabled or not installed).
+# Unset values are "not configured" (WARN), as the macOS edition scores unset profile keys; a
+# value set to something else is a FAIL. Level 2 rows are listed in one unscored INFO finding.
+# Only recommendation numbers and registry names are used here, never benchmark text.
+$Script:CisRows = @'
+1.1.3|L1|Account Policies|secedit|MinimumPasswordAge|ge|1
+1.1.6|L1|Account Policies|HKLM\SYSTEM\CurrentControlSet\Control\SAM|RelaxMinimumPasswordLengthLimits|eq|1
+1.1.7|L1|Account Policies|secedit|ClearTextPassword|eq|0
+1.2.1|L1|Account Policies|secedit|LockoutDuration|ge|15
+1.2.3|L1|Account Policies|secedit|AllowAdministratorLockout|eq|1
+1.2.4|L1|Account Policies|secedit|ResetLockoutCount|ge|15
+2.2.1|L1|User Rights Assignment|right|SeTrustedCredManAccessPrivilege|grant|
+2.2.2|L1|User Rights Assignment|right|SeNetworkLogonRight|grant|S-1-5-32-544;S-1-5-32-555
+2.2.4|L1|User Rights Assignment|right|SeIncreaseQuotaPrivilege|grant|S-1-5-32-544;S-1-5-19;S-1-5-20
+2.2.5|L1|User Rights Assignment|right|SeInteractiveLogonRight|grant|S-1-5-32-544;S-1-5-32-545
+2.2.6|L1|User Rights Assignment|right|SeRemoteInteractiveLogonRight|grant|S-1-5-32-544;S-1-5-32-555
+2.2.8|L1|User Rights Assignment|right|SeSystemtimePrivilege|grant|S-1-5-32-544;S-1-5-19
+2.2.9|L1|User Rights Assignment|right|SeCreatePagefilePrivilege|grant|S-1-5-32-544
+2.2.11|L1|User Rights Assignment|right|SeCreateGlobalPrivilege|grant|S-1-5-32-544;S-1-5-19;S-1-5-20;S-1-5-6
+2.2.12|L1|User Rights Assignment|right|SeCreatePermanentPrivilege|grant|
+2.2.13|L1|User Rights Assignment|right|SeCreateSymbolicLinkPrivilege|grant|S-1-5-32-544;S-1-5-83-0
+2.2.16|L1|User Rights Assignment|right|SeDenyBatchLogonRight|deny|S-1-5-32-546
+2.2.17|L1|User Rights Assignment|right|SeDenyServiceLogonRight|deny|S-1-5-32-546
+2.2.18|L1|User Rights Assignment|right|SeDenyInteractiveLogonRight|deny|S-1-5-32-546
+2.2.20|L1|User Rights Assignment|right|SeEnableDelegationPrivilege|grant|
+2.2.21|L1|User Rights Assignment|right|SeRemoteShutdownPrivilege|grant|S-1-5-32-544
+2.2.22|L1|User Rights Assignment|right|SeAuditPrivilege|grant|S-1-5-19;S-1-5-20;S-1-5-99-*
+2.2.24|L1|User Rights Assignment|right|SeIncreaseBasePriorityPrivilege|grant|S-1-5-32-544;S-1-5-90-0
+2.2.26|L1|User Rights Assignment|right|SeLockMemoryPrivilege|grant|
+2.2.27|L2|User Rights Assignment|right|SeBatchLogonRight|grant|S-1-5-32-544
+2.2.28|L2|User Rights Assignment|right|SeServiceLogonRight|grant|
+2.2.29|L1|User Rights Assignment|right|SeSecurityPrivilege|grant|S-1-5-32-544
+2.2.30|L1|User Rights Assignment|right|SeRelabelPrivilege|grant|
+2.2.31|L1|User Rights Assignment|right|SeSystemEnvironmentPrivilege|grant|S-1-5-32-544
+2.2.32|L1|User Rights Assignment|right|SeManageVolumePrivilege|grant|S-1-5-32-544
+2.2.33|L1|User Rights Assignment|right|SeProfileSingleProcessPrivilege|grant|S-1-5-32-544
+2.2.34|L1|User Rights Assignment|right|SeSystemProfilePrivilege|grant|S-1-5-32-544;S-1-5-80-*
+2.2.37|L1|User Rights Assignment|right|SeShutdownPrivilege|grant|S-1-5-32-544;S-1-5-32-545
+2.3.1.2|L1|Security Options|HKLM\SYSTEM\CurrentControlSet\Control\Lsa|LimitBlankPasswordUse|eq|1
+2.3.2.1|L1|Security Options|HKLM\SYSTEM\CurrentControlSet\Control\Lsa|SCENoApplyLegacyAuditPolicy|eq|1
+2.3.2.2|L1|Security Options|HKLM\SYSTEM\CurrentControlSet\Control\Lsa|CrashOnAuditFail|eq|0
+2.3.4.1|L2|Security Options|HKLM\SYSTEM\CurrentControlSet\Control\Print\Providers\LanMan PrintServices\Servers|AddPrinterDrivers|eq|1
+2.3.6.1|L1|Security Options|HKLM\SYSTEM\CurrentControlSet\Services\Netlogon\Parameters|RequireSignOrSeal|eq|1
+2.3.6.2|L1|Security Options|HKLM\SYSTEM\CurrentControlSet\Services\Netlogon\Parameters|SealSecureChannel|eq|1
+2.3.6.3|L1|Security Options|HKLM\SYSTEM\CurrentControlSet\Services\Netlogon\Parameters|SignSecureChannel|eq|1
+2.3.6.4|L1|Security Options|HKLM\SYSTEM\CurrentControlSet\Services\Netlogon\Parameters|DisablePasswordChange|eq|0
+2.3.6.6|L1|Security Options|HKLM\SYSTEM\CurrentControlSet\Services\Netlogon\Parameters|RequireStrongKey|eq|1
+2.3.7.7|L1|Security Options|HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon|PasswordExpiryWarning|range|5-14
+2.3.7.8|L1|Security Options|HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon|ScRemoveOption|in|1,2,3
+2.3.8.2|L1|Security Options|HKLM\SYSTEM\CurrentControlSet\Services\LanmanWorkstation\Parameters|EnablePlainTextPassword|eq|0
+2.3.9.1|L1|Security Options|HKLM\SYSTEM\CurrentControlSet\Services\LanManServer\Parameters|AutoDisconnect|le|15
+2.3.9.3|L1|Security Options|HKLM\SYSTEM\CurrentControlSet\Services\LanManServer\Parameters|enableforcedlogoff|eq|1
+2.3.9.4|L1|Security Options|HKLM\SYSTEM\CurrentControlSet\Services\LanManServer\Parameters|SMBServerNameHardeningLevel|in|1,2
+2.3.10.1|L1|Security Options|secedit|LSAAnonymousNameLookup|eq|0
+2.3.10.6|L1|Security Options|HKLM\SYSTEM\CurrentControlSet\Services\LanManServer\Parameters|NullSessionPipes|empty|
+2.3.10.9|L1|Security Options|HKLM\SYSTEM\CurrentControlSet\Services\LanManServer\Parameters|RestrictNullSessAccess|eq|1
+2.3.10.10|L1|Security Options|HKLM\SYSTEM\CurrentControlSet\Control\Lsa|RestrictRemoteSAM|sz|O:BAG:BAD:(A;;RC;;;BA)
+2.3.10.11|L1|Security Options|HKLM\SYSTEM\CurrentControlSet\Services\LanManServer\Parameters|NullSessionShares|empty|
+2.3.10.12|L1|Security Options|HKLM\SYSTEM\CurrentControlSet\Control\Lsa|ForceGuest|eq|0
+2.3.11.1|L1|Security Options|HKLM\SYSTEM\CurrentControlSet\Control\Lsa|UseMachineId|eq|1
+2.3.11.2|L1|Security Options|HKLM\SYSTEM\CurrentControlSet\Control\Lsa\MSV1_0|AllowNullSessionFallback|eq|0
+2.3.11.3|L1|Security Options|HKLM\SYSTEM\CurrentControlSet\Control\Lsa\pku2u|AllowOnlineID|eq|0
+2.3.11.5|L1|Security Options|secedit|ForceLogoffWhenHourExpire|eq|1
+2.3.11.7|L1|Security Options|HKLM\SYSTEM\CurrentControlSet\Services\LDAP|LDAPClientConfidentiality|in|1,2
+2.3.11.8|L1|Security Options|HKLM\SYSTEM\CurrentControlSet\Services\LDAP|LDAPClientIntegrity|in|1,2
+2.3.11.9|L1|Security Options|HKLM\SYSTEM\CurrentControlSet\Control\Lsa\MSV1_0|NTLMMinClientSec|eq|537395200
+2.3.11.10|L1|Security Options|HKLM\SYSTEM\CurrentControlSet\Control\Lsa\MSV1_0|NTLMMinServerSec|eq|537395200
+2.3.11.11|L1|Security Options|HKLM\SYSTEM\CurrentControlSet\Control\Lsa\MSV1_0|AuditReceivingNTLMTraffic|eq|2
+2.3.14.1|L2|Security Options|HKLM\SOFTWARE\Policies\Microsoft\Cryptography|ForceKeyProtection|in|1,2
+2.3.15.1|L1|Security Options|HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\kernel|ObCaseInsensitive|eq|1
+2.3.15.2|L1|Security Options|HKLM\SYSTEM\CurrentControlSet\Control\Session Manager|ProtectionMode|eq|1
+2.3.17.3|L1|Security Options|HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System|ConsentPromptBehaviorUser|eq|0
+2.3.17.5|L1|Security Options|HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System|EnableSecureUIAPaths|eq|1
+2.3.17.8|L1|Security Options|HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System|EnableVirtualization|eq|1
+5.1|L2|System Services|service|BTAGService|disabled|
+5.2|L2|System Services|service|bthserv|disabled|
+5.3|L1|System Services|service|Browser|disabled|
+5.4|L2|System Services|service|MapsBroker|disabled|
+5.6|L2|System Services|service|lfsvc|disabled|
+5.7|L1|System Services|service|IISADMIN|disabled|
+5.8|L1|System Services|service|irmon|disabled|
+5.9|L2|System Services|service|lltdsvc|disabled|
+5.10|L1|System Services|service|FTPSVC|disabled|
+5.11|L2|System Services|service|MSiSCSI|disabled|
+5.13|L2|System Services|service|PNRPsvc|disabled|
+5.14|L2|System Services|service|p2psvc|disabled|
+5.15|L2|System Services|service|p2pimsvc|disabled|
+5.16|L2|System Services|service|PNRPAutoReg|disabled|
+5.18|L2|System Services|service|wercplsupport|disabled|
+5.19|L2|System Services|service|RasAuto|disabled|
+5.20|L2|System Services|service|SessionEnv|disabled|
+5.22|L2|System Services|service|UmRdpService|disabled|
+5.23|L1|System Services|service|RpcLocator|disabled|
+5.25|L1|System Services|service|RemoteAccess|disabled|
+5.27|L1|System Services|service|simptcp|disabled|
+5.28|L2|System Services|service|SNMP|disabled|
+5.29|L1|System Services|service|sacsvr|disabled|
+5.30|L1|System Services|service|SSDPSRV|disabled|
+5.31|L1|System Services|service|upnphost|disabled|
+5.32|L1|System Services|service|WMSvc|disabled|
+5.33|L2|System Services|service|WerSvc|disabled|
+5.34|L2|System Services|service|Wecsvc|disabled|
+5.35|L1|System Services|service|WMPNetworkSvc|disabled|
+5.36|L1|System Services|service|icssvc|disabled|
+5.38|L2|System Services|service|PushToInstall|disabled|
+5.40|L1|System Services|service|W3SVC|disabled|
+5.41|L1|System Services|service|XboxGipSvc|disabled|
+5.42|L1|System Services|service|XblAuthManager|disabled|
+5.43|L1|System Services|service|XblGameSave|disabled|
+5.44|L1|System Services|service|XboxNetApiSvc|disabled|
+18.4.4|L1|MS Security Guide|HKLM\SOFTWARE\Microsoft\Cryptography\Wintrust\Config|EnableCertPaddingCheck|eq|1
+18.4.4|L1|MS Security Guide|HKLM\SOFTWARE\Wow6432Node\Microsoft\Cryptography\Wintrust\Config|EnableCertPaddingCheck|eq|1
+18.4.6|L1|MS Security Guide|HKLM\SYSTEM\CurrentControlSet\Services\NetBT\Parameters|NodeType|eq|2
+18.5.2|L1|Legacy Network Settings|HKLM\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters|DisableIPSourceRouting|eq|2
+18.5.3|L1|Legacy Network Settings|HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters|DisableIPSourceRouting|eq|2
+18.5.5|L1|Legacy Network Settings|HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters|EnableICMPRedirect|eq|0
+18.5.7|L1|Legacy Network Settings|HKLM\SYSTEM\CurrentControlSet\Services\NetBT\Parameters|NoNameReleaseOnDemand|eq|1
+18.5.12|L1|Legacy Network Settings|HKLM\SYSTEM\CurrentControlSet\Services\Eventlog\Security|WarningLevel|le|90
+18.6.4.2|L1|Network|HKLM\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient|EnableNetbios|in|0,2
+18.6.4.3|L2|Network|HKLM\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient|DisableIPv6DefaultDnsServers|eq|1
+18.6.5.1|L2|Network|HKLM\SOFTWARE\Policies\Microsoft\Windows\System|EnableFontProviders|eq|0
+18.6.7.1|L1|Network|HKLM\SOFTWARE\Policies\Microsoft\Windows\LanmanServer|AuditClientDoesNotSupportEncryption|eq|1
+18.6.7.2|L1|Network|HKLM\SOFTWARE\Policies\Microsoft\Windows\LanmanServer|AuditClientDoesNotSupportSigning|eq|1
+18.6.7.3|L1|Network|HKLM\SOFTWARE\Policies\Microsoft\Windows\LanmanServer|AuditInsecureGuestLogon|eq|1
+18.6.7.4|L1|Network|HKLM\SOFTWARE\Policies\Microsoft\Windows\LanmanServer|EnableAuthRateLimiter|eq|1
+18.6.7.5|L1|Network|HKLM\SOFTWARE\Policies\Microsoft\Windows\Bowser|EnableMailslots|eq|0
+18.6.7.6|L1|Network|HKLM\SOFTWARE\Policies\Microsoft\Windows\LanmanServer|MinSmb2Dialect|eq|785
+18.6.7.7|L1|Network|HKLM\SOFTWARE\Policies\Microsoft\Windows\LanmanServer|InvalidAuthenticationDelayTimeInMs|ge|2000
+18.6.8.1|L1|Network|HKLM\SOFTWARE\Policies\Microsoft\Windows\LanmanWorkstation|AuditInsecureGuestLogon|eq|1
+18.6.8.2|L1|Network|HKLM\SOFTWARE\Policies\Microsoft\Windows\LanmanWorkstation|AuditServerDoesNotSupportEncryption|eq|1
+18.6.8.3|L1|Network|HKLM\SOFTWARE\Policies\Microsoft\Windows\LanmanWorkstation|AuditServerDoesNotSupportSigning|eq|1
+18.6.8.5|L1|Network|HKLM\SOFTWARE\Policies\Microsoft\Windows\NetworkProvider|EnableMailslots|eq|0
+18.6.8.6|L1|Network|HKLM\SOFTWARE\Policies\Microsoft\Windows\LanmanWorkstation|MinSmb2Dialect|eq|785
+18.6.8.7|L1|Network|HKLM\SOFTWARE\Policies\Microsoft\Windows\LanmanWorkstation|RequireEncryption|eq|1
+18.6.10.2|L2|Network|HKLM\SOFTWARE\Policies\Microsoft\Peernet|Disabled|eq|1
+18.6.11.2|L1|Network|HKLM\SOFTWARE\Policies\Microsoft\Windows\Network Connections|NC_AllowNetBridge_NLA|eq|0
+18.6.11.3|L1|Network|HKLM\SOFTWARE\Policies\Microsoft\Windows\Network Connections|NC_ShowSharedAccessUI|eq|0
+18.6.11.4|L1|Network|HKLM\SOFTWARE\Policies\Microsoft\Windows\Network Connections|NC_StdDomainUserSetLocation|eq|1
+18.6.14.1|L1|Network|HKLM\SOFTWARE\Policies\Microsoft\Windows\NetworkProvider\HardenedPaths|\\*\NETLOGON|contains|RequireMutualAuthentication=1,RequireIntegrity=1
+18.6.14.1|L1|Network|HKLM\SOFTWARE\Policies\Microsoft\Windows\NetworkProvider\HardenedPaths|\\*\SYSVOL|contains|RequireMutualAuthentication=1,RequireIntegrity=1
+18.6.20.2|L2|Network|HKLM\SOFTWARE\Policies\Microsoft\Windows\WCN\UI|DisableWcnUi|eq|1
+18.6.21.1|L1|Network|HKLM\SOFTWARE\Policies\Microsoft\Windows\WcmSvc\GroupPolicy|fMinimizeConnections|eq|3
+18.6.23.2.1|L1|Network|HKLM\SOFTWARE\Microsoft\WcmSvc\wifinetworkmanager\config|AutoConnectAllowedOEM|eq|0
+18.7.1|L1|Printers & RPC|HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Printers|RegisterSpoolerRemoteRpcEndPoint|eq|2
+18.7.2|L1|Printers & RPC|HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Printers|RedirectionguardPolicy|eq|1
+18.7.3|L1|Printers & RPC|HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Printers\RPC|RpcUseNamedPipeProtocol|eq|0
+18.7.4|L1|Printers & RPC|HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Printers\RPC|RpcAuthentication|eq|0
+18.7.5|L1|Printers & RPC|HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Printers\RPC|RpcProtocols|eq|5
+18.7.6|L1|Printers & RPC|HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Printers\RPC|ForceKerberosForRpc|in|0,1
+18.7.7|L1|Printers & RPC|HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Printers\RPC|RpcTcpPort|eq|0
+18.7.9|L2|Printers & RPC|HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Printers\WPP|WindowsProtectedPrintGroupPolicyState|eq|1
+18.7.11|L1|Printers & RPC|HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Printers|CopyFilesPolicy|eq|1
+18.7.14|L2|Printers & RPC|HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Printers\IPP|RequireIpps|eq|1
+18.7.15|L2|Printers & RPC|HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Printers\IPP|SecurityFlagsBlockUnknownCA|eq|1
+18.7.16|L2|Printers & RPC|HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Printers\IPP|SecurityFlagsBlockCertWrongUsage|eq|1
+18.7.17|L2|Printers & RPC|HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Printers\IPP|SecurityFlagsBlockCertCNInvalid|eq|1
+18.7.18|L2|Printers & RPC|HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Printers\IPP|SecurityFlagsBlockCertDateInvalid|eq|1
+18.9.4.2|L1|System|HKLM\SOFTWARE\Policies\Microsoft\Windows\CredentialsDelegation|AllowProtectedCreds|eq|1
+18.9.5.3|L1|System|HKLM\SOFTWARE\Policies\Microsoft\Windows\DeviceGuard|HypervisorEnforcedCodeIntegrity|eq|1
+18.9.5.4|L1|System|HKLM\SOFTWARE\Policies\Microsoft\Windows\DeviceGuard|HVCIMATRequired|eq|1
+18.9.5.6|L1|System|HKLM\SOFTWARE\Policies\Microsoft\Windows\DeviceGuard|ConfigureSystemGuardLaunch|eq|1
+18.9.5.7|L1|System|HKLM\SOFTWARE\Policies\Microsoft\Windows\DeviceGuard|ConfigureKernelShadowStacksLaunch|eq|1
+18.9.7.1.1|L2|System|HKLM\SOFTWARE\Policies\Microsoft\Windows\DeviceInstall\Restrictions|DenyDeviceClasses|eq|1
+18.9.7.1.3|L2|System|HKLM\SOFTWARE\Policies\Microsoft\Windows\DeviceInstall\Restrictions|DenyDeviceClassesRetroactive|eq|1
+18.9.7.2|L1|System|HKLM\SOFTWARE\Policies\Microsoft\Windows\DeviceMetadata|PreventDeviceMetadataFromNetwork|eq|1
+18.9.13.1|L1|System|HKLM\SYSTEM\CurrentControlSet\Policies\EarlyLaunch|DriverLoadPolicy|eq|3
+18.9.17.1|L1|System|HKLM\SYSTEM\CurrentControlSet\Policies|ClfsAuthenticationChecking|eq|1
+18.9.19.2|L1|System|HKLM\SOFTWARE\Policies\Microsoft\Windows\Group Policy\{827D319E-6EAC-11D2-A4EA-00C04F79F83A}|NoBackgroundPolicy|eq|0
+18.9.19.3|L1|System|HKLM\SOFTWARE\Policies\Microsoft\Windows\Group Policy\{827D319E-6EAC-11D2-A4EA-00C04F79F83A}|NoGPOListChanges|eq|0
+18.9.19.4|L1|System|HKLM\SOFTWARE\Policies\Microsoft\Windows\System|EnableCdp|eq|0
+18.9.19.5|L1|System|HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System|DisableBkGndGroupPolicy|absent|
+18.9.26.1|L1|System|HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\LAPS|BackupDirectory|in|1,2
+18.9.26.2|L1|System|HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\LAPS|PasswordExpirationProtectionEnabled|eq|1
+18.9.26.3|L1|System|HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\LAPS|ADPasswordEncryptionEnabled|eq|1
+18.9.26.5|L1|System|HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\LAPS|PasswordLength|eq|15
+18.9.26.6|L1|System|HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\LAPS|PasswordAgeDays|eq|30
+18.9.26.7|L1|System|HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\LAPS|PostAuthenticationResetDelay|lenz|8
+18.9.26.8|L1|System|HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\LAPS|PostAuthenticationActions|in|3,5,11
+18.9.27.1|L1|System|HKLM\SOFTWARE\Policies\Microsoft\Windows\System|AllowCustomSSPsAPs|eq|0
+18.9.28.1|L2|System|HKLM\SOFTWARE\Policies\Microsoft\Control Panel\International|BlockUserInputMethodsForSignIn|eq|1
+18.9.29.1|L1|System|HKLM\SOFTWARE\Policies\Microsoft\Windows\System|BlockUserFromShowingAccountDetailsOnSignin|eq|1
+18.9.29.2|L1|System|HKLM\SOFTWARE\Policies\Microsoft\Windows\System|DontDisplayNetworkSelectionUI|eq|1
+18.9.29.3|L1|System|HKLM\SOFTWARE\Policies\Microsoft\Windows\System|DontEnumerateConnectedUsers|eq|1
+18.9.29.4|L1|System|HKLM\SOFTWARE\Policies\Microsoft\Windows\System|EnumerateLocalUsers|eq|0
+18.9.29.5|L1|System|HKLM\SOFTWARE\Policies\Microsoft\Windows\System|DisableLockScreenAppNotifications|eq|1
+18.9.29.6|L1|System|HKLM\SOFTWARE\Policies\Microsoft\Windows\System|BlockDomainPicturePassword|eq|1
+18.9.29.7|L1|System|HKLM\SOFTWARE\Policies\Microsoft\Windows\System|AllowDomainPINLogon|eq|0
+18.9.31.1.1|L1|System|HKLM\SOFTWARE\Policies\Microsoft\Netlogon\Parameters|BlockNetbiosDiscovery|eq|1
+18.9.33.1|L2|System|HKLM\SOFTWARE\Policies\Microsoft\Windows\System|AllowCrossDeviceClipboard|eq|0
+18.9.33.2|L2|System|HKLM\SOFTWARE\Policies\Microsoft\Windows\System|UploadUserActivities|eq|0
+18.9.35.6.1|L1|System|HKLM\SOFTWARE\Policies\Microsoft\Power\PowerSettings\f15576e8-98b7-4186-b944-eafa664402d9|DCSettingIndex|eq|0
+18.9.35.6.2|L1|System|HKLM\SOFTWARE\Policies\Microsoft\Power\PowerSettings\f15576e8-98b7-4186-b944-eafa664402d9|ACSettingIndex|eq|0
+18.9.35.6.3|L2|System|HKLM\SOFTWARE\Policies\Microsoft\Power\PowerSettings\abfc2519-3608-4c2a-94ea-171b0ed546ab|DCSettingIndex|eq|0
+18.9.35.6.4|L2|System|HKLM\SOFTWARE\Policies\Microsoft\Power\PowerSettings\abfc2519-3608-4c2a-94ea-171b0ed546ab|ACSettingIndex|eq|0
+18.9.35.6.5|L1|System|HKLM\SOFTWARE\Policies\Microsoft\Power\PowerSettings\0e796bdb-100d-47d6-a2d5-f7d2daa51f51|DCSettingIndex|eq|1
+18.9.35.6.6|L1|System|HKLM\SOFTWARE\Policies\Microsoft\Power\PowerSettings\0e796bdb-100d-47d6-a2d5-f7d2daa51f51|ACSettingIndex|eq|1
+18.9.37.1|L1|System|HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services|fAllowUnsolicited|eq|0
+18.9.37.2|L1|System|HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services|fAllowToGetHelp|eq|0
+18.9.38.1|L1|System|HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Rpc|EnableAuthEpResolution|eq|1
+18.9.38.2|L1|System|HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Rpc|RestrictRemoteClients|eq|1
+18.9.41.1|L1|System|HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\SAM|SamrChangeUserPasswordApiPolicy|eq|1
+18.9.49.5.1|L2|System|HKLM\SOFTWARE\Policies\Microsoft\Windows\ScriptedDiagnosticsProvider\Policy|DisableQueryRemoteServer|eq|0
+18.9.49.11.1|L2|System|HKLM\SOFTWARE\Policies\Microsoft\Windows\WDI\{9c5a40da-b965-4fc3-8781-88dd50a6299d}|ScenarioExecutionEnabled|eq|0
+18.9.51.1|L2|System|HKLM\SOFTWARE\Policies\Microsoft\Windows\AdvertisingInfo|DisabledByGroupPolicy|eq|1
+18.9.53.1.1|L1|System|HKLM\SOFTWARE\Policies\Microsoft\W32Time\TimeProviders\NtpClient|Enabled|eq|1
+18.9.53.1.2|L1|System|HKLM\SOFTWARE\Policies\Microsoft\W32Time\TimeProviders\NtpServer|Enabled|eq|0
+18.9.54|L1|System|HKLM\SOFTWARE\Policies\Microsoft\Windows\Sudo|Enabled|eq|0
+18.10.3.1|L2|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows\AppCompat|DisableAPISampingNote|eq|1
+18.10.3.2|L2|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows\AppCompat|DisableApplicationFootprint|eq|1
+18.10.3.3|L2|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows\AppCompat|DisableInstallTracing|eq|1
+18.10.4.1|L2|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows\CurrentVersion\AppModel\StateManager|AllowSharedLocalAppData|eq|0
+18.10.4.2|L1|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows\Appx|DisablePerUserUnsignedPackagesByDefault|eq|1
+18.10.4.3|L1|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows\Appx|BlockNonAdminUserInstall|eq|1
+18.10.5.1|L1|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy|LetAppsActivateWithVoiceAboveLock|eq|2
+18.10.6.1|L1|Windows Components|HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System|MSAOptional|eq|1
+18.10.6.2|L2|Windows Components|HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System|BlockHostedAppAccessWinRT|eq|1
+18.10.8.1|L1|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows\Explorer|NoAutoplayfornonVolume|eq|1
+18.10.8.2|L1|Windows Components|HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer|NoAutorun|eq|1
+18.10.9.1.1|L1|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Biometrics\FacialFeatures|EnhancedAntiSpoofing|eq|1
+18.10.11.1|L2|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Camera|AllowCamera|eq|0
+18.10.14.1|L1|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows\Connect|RequirePinForPairing|in|1,2
+18.10.15.1|L1|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows\CredUI|DisablePasswordReveal|eq|1
+18.10.15.2|L1|Windows Components|HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\CredUI|EnumerateAdministrators|eq|0
+18.10.15.3|L1|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows\System|NoLocalPasswordResetQuestions|eq|1
+18.10.16.2|L2|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows\DataCollection|DisableEnterpriseAuthProxy|eq|1
+18.10.16.3|L1|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows\DataCollection|DoNotShowFeedbackNotifications|eq|1
+18.10.16.4|L1|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows\DataCollection|EnableOneSettingsAuditing|eq|1
+18.10.16.5|L2|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows\DataCollection|LimitDiagnosticLogCollection|eq|1
+18.10.16.6|L2|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows\DataCollection|LimitDumpCollection|eq|1
+18.10.17.1|L1|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization|DODownloadMode|ne|3
+18.10.18.1|L2|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows\AppInstaller|EnableAppInstaller|eq|0
+18.10.18.2|L1|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows\AppInstaller|EnableExperimentalFeatures|eq|0
+18.10.18.3|L1|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows\AppInstaller|EnableHashOverride|eq|0
+18.10.18.4|L1|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows\AppInstaller|EnableLocalArchiveMalwareScanOverride|eq|0
+18.10.18.5|L1|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows\AppInstaller|EnableBypassCertificatePinningForMicrosoftStore|eq|0
+18.10.18.6|L1|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows\AppInstaller|EnableMSAppInstallerProtocol|eq|0
+18.10.18.7|L2|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows\AppInstaller|EnableWindowsPackageManagerCommandLineInterfaces|eq|0
+18.10.26.1.1|L1|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows\EventLog\Application|Retention|eq|0
+18.10.26.2.1|L1|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows\EventLog\Security|Retention|eq|0
+18.10.26.3.1|L1|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows\EventLog\Setup|Retention|eq|0
+18.10.26.4.1|L1|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows\EventLog\System|Retention|eq|0
+18.10.29.2|L2|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows\Explorer|DisableGraphRecentItems|eq|1
+18.10.29.3|L1|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows\Explorer|NoDataExecutionPrevention|eq|0
+18.10.29.4|L1|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows\Explorer|DisableMotWOnInsecurePathCopy|eq|0
+18.10.29.5|L1|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows\Explorer|NoHeapTerminationOnCorruption|eq|0
+18.10.29.6|L1|Windows Components|HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer|PreXPSP2ShellProtocolBehavior|eq|0
+18.10.36.1|L2|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows\LocationAndSensors|DisableLocation|eq|1
+18.10.40.1|L2|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows\Messaging|AllowMessageSync|eq|0
+18.10.41.1|L1|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\MicrosoftAccount|DisableUserAuth|eq|1
+18.10.56.1|L2|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\PushToInstall|DisablePushToInstall|eq|1
+18.10.57.2.2|L2|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services\Client|DisableCloudClipboardIntegration|eq|1
+18.10.57.2.3|L1|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services|DisablePasswordSaving|eq|1
+18.10.57.3.3.1|L2|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services|EnableUiaRedirection|eq|0
+18.10.57.3.3.2|L2|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services|fDisableCcm|eq|1
+18.10.57.3.3.4|L2|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services|fDisableLocationRedir|eq|1
+18.10.57.3.3.5|L2|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services|fDisableLPT|eq|1
+18.10.57.3.3.6|L2|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services|fDisablePNPRedir|eq|1
+18.10.57.3.3.7|L2|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services|fDisableWebAuthn|eq|1
+18.10.57.3.3.8|L2|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services|SCClipLevel|eq|0
+18.10.57.3.9.1|L1|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services|fPromptForPassword|eq|1
+18.10.57.3.9.2|L1|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services|fEncryptRPCTraffic|eq|1
+18.10.57.3.10.2|L2|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services|MaxDisconnectionTime|eq|60000
+18.10.57.3.11.1|L1|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services|DeleteTempDirsOnExit|eq|1
+18.10.58.1|L1|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Internet Explorer\Feeds|DisableEnclosureDownload|eq|1
+18.10.63.1|L2|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows NT\CurrentVersion\Software Protection Platform|NoGenTicket|eq|1
+18.10.73.1|L1|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsAI|AllowRecallEnablement|eq|0
+18.10.77.1.1|L1|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows\WTDS\Components|CaptureThreatWindow|eq|1
+18.10.77.1.2|L1|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows\WTDS\Components|NotifyMalicious|eq|1
+18.10.77.1.3|L1|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows\WTDS\Components|NotifyPasswordReuse|eq|1
+18.10.77.1.4|L1|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows\WTDS\Components|NotifyUnsafeApp|eq|1
+18.10.77.1.5|L1|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows\WTDS\Components|ServiceEnabled|eq|1
+18.10.80.1|L1|Windows Components|HKLM\SOFTWARE\Microsoft\Policies\PassportForWork\Biometrics|EnableESSwithSupportedPeripherals|eq|1
+18.10.82.1|L1|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows\Installer|EnableUserControl|eq|0
+18.10.82.3|L2|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows\Installer|SafeForScripting|eq|0
+18.10.83.1|L1|Windows Components|HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System|EnableMPR|eq|0
+18.10.83.2|L1|Windows Components|HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System|DisableAutomaticRestartSignOn|eq|1
+18.10.90.1.3|L1|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows\WinRM\Client|AllowDigest|eq|0
+18.10.90.2.2|L2|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows\WinRM\Service|AllowAutoConfig|eq|0
+18.10.90.2.4|L1|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows\WinRM\Service|DisableRunAs|eq|1
+18.10.91.1|L2|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows\WinRM\Service\WinRS|AllowRemoteShellAccess|eq|0
+18.10.92.1|L1|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows\Sandbox|AllowClipboardRedirection|eq|0
+18.10.92.2|L2|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows\Sandbox|AllowWriteToMappedFolders|eq|0
+18.10.92.3|L1|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows\Sandbox|AllowNetworking|eq|0
+18.10.93.2.1|L1|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows Defender Security Center\App and Browser protection|DisallowExploitProtectionOverride|eq|1
+18.10.94.1.1|L1|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU|NoAutoRebootWithLoggedOnUsers|eq|0
+18.10.94.2.1|L1|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU|NoAutoUpdate|eq|0
+18.10.94.2.2|L1|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU|ScheduledInstallDay|eq|0
+18.10.94.2.3|L1|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate|AllowTemporaryEnterpriseFeatureControl|eq|0
+18.10.94.2.4|L1|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate|SetDisablePauseUXAccess|eq|1
+18.10.94.4.1|L1|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate|ManagePreviewBuildsPolicyValue|eq|1
+18.10.94.4.3|L1|Windows Components|HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate|SetAllowOptionalContent|eq|0
+18.11.1|L1|Network|HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings\WinHttp|DisableWpad|eq|1
+18.11.2|L1|Network|HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings|DisableProxyAuthenticationSchemes|in|256,287
+'@
+
+$Script:CisGroups = [ordered]@{
+    'Account Policies'        = @{ Severity = 'High'; Mitre = 'T1110 (Brute Force)'; Nist = 'AC-7, IA-5'; Cis8 = 'CIS 5.2' }
+    'User Rights Assignment'  = @{ Severity = 'High'; Mitre = 'T1078 (Valid Accounts), T1134 (Access Token Manipulation)'; Nist = 'AC-6'; Cis8 = 'CIS 5.4'; SoftMismatch = $true }
+    'Security Options'        = @{ Severity = 'High'; Mitre = 'T1557 (Adversary-in-the-Middle), T1087 (Account Discovery)'; Nist = 'AC-3, IA-2, SC-8'; Cis8 = 'CIS 4.1' }
+    'System Services'         = @{ Severity = 'Medium'; Mitre = 'T1210 (Exploitation of Remote Services)'; Nist = 'CM-7'; Cis8 = 'CIS 4.8'; SoftMismatch = $true }
+    'MS Security Guide'       = @{ Severity = 'High'; Mitre = 'T1557.001 (LLMNR/NBT-NS Poisoning and SMB Relay)'; Nist = 'SC-8, SI-7'; Cis8 = 'CIS 4.1' }
+    'Legacy Network Settings' = @{ Severity = 'Medium'; Mitre = 'T1557 (Adversary-in-the-Middle)'; Nist = 'SC-7'; Cis8 = 'CIS 4.1' }
+    'Network'                 = @{ Severity = 'High'; Mitre = 'T1557 (Adversary-in-the-Middle), T1021.002 (SMB/Windows Admin Shares)'; Nist = 'SC-8, SC-23'; Cis8 = 'CIS 4.1, 3.10' }
+    'Printers & RPC'          = @{ Severity = 'High'; Mitre = 'T1068 (Exploitation for Privilege Escalation), T1187 (Forced Authentication)'; Nist = 'CM-7, SC-8'; Cis8 = 'CIS 4.1' }
+    'System'                  = @{ Severity = 'Medium'; Mitre = 'T1556 (Modify Authentication Process), T1547 (Boot or Logon Autostart Execution)'; Nist = 'CM-6, SI-7'; Cis8 = 'CIS 4.1' }
+    'Windows Components'      = @{ Severity = 'Medium'; Mitre = 'T1204 (User Execution), T1021.001 (Remote Desktop Protocol)'; Nist = 'CM-6, CM-7'; Cis8 = 'CIS 4.1' }
+}
+
+$Script:SeceditCache = $null
+function Get-SeceditSetting {
+    <# [System Access] and [Privilege Rights] from one secedit export, cached for the run. #>
+    if ($null -ne $Script:SeceditCache) { return $Script:SeceditCache }
+    $result = @{}
+    $tempCfg = Join-Path -Path $env:TEMP -ChildPath "EndpointPostureCheck_cis_$PID.cfg"
+    try {
+        $null = & secedit.exe /export /cfg $tempCfg /quiet 2>$null
+        if (Test-Path -LiteralPath $tempCfg) {
+            foreach ($line in (Get-Content -LiteralPath $tempCfg -ErrorAction Stop)) {
+                if ($line -match '^\s*([A-Za-z]+)\s*=\s*(.*)$') { $result[$Matches[1]] = $Matches[2].Trim() }
+            }
+        }
+    } catch { Write-Verbose "secedit export: $($_.Exception.Message)" }
+    finally { Remove-Item -LiteralPath $tempCfg -Force -ErrorAction SilentlyContinue }
+    $Script:SeceditCache = $result
+    return $result
+}
+
+function ConvertTo-PrincipalSid {
+    # secedit lists principals as *S-1-... or as names it could not map; names are translated.
+    param([string]$Principal)
+    $p = $Principal.Trim()
+    if ($p.StartsWith('*')) { return $p.Substring(1) }
+    try { return ([System.Security.Principal.NTAccount]::new($p)).Translate([System.Security.Principal.SecurityIdentifier]).Value } catch { return $p }
+}
+
+function Test-CisSidAllowed {
+    param([string]$Sid, [string[]]$Allowed)
+    foreach ($a in $Allowed) {
+        if ($a.EndsWith('*')) { if ($Sid.StartsWith($a.TrimEnd('*'))) { return $true } }
+        elseif ($Sid -eq $a) { return $true }
+    }
+    return $false
+}
+
+function Test-CisValueMatch {
+    <# $true when a set value satisfies the row; values are compared as numbers when both sides are numbers. #>
+    param([string]$Op, [string]$Expected, $Value)
+    $text = if ($Value -is [array]) { (@($Value) | Where-Object { "$_" -ne '' }) -join ',' } else { [string]$Value }
+    $num = [int64]0; $isNum = [int64]::TryParse($text, [ref]$num)
+    $exp = [int64]0; $expNum = [int64]::TryParse($Expected, [ref]$exp)
+    switch ($Op) {
+        'eq' { if ($isNum -and $expNum) { return $num -eq $exp }; return $text -eq $Expected }
+        'in' { return (@($Expected -split ',') -contains $text) }
+        'ge' { return ($isNum -and $num -ge $exp) }
+        'le' { return ($isNum -and $num -le $exp) }
+        'lenz' { return ($isNum -and $num -le $exp -and $num -ne 0) }
+        'ne' { return $text -ne $Expected }
+        'range' { $lo, $hi = $Expected -split '-'; return ($isNum -and $num -ge [int64]$lo -and $num -le [int64]$hi) }
+        'sz' { return $text -eq $Expected }
+        'empty' { return [string]::IsNullOrWhiteSpace($text) }
+        'contains' {
+            $flat = ($text -replace '\s', '').ToLowerInvariant()
+            foreach ($t in ($Expected -split ',')) { if ($flat -notlike "*$($t.ToLowerInvariant())*") { return $false } }
+            return $true
+        }
+        default { return $false }
+    }
+}
+
+function Get-CisRowResult {
+    <# State of one row: OK, BAD (set differently), UNSET (not configured), plus the shown value. #>
+    param([string[]]$Row, $Services)
+    $id, $level, $group, $source, $name, $op, $expected = $Row
+    switch ($source) {
+        'secedit' {
+            $sec = Get-SeceditSetting
+            if (-not $sec.ContainsKey($name)) { return @{ State = 'UNSET'; Shown = 'not set' } }
+            $v = $sec[$name]
+            return @{ State = $(if (Test-CisValueMatch $op $expected $v) { 'OK' } else { 'BAD' }); Shown = $v }
+        }
+        'right' {
+            $sec = Get-SeceditSetting
+            $assigned = @()
+            if ($sec.ContainsKey($name) -and $sec[$name]) { $assigned = @($sec[$name] -split ',' | Where-Object { $_ } | ForEach-Object { ConvertTo-PrincipalSid $_ }) }
+            $want = @($expected -split ';' | Where-Object { $_ })
+            if ($op -eq 'deny') {
+                $missing = @($want | Where-Object { $assigned -notcontains $_ })
+                if (-not $missing.Count) { return @{ State = 'OK'; Shown = ($assigned -join ', ') } }
+                return @{ State = $(if ($assigned.Count) { 'BAD' } else { 'UNSET' }); Shown = "missing $($missing -join ', ')" }
+            }
+            $extra = @($assigned | Where-Object { -not (Test-CisSidAllowed $_ $want) })
+            if (-not $extra.Count) { return @{ State = 'OK'; Shown = $(if ($assigned.Count) { $assigned -join ', ' } else { 'No One' }) } }
+            # A privilege (not a logon right) granted to a broad group is a real hole, not a default.
+            $broad = @($extra | Where-Object { $_ -in @('S-1-1-0', 'S-1-5-11', 'S-1-5-32-545', 'S-1-5-32-546', 'S-1-5-7', 'S-1-5-4') })
+            $hard = ($name -like '*Privilege') -and $broad.Count -and -not ($name -in @('SeShutdownPrivilege', 'SeChangeNotifyPrivilege'))
+            return @{ State = $(if ($hard) { 'HARD' } else { 'BAD' }); Shown = "also granted to $($extra -join ', ')" }
+        }
+        'service' {
+            $svc = $Services | Where-Object { $_.Name -eq $name } | Select-Object -First 1
+            if (-not $svc) { return @{ State = 'OK'; Shown = 'not installed' } }
+            if ([string]$svc.StartMode -eq 'Disabled') { return @{ State = 'OK'; Shown = 'Disabled' } }
+            return @{ State = 'BAD'; Shown = "$($svc.StartMode), $($svc.State)" }
+        }
+        default {
+            $regPath = 'Registry::' + ($source -replace '^HKLM\\', 'HKEY_LOCAL_MACHINE\')
+            $key = Get-Item -LiteralPath $regPath -ErrorAction SilentlyContinue
+            $exists = $key -and (@($key.GetValueNames()) -contains $name)
+            if ($op -eq 'absent') { return @{ State = $(if ($exists) { 'BAD' } else { 'OK' }); Shown = $(if ($exists) { [string]$key.GetValue($name) } else { 'absent' }) } }
+            if (-not $exists) { return @{ State = $(if ($op -eq 'empty') { 'OK' } else { 'UNSET' }); Shown = 'not set' } }
+            $v = $key.GetValue($name, $null, 'DoNotExpandEnvironmentNames')
+            $shown = if ($v -is [array]) { (@($v) | Where-Object { "$_" -ne '' }) -join ',' } else { [string]$v }
+            return @{ State = $(if (Test-CisValueMatch $op $expected $v) { 'OK' } else { 'BAD' }); Shown = $shown }
+        }
+    }
+}
+
+function Test-CisBenchmarkPolicies {
+    <#
+        Evaluates every row of $Script:CisRows and adds one finding per CIS area (Level 1, scored)
+        plus one INFO finding with the Level 2 settings. Detail lines name the recommendation
+        number, where the setting lives, its value and the expected value.
+    #>
+    Write-SectionBanner 'CIS Windows 11 Benchmark - Policy Settings'
+    $category = 'CIS Benchmark Policy Settings'
+    $services = @(Get-ServiceInventoryCache)
+    $byGroup = @{}; $level2 = [System.Collections.Generic.List[string]]::new(); $l2ok = 0
+    foreach ($line in ($Script:CisRows -split "`r?`n")) {
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        $row = $line.Split('|')
+        if ($row.Count -lt 7) { continue }
+        $id, $level, $group, $source, $name, $op, $expected = $row
+        try { $r = Get-CisRowResult -Row $row -Services $services } catch { $r = @{ State = 'UNSET'; Shown = "unreadable: $($_.Exception.Message)" } }
+        $where = switch ($source) { 'secedit' { "Security policy $name" } 'right' { "User right $name" } 'service' { "Service $name" } default { "$source\$name" } }
+        $want = switch ($op) { 'grant' { "only $(if ($expected) { $expected -replace ';', ', ' } else { 'No One' })" } 'deny' { "includes $($expected -replace ';', ', ')" } 'disabled' { 'Disabled or not installed' } 'absent' { 'not present' } 'empty' { 'empty' } 'in' { "one of $expected" } 'ge' { ">= $expected" } 'le' { "<= $expected" } 'lenz' { "1 to $expected" } 'range' { $expected } 'ne' { "not $expected" } 'contains' { "contains $expected" } default { $expected } }
+        $detail = "${id}: $where = $($r.Shown) (expected $want)"
+        if ($level -eq 'L2') {
+            if ($r.State -eq 'OK') { $l2ok++ } else { $level2.Add("$(if ($r.State -eq 'UNSET') { 'NOT SET' } else { 'DIFFERS' }) $detail") }
+            continue
+        }
+        if (-not $byGroup.ContainsKey($group)) { $byGroup[$group] = @{ Ok = 0; Hard = [System.Collections.Generic.List[string]]::new(); Bad = [System.Collections.Generic.List[string]]::new(); Unset = [System.Collections.Generic.List[string]]::new() } }
+        switch ($r.State) {
+            'OK' { $byGroup[$group].Ok++ }
+            'HARD' { $byGroup[$group].Hard.Add("DIFFERS $detail") }
+            'BAD' { $byGroup[$group].Bad.Add("DIFFERS $detail") }
+            default { $byGroup[$group].Unset.Add("NOT SET $detail") }
+        }
+    }
+    foreach ($g in $Script:CisGroups.GetEnumerator()) {
+        if (-not $byGroup.ContainsKey($g.Key)) { continue }
+        $b = $byGroup[$g.Key]; $meta = $g.Value
+        $total = $b.Ok + $b.Hard.Count + $b.Bad.Count + $b.Unset.Count
+        $differs = $b.Hard.Count + $b.Bad.Count
+        $fwc = @{ Category = $category; Control = "CIS Benchmark - $($g.Key)"; CIS_Control = $meta.Cis8; NIST_Control = $meta.Nist; MITRE_Technique = $meta.Mitre
+            ISO27001_Control = 'A.8.9'; NIS2_Article = 'Art.21(2)(d)'; RecommendedValue = 'Every Level 1 setting as the CIS Windows 11 Enterprise Benchmark v5.0.1 recommends'
+            Evidence = 'Policy registry keys, secedit /export and Win32_Service; one line per CIS recommendation number' }
+        $details = (@($b.Hard) + @($b.Bad) + @($b.Unset)) -join "`n"
+        $current = "$($b.Ok) of $total Level 1 setting(s) as recommended; $differs set differently, $($b.Unset.Count) not configured"
+        $rec = 'Configure each listed setting through Group Policy (Computer Configuration > Windows Settings > Security Settings, or Administrative Templates) or the matching Intune setting, so it stays enforced. Each line gives the CIS recommendation number and the registry value or policy it maps to.'
+        if ($b.Hard.Count -or ($differs -and -not $meta.SoftMismatch)) {
+            Add-AuditResult @fwc -Status 'FAIL' -Severity $meta.Severity -CurrentValue $current -Details $details -Recommendation $rec
+        } elseif ($differs -or $b.Unset.Count) {
+            Add-AuditResult @fwc -Status 'WARN' -Severity $meta.Severity -CurrentValue $current -Details $details -Recommendation $rec
+        } else {
+            Add-AuditResult @fwc -Status 'PASS' -Severity $meta.Severity -CurrentValue $current -Recommendation 'No action required.'
+        }
+    }
+    Add-AuditResult -Category $category -Control 'CIS Benchmark - Level 2 Settings' -Status 'INFO' -Severity 'Informational' `
+        -CurrentValue "$l2ok Level 2 setting(s) as recommended, $($level2.Count) not (not scored: Level 2 trades functionality for security)" -Details ($level2 -join "`n") `
+        -CIS_Control 'CIS 4.1' -NIST_Control 'CM-6' -ISO27001_Control 'A.8.9' -Evidence 'Policy registry keys, secedit /export and Win32_Service' `
+        -Recommendation 'Informational only. Apply Level 2 settings where the environment needs the stronger profile.'
+}
+
+# The 27 Advanced Audit Policy subcategories of CIS section 17. Matched by subcategory GUID (the
+# same on every language edition of Windows), with the English name as fallback. Need: S =
+# include Success, F = include Failure, SF = Success and Failure.
+$Script:CisAuditSubcategories = @(
+    @{ Id = '17.1.1'; Name = 'Credential Validation'; Guid = '{0CCE923F-69AE-11D9-BED3-505054503030}'; Need = 'SF'; Severity = 'High' }
+    @{ Id = '17.2.1'; Name = 'Application Group Management'; Guid = '{0CCE9239-69AE-11D9-BED3-505054503030}'; Need = 'SF'; Severity = 'Medium' }
+    @{ Id = '17.2.2'; Name = 'Security Group Management'; Guid = '{0CCE9237-69AE-11D9-BED3-505054503030}'; Need = 'S'; Severity = 'High' }
+    @{ Id = '17.2.3'; Name = 'User Account Management'; Guid = '{0CCE9235-69AE-11D9-BED3-505054503030}'; Need = 'SF'; Severity = 'High' }
+    @{ Id = '17.3.1'; Name = 'PNP Activity'; Guid = '{0CCE9248-69AE-11D9-BED3-505054503030}'; Need = 'S'; Severity = 'Medium' }
+    @{ Id = '17.3.2'; Name = 'Process Creation'; Guid = '{0CCE922B-69AE-11D9-BED3-505054503030}'; Need = 'S'; Severity = 'High' }
+    @{ Id = '17.5.1'; Name = 'Account Lockout'; Guid = '{0CCE9217-69AE-11D9-BED3-505054503030}'; Need = 'F'; Severity = 'Medium' }
+    @{ Id = '17.5.2'; Name = 'Group Membership'; Guid = '{0CCE9249-69AE-11D9-BED3-505054503030}'; Need = 'S'; Severity = 'Medium' }
+    @{ Id = '17.5.3'; Name = 'Logoff'; Guid = '{0CCE9216-69AE-11D9-BED3-505054503030}'; Need = 'S'; Severity = 'Low' }
+    @{ Id = '17.5.4'; Name = 'Logon'; Guid = '{0CCE9215-69AE-11D9-BED3-505054503030}'; Need = 'SF'; Severity = 'High' }
+    @{ Id = '17.5.5'; Name = 'Other Logon/Logoff Events'; Guid = '{0CCE921C-69AE-11D9-BED3-505054503030}'; Need = 'SF'; Severity = 'Medium' }
+    @{ Id = '17.5.6'; Name = 'Special Logon'; Guid = '{0CCE921B-69AE-11D9-BED3-505054503030}'; Need = 'S'; Severity = 'High' }
+    @{ Id = '17.6.1'; Name = 'Detailed File Share'; Guid = '{0CCE9244-69AE-11D9-BED3-505054503030}'; Need = 'F'; Severity = 'Medium' }
+    @{ Id = '17.6.2'; Name = 'File Share'; Guid = '{0CCE9224-69AE-11D9-BED3-505054503030}'; Need = 'SF'; Severity = 'Medium' }
+    @{ Id = '17.6.3'; Name = 'Other Object Access Events'; Guid = '{0CCE9227-69AE-11D9-BED3-505054503030}'; Need = 'SF'; Severity = 'Medium' }
+    @{ Id = '17.6.4'; Name = 'Removable Storage'; Guid = '{0CCE9245-69AE-11D9-BED3-505054503030}'; Need = 'SF'; Severity = 'Medium' }
+    @{ Id = '17.7.1'; Name = 'Audit Policy Change'; Guid = '{0CCE922F-69AE-11D9-BED3-505054503030}'; Need = 'S'; Severity = 'Medium' }
+    @{ Id = '17.7.2'; Name = 'Authentication Policy Change'; Guid = '{0CCE9230-69AE-11D9-BED3-505054503030}'; Need = 'S'; Severity = 'Medium' }
+    @{ Id = '17.7.3'; Name = 'Authorization Policy Change'; Guid = '{0CCE9231-69AE-11D9-BED3-505054503030}'; Need = 'S'; Severity = 'Medium' }
+    @{ Id = '17.7.4'; Name = 'MPSSVC Rule-Level Policy Change'; Guid = '{0CCE9232-69AE-11D9-BED3-505054503030}'; Need = 'SF'; Severity = 'Medium' }
+    @{ Id = '17.7.5'; Name = 'Other Policy Change Events'; Guid = '{0CCE9234-69AE-11D9-BED3-505054503030}'; Need = 'F'; Severity = 'Low' }
+    @{ Id = '17.8.1'; Name = 'Sensitive Privilege Use'; Guid = '{0CCE9228-69AE-11D9-BED3-505054503030}'; Need = 'SF'; Severity = 'High' }
+    @{ Id = '17.9.1'; Name = 'IPsec Driver'; Guid = '{0CCE9213-69AE-11D9-BED3-505054503030}'; Need = 'SF'; Severity = 'Low' }
+    @{ Id = '17.9.2'; Name = 'Other System Events'; Guid = '{0CCE9214-69AE-11D9-BED3-505054503030}'; Need = 'SF'; Severity = 'Medium' }
+    @{ Id = '17.9.3'; Name = 'Security State Change'; Guid = '{0CCE9210-69AE-11D9-BED3-505054503030}'; Need = 'S'; Severity = 'Medium' }
+    @{ Id = '17.9.4'; Name = 'Security System Extension'; Guid = '{0CCE9211-69AE-11D9-BED3-505054503030}'; Need = 'S'; Severity = 'High' }
+    @{ Id = '17.9.5'; Name = 'System Integrity'; Guid = '{0CCE9212-69AE-11D9-BED3-505054503030}'; Need = 'SF'; Severity = 'High' }
+)
+
+function Test-AdvancedAuditPolicy {
+    <#
+        All 27 Advanced Audit Policy subcategories CIS Windows 11 section 17 requires, each with
+        its exact requirement (Success, Failure, or both). Reads auditpol /r once and matches by
+        subcategory GUID, so it also works on non-English Windows. The "Setting Value" column
+        (1 = Success, 2 = Failure, 3 = both) is used where present, the English text otherwise.
+    #>
+    Write-SectionBanner 'Advanced Security Auditing & Event Logging'
+    try {
+        $auditCsv = @(& auditpol.exe /get /category:* /r 2>$null | ConvertFrom-Csv)
+        if (-not $auditCsv.Count) { throw 'auditpol returned no data' }
+        foreach ($sub in $Script:CisAuditSubcategories) {
+            $row = $auditCsv | Where-Object { [string]$_.'Subcategory GUID' -eq $sub.Guid } | Select-Object -First 1
+            if (-not $row) { $row = $auditCsv | Where-Object { $_.Subcategory -eq $sub.Name } | Select-Object -First 1 }
+            $fw = @{ Category = 'Advanced Security Auditing & Event Logging'; Control = "Advanced Audit Policy - $($sub.Name)"; CIS_Control = 'CIS 8.2, 8.5'
+                NIST_Control = 'AU-2, AU-12'; MITRE_Technique = 'T1562.002 (Disable Windows Event Logging)'; ISO27001_Control = 'A.8.15'; NIS2_Article = 'Art.21(2)(b)'
+                NSA_Guidance = 'NSA/CISA Audit Logging Best Practices'; Evidence = "auditpol /get /category:* /r ($($sub.Guid))"
+                RecommendedValue = "$(switch ($sub.Need) { 'SF' { 'Success and Failure' } 'S' { 'Includes Success' } 'F' { 'Includes Failure' } }) (CIS $($sub.Id))" }
+            if (-not $row) {
+                Add-AuditResult @fw -Status 'WARN' -Severity 'Low' -CurrentValue 'Subcategory not found in auditpol output' -Recommendation 'Verify the OS build and run auditpol /get /category:* manually.'
+                continue
+            }
+            $value = -1
+            if ($row.PSObject.Properties['Setting Value'] -and [string]$row.'Setting Value' -match '^\d+$') { $value = [int]$row.'Setting Value' }
+            else {
+                $text = [string]$row.'Inclusion Setting'
+                $value = 0
+                if ($text -match 'Success') { $value = $value -bor 1 }
+                if ($text -match 'Failure') { $value = $value -bor 2 }
+            }
+            $need = switch ($sub.Need) { 'SF' { 3 } 'S' { 1 } 'F' { 2 } }
+            $shown = switch ($value) { 0 { 'No Auditing' } 1 { 'Success' } 2 { 'Failure' } 3 { 'Success and Failure' } default { [string]$row.'Inclusion Setting' } }
+            if (($value -band $need) -eq $need) {
+                Add-AuditResult @fw -Status 'PASS' -Severity $sub.Severity -CurrentValue $shown -Recommendation 'No action required.'
+            } else {
+                Add-AuditResult @fw -Status 'FAIL' -Severity $sub.Severity -CurrentValue $shown `
+                    -Recommendation "Set Advanced Audit Policy > $($sub.Name) to $($fw.RecommendedValue) by Group Policy (Computer Configuration > Windows Settings > Security Settings > Advanced Audit Policy Configuration), together with 'Audit: Force audit policy subcategory settings' (CIS 2.3.2.1) so legacy category settings cannot override it."
+            }
+        }
+    } catch {
+        Add-AuditResult -Category 'Advanced Security Auditing & Event Logging' -Control 'Advanced Audit Policy Configuration' -Status 'WARN' -Severity 'Low' `
+            -CurrentValue 'Query failed' -Recommendation "Unable to query auditpol.exe: $($_.Exception.Message)"
+    }
+}
+
+function Test-DefenderScanAndRemediationSettings {
+    <#
+        Defender settings from the CIS Microsoft Defender Antivirus Benchmark v1.0.0 that the
+        other Defender checks do not read. The effective value comes from Get-MpPreference where
+        it exposes the setting, so Intune and local settings count; the policy key says whether
+        a weak value was configured (FAIL) or is only Defender's default (WARN).
+    #>
+    Write-SectionBanner 'Next-Gen Antivirus & EDR - Defender Scan & Remediation Settings'
+    $fwc = @{ Category = 'Next-Gen Antivirus & EDR'; Control = 'Defender Scan & Remediation Settings'; CIS_Control = 'CIS 10.1, 10.4'; NIST_Control = 'SI-3'
+        MITRE_Technique = 'T1562.001 (Disable or Modify Tools), T1027 (Obfuscated Files or Information)'; ISO27001_Control = 'A.8.7'; NIS2_Article = 'Art.21(2)(e)'
+        RecommendedValue = 'Every listed Defender setting as the CIS Defender Antivirus Benchmark recommends'; Evidence = 'Get-MpPreference and HKLM\SOFTWARE\Policies\Microsoft\Windows Defender' }
+    $pol = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender'
+    # Id, preference property (or ''), policy subkey, value name, expected (as a string), op
+    $items = @(
+        @('1.5.1', '', 'Spynet', 'LocalSettingOverrideSpynetReporting', '0', 'eq')
+        @('1.5.2', 'DisableBlockAtFirstSeen', 'Spynet', 'DisableBlockAtFirstSeen', 'False', 'bool')
+        @('1.7.1', '', 'MpEngine', 'EnableFileHashComputation', '1', 'eq')
+        @('1.8.1', '', 'NIS', 'EnableConvertWarnToBlock', '1', 'eq')
+        @('1.10.1', 'RealTimeScanDirection', 'Real-Time Protection', 'RealtimeScanDirection', '0', 'eq')
+        @('1.10.7', '', 'Real-Time Protection', 'DisableScanOnRealtimeEnable', '0', 'eqdefault')
+        @('1.13.1', 'CheckForSignaturesBeforeRunningScan', 'Scan', 'CheckForSignaturesBeforeRunningScan', 'True', 'bool')
+        @('1.13.2', 'DisableArchiveScanning', 'Scan', 'DisableArchiveScanning', 'False', 'bool')
+        @('1.13.4', '', 'Scan', 'DisablePackedExeScanning', '0', 'eqdefault')
+        @('1.13.5', 'DisableRemovableDriveScanning', 'Scan', 'DisableRemovableDriveScanning', 'False', 'bool')
+        @('1.13.11', 'DisableEmailScanning', 'Scan', 'DisableEmailScanning', 'False', 'bool')
+        @('1.14.1', '', 'Signature Updates', 'SignatureUpdateInterval', '1-4', 'range')
+        @('1.17', '', '', 'HideExclusionsFromLocalUsers', '1', 'eq')
+        @('1.18', '', '', 'DisableRoutinelyTakingAction', '0', 'eqdefault')
+    )
+    try {
+        $pref = Get-MpPreference -ErrorAction Stop
+        $bad = [System.Collections.Generic.List[string]]::new(); $weak = [System.Collections.Generic.List[string]]::new(); $ok = 0
+        foreach ($it in $items) {
+            $id, $prop, $sub, $name, $expected, $op = $it
+            $key = if ($sub) { "$pol\$sub" } else { $pol }
+            $policy = Get-RegistryValueSafe -Path $key -Name $name -DefaultValue $null
+            $effective = $null
+            if ($prop -and $pref.PSObject.Properties[$prop]) { $effective = $pref.$prop }
+            $value = if ($null -ne $effective) { [string]$effective } elseif ($null -ne $policy) { [string]$policy } else { $null }
+            $good = switch ($op) {
+                'bool' { ($value -eq $expected) -or ($expected -eq 'False' -and $value -eq '0') -or ($expected -eq 'True' -and $value -eq '1') }
+                'eq' { $value -eq $expected }
+                'eqdefault' { $null -eq $value -or $value -eq $expected }   # unset = Defender default, which is the secure value
+                'range' { $lo, $hi = $expected -split '-'; ($value -match '^\d+$') -and [int]$value -ge [int]$lo -and [int]$value -le [int]$hi }
+            }
+            $line = "${id}: $name = $(if ($null -eq $value) { 'not set' } else { $value }) (expected $expected)"
+            if ($good) { $ok++ }
+            elseif ($null -ne $policy) { $bad.Add("SET BY POLICY $line") }
+            else { $weak.Add("DEFAULT $line") }
+        }
+        $status = Get-MpComputerStatus -ErrorAction SilentlyContinue
+        if ($status -and [string]$status.AMRunningMode -match 'Passive|EDR') {
+            $pr = Get-RegistryValueSafe -Path "$pol\Features" -Name 'PassiveRemediation' -DefaultValue $null
+            if ($null -eq $pr -or (([int]$pr -band 1) -eq 0)) { $weak.Add("DEFAULT 1.4.1: Defender runs in $($status.AMRunningMode) mode without EDR in block mode (Features\PassiveRemediation bit 1)") }
+        }
+        $all = (@($bad) + @($weak)) -join "`n"
+        if ($bad.Count) {
+            Add-AuditResult @fwc -Status 'FAIL' -Severity 'Medium' -CurrentValue "$($bad.Count) setting(s) weakened by policy, $($weak.Count) left at a weaker default; $ok as recommended" -Details $all `
+                -Recommendation 'Fix the policy values (Group Policy: Windows Components > Microsoft Defender Antivirus, or the Intune Antivirus profile). A policy that turns off archive, e-mail or removable-drive scanning, or Block at First Sight, removes detection paths attackers use.'
+        } elseif ($weak.Count) {
+            Add-AuditResult @fwc -Status 'WARN' -Severity 'Medium' -CurrentValue "$($weak.Count) setting(s) left at a weaker Defender default; $ok as recommended" -Details $all `
+                -Recommendation 'Enable the listed settings by policy: e-mail and removable-drive scanning, file hash computation, warn-to-block for Network Protection, hidden exclusions, and a signature update interval of at most 4 hours.'
+        } else {
+            Add-AuditResult @fwc -Status 'PASS' -Severity 'Medium' -CurrentValue "All $ok listed Defender settings as recommended" -Recommendation 'No action required.'
+        }
+    } catch {
+        Add-AuditResult @fwc -Status 'WARN' -Severity 'Low' -CurrentValue 'Query failed' -Recommendation "Unable to read Defender preferences (another antivirus may be active): $($_.Exception.Message)"
+    }
+}
+
+#endregion
+
+#region ============================== 40. BROWSER & OFFICE SECURITY POLICIES (CIS) ==============================
+
+# Security-relevant policies from the CIS Microsoft Edge v5.0.0 and Google Chrome v3.0.0
+# benchmarks: Name|Op|Expected. Ops: eq, in (a,b), list (policy list subkey contains the value),
+# nokey (list policy must not exist). Privacy, UI and AI toggles are deliberately left out.
+$Script:BrowserPolicies = @{
+    'Microsoft Edge' = @{ Key = 'HKLM:\SOFTWARE\Policies\Microsoft\Edge'; Exe = @("${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe", "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe"); Rows = @(
+            'SmartScreenEnabled|eq|1', 'PreventSmartScreenPromptOverride|eq|1', 'PreventSmartScreenPromptOverrideForFiles|eq|1', 'SmartScreenPuaEnabled|eq|1',
+            'DownloadRestrictions|in|1,2,3,4', 'SSLErrorOverrideAllowed|eq|0', 'BlockExternalExtensions|eq|1', 'ExtensionInstallBlocklist|list|*',
+            'RemoteDebuggingAllowed|eq|0', 'ApplicationBoundEncryptionEnabled|eq|1', 'SitePerProcess|eq|1', 'ClickOnceEnabled|eq|0', 'DirectInvokeEnabled|eq|0',
+            'ScarewareBlockerProtectionEnabled|eq|1', 'TyposquattingCheckerEnabled|eq|1', 'EnhanceSecurityMode|in|1,2',
+            'OverrideSecurityRestrictionsOnInsecureOrigin|nokey|', 'HSTSPolicyBypassList|nokey|')
+    }
+    'Google Chrome'  = @{ Key = 'HKLM:\SOFTWARE\Policies\Google\Chrome'; Exe = @("$env:ProgramFiles\Google\Chrome\Application\chrome.exe", "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe"); Rows = @(
+            'SafeBrowsingProtectionLevel|in|1,2', 'DisableSafeBrowsingProceedAnyway|eq|1', 'DownloadRestrictions|in|1,2,3,4', 'SSLErrorOverrideAllowed|eq|0',
+            'BlockExternalExtensions|eq|1', 'ExtensionInstallBlocklist|list|*', 'RemoteDebuggingAllowed|eq|0', 'ApplicationBoundEncryptionEnabled|eq|1', 'SitePerProcess|eq|1',
+            'OverrideSecurityRestrictionsOnInsecureOrigin|nokey|', 'HSTSPolicyBypassList|nokey|')
+    }
+}
+
+function Test-BrowserSecurityPolicy {
+    <#
+        Edge and Chrome enterprise policies that stop phishing, malicious downloads, certificate
+        click-through, extension sideloading and remote-debugging cookie theft. A browser with no
+        policy at all gets one WARN ("not managed by policy") rather than a FAIL per setting; an
+        explicitly weakened policy is a FAIL. "*" in ExtensionSettings with installation_mode
+        "blocked" counts as a block-all extension policy.
+    #>
+    Write-SectionBanner 'Browser & Application Hardening - Edge & Chrome Security Policies'
+    foreach ($b in $Script:BrowserPolicies.GetEnumerator()) {
+        $name = $b.Key; $cfg = $b.Value
+        $fwc = @{ Category = 'Browser & Application Hardening'; Control = "Browser Security Policy - $name"; CIS_Control = 'CIS 9.1, 9.4'; NIST_Control = 'CM-6, SC-18'
+            MITRE_Technique = 'T1566 (Phishing), T1176 (Browser Extensions), T1539 (Steal Web Session Cookie)'; ISO27001_Control = 'A.8.9'; NIS2_Article = 'Art.21(2)(d)'
+            RecommendedValue = "Security policies of the CIS $name benchmark enforced"; Evidence = $cfg.Key }
+        try {
+            if (-not @($cfg.Exe | Where-Object { $_ -and (Test-Path -LiteralPath $_) }).Count) { continue }
+            if (-not (Test-Path -LiteralPath $cfg.Key)) {
+                Add-AuditResult @fwc -Status 'WARN' -Severity 'Low' -CurrentValue "$name is installed but not managed by policy ($($cfg.Rows.Count) recommended security policies unset)" `
+                    -Recommendation "Manage $name by Group Policy or Intune (ADMX templates from the vendor) and enforce at least SmartScreen/Safe Browsing without click-through, download restrictions, no certificate-error override, an extension block list with an allow list, and remote debugging off."
+                continue
+            }
+            $props = Get-ItemProperty -LiteralPath $cfg.Key -ErrorAction SilentlyContinue
+            $extSettings = if ($props -and $props.PSObject.Properties['ExtensionSettings']) { [string]$props.ExtensionSettings } else { '' }
+            $bad = [System.Collections.Generic.List[string]]::new(); $unset = [System.Collections.Generic.List[string]]::new(); $ok = 0
+            foreach ($row in $cfg.Rows) {
+                $policy, $op, $expected = $row.Split('|')
+                if ($op -eq 'nokey') {
+                    if (Test-Path -LiteralPath "$($cfg.Key)\$policy") { $bad.Add("${policy}: exceptions are configured (expected none)") } else { $ok++ }
+                    continue
+                }
+                if ($op -eq 'list') {
+                    $values = @()
+                    $listKey = Get-ItemProperty -LiteralPath "$($cfg.Key)\$policy" -ErrorAction SilentlyContinue
+                    if ($listKey) { $values = @($listKey.PSObject.Properties | Where-Object { $_.Name -match '^\d+$' } | ForEach-Object { [string]$_.Value }) }
+                    if ($values -contains $expected -or ($extSettings -match '"\*"\s*:\s*\{[^}]*"installation_mode"\s*:\s*"blocked"')) { $ok++ }
+                    elseif ($values.Count) { $unset.Add("${policy}: $($values.Count) entr(y/ies) but no '*' (only listed extensions are blocked)") }
+                    else { $unset.Add("${policy}: not set (expected '*' plus an ExtensionInstallAllowlist)") }
+                    continue
+                }
+                if (-not ($props -and $props.PSObject.Properties[$policy])) { $unset.Add("${policy}: not set (expected $expected)"); continue }
+                $value = [string]$props.$policy
+                $good = if ($op -eq 'in') { @($expected -split ',') -contains $value } else { $value -eq $expected }
+                if ($good) { $ok++ } else { $bad.Add("${policy} = $value (expected $expected)") }
+            }
+            $all = (@($bad) + @($unset)) -join "`n"
+            if ($bad.Count) {
+                Add-AuditResult @fwc -Status 'FAIL' -Severity 'Medium' -CurrentValue "$($bad.Count) policy(ies) weakened, $($unset.Count) not set, $ok as recommended" -Details $all `
+                    -Recommendation "Correct the listed $name policies in the Group Policy or Intune profile that sets them."
+            } elseif ($unset.Count) {
+                Add-AuditResult @fwc -Status 'WARN' -Severity 'Medium' -CurrentValue "$($unset.Count) recommended policy(ies) not set, $ok as recommended" -Details $all `
+                    -Recommendation "Add the listed policies to the $name policy profile."
+            } else {
+                Add-AuditResult @fwc -Status 'PASS' -Severity 'Medium' -CurrentValue "All $ok checked security policies enforced" -Recommendation 'No action required.'
+            }
+        } catch {
+            Add-AuditResult @fwc -Status 'WARN' -Severity 'Low' -CurrentValue 'Query failed' -Recommendation "Unable to read $name policies: $($_.Exception.Message)"
+        }
+    }
+}
+
+# Office macro and Protected View policies (CIS Microsoft Office Enterprise v2.0.0), per user
+# under HKU\<SID>\SOFTWARE\Policies\Microsoft\office\16.0: App|Subkey|Value|Op|Expected|Unset
+# where Unset is OK when the current Office default is the secure value, WARN otherwise.
+$Script:OfficePolicies = @(
+    'word|security|blockcontentexecutionfrominternet|eq|1|OK', 'excel|security|blockcontentexecutionfrominternet|eq|1|OK', 'powerpoint|security|blockcontentexecutionfrominternet|eq|1|OK'
+    'word|security|vbawarnings|in|3,4|WARN', 'excel|security|vbawarnings|in|3,4|WARN', 'powerpoint|security|vbawarnings|in|3,4|WARN'
+    'excel|security|xl4macrooff|eq|1|WARN', 'excel|security|blockxllfrominternet|eq|1|OK', 'excel|security\external content|disableddeserverlaunch|eq|1|WARN'
+    'word|security|accessvbom|eq|0|OK', 'excel|security|accessvbom|eq|0|OK', 'powerpoint|security|accessvbom|eq|0|OK'
+    'word|security\protectedview|disableinternetfilesinpv|eq|0|OK', 'excel|security\protectedview|disableinternetfilesinpv|eq|0|OK', 'powerpoint|security\protectedview|disableinternetfilesinpv|eq|0|OK'
+    'word|security\protectedview|disableattachmentsinpv|eq|0|OK', 'excel|security\protectedview|disableattachmentsinpv|eq|0|OK', 'powerpoint|security\protectedview|disableattachmentsinpv|eq|0|OK'
+    'word|security\trusted locations|allownetworklocations|eq|0|OK', 'excel|security\trusted locations|allownetworklocations|eq|0|OK'
+    'common|security|macroruntimescanscope|eq|2|WARN'
+)
+
+function Test-OfficeMacroPolicy {
+    <#
+        Office macro defences for every loaded user profile: macros from the internet blocked,
+        VBA limited to signed macros, Excel 4.0 (XLM) macros, untrusted XLL add-ins and DDE server
+        launch off, Protected View kept on, no programmatic VBA project access, no trusted
+        locations on the network, and AMSI scanning of macros at runtime. Only when Microsoft 365
+        Apps or Office 2016+ is installed. Users whose hive is not loaded cannot be read.
+    #>
+    Write-SectionBanner 'Browser & Application Hardening - Office Macro & Protected View Policies'
+    $fwc = @{ Category = 'Browser & Application Hardening'; Control = 'Office Macro & Protected View Policies'; CIS_Control = 'CIS 2.7, 9.6'; NIST_Control = 'CM-7, SI-3'
+        MITRE_Technique = 'T1566.001 (Spearphishing Attachment), T1204.002 (Malicious File), T1559.002 (Dynamic Data Exchange)'; ISO27001_Control = 'A.8.7'; NIS2_Article = 'Art.21(2)(e)'
+        RecommendedValue = 'Macro and Protected View policies of the CIS Office benchmark enforced for every user'; Evidence = 'HKU\<SID>\SOFTWARE\Policies\Microsoft\office\16.0' }
+    try {
+        $office = (Test-Path -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration') -or (Test-Path -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Office\16.0\Common\InstallRoot')
+        if (-not $office) {
+            Add-AuditResult @fwc -Status 'INFO' -Severity 'Informational' -CurrentValue 'Microsoft 365 Apps / Office 2016+ not installed' -Recommendation 'Not applicable.'
+            return
+        }
+        $hives = @(Get-ChildItem -Path 'Registry::HKEY_USERS' -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -match '^S-1-5-21-[\d-]+$' })
+        $bad = [System.Collections.Generic.List[string]]::new(); $unset = [System.Collections.Generic.List[string]]::new(); $ok = 0
+        foreach ($h in $hives) {
+            $user = $h.PSChildName
+            try { $user = ([System.Security.Principal.SecurityIdentifier]::new($h.PSChildName)).Translate([System.Security.Principal.NTAccount]).Value } catch { Write-Verbose 'SID not resolvable' }
+            foreach ($row in $Script:OfficePolicies) {
+                $app, $sub, $value, $op, $expected, $unsetMeans = $row.Split('|')
+                $key = "Registry::HKEY_USERS\$($h.PSChildName)\SOFTWARE\Policies\Microsoft\office\16.0\$app\$sub"
+                $v = Get-RegistryValueSafe -Path $key -Name $value -DefaultValue $null
+                if ($null -eq $v) {
+                    if ($unsetMeans -eq 'OK') { $ok++ } else { $unset.Add("${user}: $app\$sub\$value not set (expected $expected)") }
+                    continue
+                }
+                $good = if ($op -eq 'in') { @($expected -split ',') -contains [string]$v } else { [string]$v -eq $expected }
+                if ($good) { $ok++ } else { $bad.Add("${user}: $app\$sub\$value = $v (expected $expected)") }
+            }
+        }
+        $all = (@($bad) + @($unset)) -join "`n"
+        if (-not $hives.Count) {
+            Add-AuditResult @fwc -Status 'INFO' -Severity 'Informational' -CurrentValue 'No user profile hive is loaded, so per-user Office policies cannot be read' -Recommendation 'Run the audit while the users are signed in, or review the Office policies in Group Policy/Intune.'
+        } elseif ($bad.Count) {
+            Add-AuditResult @fwc -Status 'FAIL' -Severity 'High' -CurrentValue "$($bad.Count) macro/Protected View policy(ies) weakened, $($unset.Count) not set, across $($hives.Count) loaded user profile(s)" -Details $all `
+                -Recommendation 'Fix the Office policies (Group Policy: User Configuration > Administrative Templates > Microsoft Office 2016 / Microsoft 365, or the Intune Office settings). Macros from the internet, unsigned VBA, XLM macros and DDE are the most common Office initial-access routes.'
+        } elseif ($unset.Count) {
+            Add-AuditResult @fwc -Status 'WARN' -Severity 'Medium' -CurrentValue "$($unset.Count) recommended Office policy(ies) not set across $($hives.Count) loaded user profile(s)" -Details $all `
+                -Recommendation 'Set VBA macro notification to "Disable all except digitally signed macros", turn off XLM macros and DDE server launch in Excel, and set Macro Runtime Scan Scope to all documents.'
+        } else {
+            Add-AuditResult @fwc -Status 'PASS' -Severity 'High' -CurrentValue "Office macro and Protected View policies as recommended for $($hives.Count) loaded user profile(s)" -Recommendation 'No action required.'
+        }
+    } catch {
+        Add-AuditResult @fwc -Status 'WARN' -Severity 'Low' -CurrentValue 'Query failed' -Recommendation "Unable to read Office policies: $($_.Exception.Message)"
+    }
+}
+
+#endregion
+
 #region ============================== JSON EXPORT ==============================
 
 function Export-JsonReport {
@@ -12316,6 +13058,10 @@ $auditChecks = @(
     'Test-NamedPipePermission',
     'Test-EndOfLifeRuntime',
     'Test-PolicySourceConflict',
+    'Test-CisBenchmarkPolicies',
+    'Test-DefenderScanAndRemediationSettings',
+    'Test-BrowserSecurityPolicy',
+    'Test-OfficeMacroPolicy',
     'Test-HostsFileIntegrity',
     'Test-LSASSCrashDumpExposure',
     'Test-CredentialGuardUEFILock',
