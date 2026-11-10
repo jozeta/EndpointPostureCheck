@@ -1,4 +1,4 @@
 waive=QA-TEST-1: tests are kept local and unpublished on purpose (tests/ is gitignored: only the shippable scripts are published)
-waive=QA-CI-2: CI lints only, since the tests are unpublished (see QA-TEST-1)
+waive=QA-CI-2: the unit tests are unpublished (see QA-TEST-1); CI lints and runs both full audits on real runners instead (ci/Test-ReportOutput.ps1)
 design=family
 design_decided=2026-11-09

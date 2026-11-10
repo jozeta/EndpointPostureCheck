@@ -1,5 +1,5 @@
 #!/usr/bin/env zsh
-# EndpointPostureCheck for macOS — built 2026-11-09 23:27:29 from src/*.zsh. Do not edit directly.
+# EndpointPostureCheck for macOS — built 2026-11-10 20:39:28 from src/*.zsh. Do not edit directly.
 
 # ---- 00-header.zsh ----
 #
@@ -269,6 +269,44 @@ run_as_user() {
     RUN_AS_USER_OUTPUT=$(sudo -u "$CONSOLE_USER" "$@" 2>&1)
     RUN_AS_USER_STATUS=$?
     return 0
+}
+
+# True when an octal mode string grants write to group or others ("664", "777", "1777").
+_mode_group_or_other_writable() {
+    local mode="$1"
+    [[ "$mode" == <-> ]] || return 1
+    local go="${mode[-2,-1]}"
+    [[ "${go[1]}" == [2367] || "${go[2]}" == [2367] ]]
+}
+
+# Extended ACL entries (ls -lde) that let someone other than root, wheel, admin or the given
+# expected owner write to a path. Mode bits alone miss these: a 0644 root-owned file with
+# "user:bob allow write" is writable by bob. Prints one "principal: rights" line per grant;
+# returns 1 when there are none. Deny entries are ignored (they only take rights away).
+_acl_write_grantees() {
+    local target="$1" expected_owner="${2:-root}" line="" principal="" rights="" r="" bad=""
+    local -a out rlist
+    local listing=""
+    listing=$(command ls -lde -- "$target" 2>/dev/null) || return 1
+    for line in "${(@f)listing}"; do
+        [[ "$line" =~ '^ *[0-9]+: (.+) (allow|deny) ([a-z_,]+)$' ]] || continue
+        [[ "${match[2]}" == allow ]] || continue
+        principal="${match[1]% inherited}"; rights="${match[3]}"
+        case "$principal" in
+            user:root|group:wheel|group:admin|group:system|"user:$expected_owner") continue ;;
+        esac
+        bad=""
+        rlist=(${(s:,:)rights})
+        for r in "${rlist[@]}"; do
+            case "$r" in
+                write|append|add_file|add_subdirectory|delete_child|writeattr|writeextattr|writesecurity|chown)
+                    bad+="${bad:+,}$r" ;;
+            esac
+        done
+        [[ -n "$bad" ]] && out+=("$principal: $bad")
+    done
+    (( ${#out[@]} )) || return 1
+    print -r -- "${(j:; :)out}"
 }
 
 defaults_read_safe() {
@@ -3435,15 +3473,19 @@ _script_risk_scan_file() {
 # when it is fine. Checked for the file and its parent directory, since a
 # writable directory lets anyone swap the file out.
 _tamper_reason() {
-    local f="$1" expected_owner="${2:-root}" target="" info="" owner="" mode=""
+    local f="$1" expected_owner="${2:-root}" target="" info="" owner="" mode="" acl=""
     for target in "$f" "${f:h}"; do
         info=$(stat -f '%Su %Lp' "$target" 2>/dev/null) || continue
         owner="${info% *}"; mode="${info#* }"
-        if (( 8#$mode & 8#022 )); then
+        # Digits only before arithmetic (project rule), then the octal test.
+        if [[ "$mode" == <-> ]] && (( 8#$mode & 8#022 )); then
             print -r -- "$target writable by group/other (mode $mode)"; return 0
         fi
         if [[ "$owner" != root && "$owner" != "$expected_owner" ]]; then
             print -r -- "$target owned by $owner"; return 0
+        fi
+        if acl=$(_acl_write_grantees "$target" "$expected_owner"); then
+            print -r -- "$target writable through an ACL ($acl)"; return 0
         fi
     done
     return 1
@@ -4388,17 +4430,16 @@ _writable_dir_check() {
         return
     fi
 
-    local mode="$ROOT_CMD_OUTPUT"
-    local last3="${mode: -3}"
-    local group_digit="${last3:1:1}" other_digit="${last3:2:1}"
+    local mode="$ROOT_CMD_OUTPUT" acl=""
+    acl=$(_acl_write_grantees "$dir" root) || acl=""
 
-    if (( (group_digit & 2) != 0 || (other_digit & 2) != 0 )); then
+    if [[ -n "$acl" ]] || _mode_group_or_other_writable "$mode"; then
         add_audit_result --category 'Privilege Escalation: File & Directory Permissions' --control "$control_name" \
-            --status FAIL --severity Critical --current "$dir mode $mode" \
+            --status FAIL --severity Critical --current "$dir mode $mode${acl:+; ACL grants write: $acl}" \
             --recommended 'No group/other write bit' \
             --cis 'CIS 5.1' --nist 'AC-6, CM-6' --mitre 'T1574.010 (Services File Permissions Weakness)' --iso27001 'A.8.3' \
             --nis2 'Art.21(2)(d)' --nsa 'NSA/CISA macOS Hardening Guidance' --cis-macos 'N/A' --mscp 'N/A' \
-            --recommendation "sudo chmod go-w $dir — a world/group-writable LaunchDaemons or LaunchAgents directory lets any local user plant a persistent root-level launch item."
+            --recommendation "sudo chmod go-w $dir (and remove any ACL write entries: sudo chmod -N $dir) — a world/group-writable LaunchDaemons or LaunchAgents directory lets any local user plant a persistent root-level launch item."
     else
         add_audit_result --category 'Privilege Escalation: File & Directory Permissions' --control "$control_name" \
             --status PASS --severity Critical --current "$dir mode $mode" \
@@ -4435,12 +4476,14 @@ _writable_path_scan() {
         [[ $ROOT_CMD_STATUS -ne 0 ]] && continue
 
         local owner="${ROOT_CMD_OUTPUT%% *}" mode="${ROOT_CMD_OUTPUT##* }"
+        [[ "$mode" == <-> ]] || continue
         local last3="${mode: -3}"
-        local owner_digit="${last3:0:1}" group_digit="${last3:1:1}" other_digit="${last3:2:1}"
+        local owner_digit="${last3:0:1}"
 
         local is_writable=0
-        if [[ "$owner" != "root" ]] && (( (owner_digit & 2) != 0 )); then is_writable=1; fi
-        if (( (group_digit & 2) != 0 || (other_digit & 2) != 0 )); then is_writable=1; fi
+        if [[ "$owner" != "root" && "$owner_digit" == [2367] ]]; then is_writable=1; fi
+        _mode_group_or_other_writable "$mode" && is_writable=1
+        _acl_write_grantees "$dir" root >/dev/null && is_writable=1
 
         (( is_writable )) && writable+=("$dir")
     done
@@ -4665,13 +4708,12 @@ _writable_dylib_dir_check() {
     run_root stat -f '%Lp' "$dir"
     [[ $ROOT_CMD_STATUS -ne 0 ]] && return
 
-    local mode="$ROOT_CMD_OUTPUT"
-    local last3="${mode: -3}"
-    local group_digit="${last3:1:1}" other_digit="${last3:2:1}"
+    local mode="$ROOT_CMD_OUTPUT" acl=""
+    acl=$(_acl_write_grantees "$dir" root) || acl=""
 
-    if (( (group_digit & 2) != 0 || (other_digit & 2) != 0 )); then
+    if [[ -n "$acl" ]] || _mode_group_or_other_writable "$mode"; then
         add_audit_result --category 'Dylib Hijacking & Code Injection' --control 'Writable Dylib Search Paths' \
-            --status FAIL --severity High --current "$dir mode $mode" \
+            --status FAIL --severity High --current "$dir mode $mode${acl:+; ACL grants write: $acl}" \
             --recommended 'No group/other write bit' \
             --cis 'CIS 2.7' --nist 'SI-7, CM-7' --mitre 'T1574.006 (Dynamic Linker Hijacking)' --iso27001 'A.8.19' \
             --nis2 'Art.21(2)(d)' --cis-macos 'N/A' --mscp 'N/A' \
@@ -6996,23 +7038,16 @@ _owner_mode() {
     stat -f '%Su %Lp' "$1" 2>/dev/null
 }
 
-# True when an octal mode string grants write to group or others ("664", "777", "1777").
-_mode_group_or_other_writable() {
-    local mode="$1"
-    [[ "$mode" == <-> ]] || return 1
-    local go="${mode[-2,-1]}"
-    [[ "${go[1]}" == [2367] || "${go[2]}" == [2367] ]]
-}
-
-# True when a path is writable by someone other than root: not owned by root, or group/other
-# writable. Missing paths are not writable.
+# True when a path is writable by someone other than root: not owned by root, group/other
+# writable, or granted write through an extended ACL. Missing paths are not writable.
 _writable_by_non_root() {
     local om="" owner="" mode=""
     om=$(_owner_mode "$1") || return 1
     [[ -z "$om" ]] && return 1
     owner="${om%% *}"; mode="${om##* }"
     [[ "$owner" != root ]] && return 0
-    _mode_group_or_other_writable "$mode"
+    _mode_group_or_other_writable "$mode" && return 0
+    _acl_write_grantees "$1" root >/dev/null
 }
 
 # ---------------------------------------------------------------- TCC
@@ -7125,6 +7160,89 @@ check_sudo_environment_and_dropins() {
     else
         add_audit_result --category 'Identity, Accounts & Privilege Management' --control 'Sudo Environment & Drop-in Permissions' \
             --status PASS --severity High --current "${#files[@]} sudoers file(s): environment reset, no dangerous variables kept, root-only" "${fw[@]}" \
+            --recommendation 'No action required.'
+    fi
+}
+
+# Programs that turn a "restricted" sudo rule into root anyway (GTFOBins "sudo" entries):
+# they spawn a shell, run arbitrary code, or write any file. Matched on the basename.
+typeset -ga SUDO_SHELL_ESCAPE_BINS SUDO_FILE_READ_BINS
+SUDO_SHELL_ESCAPE_BINS=(vi vim nvim view vimdiff rvim ex ed nano pico emacs less more man most find awk gawk nawk mawk
+    sed perl python python2 python3 ruby irb lua php node nodejs bash sh zsh ksh csh tcsh dash fish env tar zip
+    rsync scp ssh sftp ftp git nmap tcpdump wget curl cp mv tee dd chmod chown install ln openssl socat nc ncat
+    script expect xargs time timeout watch nice strace gdb lldb make docker pip pip3 npm gem brew osascript screen
+    tmux crontab sqlite3 mysql psql su sudo login dtrace launchctl ditto)
+SUDO_FILE_READ_BINS=(cat head tail base64 xxd hexdump strings od diff sort uniq grep egrep fgrep cut nl fold)
+
+# Command lists of sudoers rules and Cmnd_Alias definitions, one command per line.
+_sudoers_rule_commands() {
+    local text="$1" line="" joined="" cmds="" c=""
+    # Join backslash continuations first.
+    text="${text//\\$'\n'/ }"
+    for line in "${(@f)text}"; do
+        line="${line#"${line%%[![:space:]]*}"}"
+        [[ -z "$line" || "$line" == \#* || "$line" == Defaults* || "$line" == (User|Host|Runas)_Alias* ]] && continue
+        [[ "$line" == *=* ]] || continue
+        cmds="${line#*=}"
+        [[ "$line" == Cmnd_Alias* ]] || cmds="${cmds#*\)}"    # drop "(runas)"
+        for c in "${(@s:,:)cmds}"; do
+            c="${c#"${c%%[![:space:]]*}"}"
+            # Drop tags (NOPASSWD:, SETENV:, ...) but remember NOPASSWD.
+            while [[ "$c" =~ '^[A-Z_]+:' ]]; do
+                case "$c" in NOPASSWD:*) joined="NOPASSWD" ;; PASSWD:*) joined="" ;; esac
+                c="${c#*:}"; c="${c#"${c%%[![:space:]]*}"}"
+            done
+            [[ -z "$c" || "$c" == '!'* || "$c" == ALL ]] && continue
+            print -r -- "${joined:+NOPASSWD }$c"
+        done
+        joined=""
+    done
+}
+
+check_sudo_rules_shell_escape() {
+    local -a files unreadable escape readers wild
+    local f="" entry="" cmd="" bin="" nopw=""
+    run_root find /etc/sudoers.d -maxdepth 1 -type f
+    files=(/etc/sudoers "${(@f)ROOT_CMD_OUTPUT}"); files=(${files:#})
+    for f in "${files[@]}"; do
+        [[ "$f" == /etc/sudoers* ]] || continue
+        run_root cat "$f"
+        if [[ $ROOT_CMD_STATUS -ne 0 ]]; then unreadable+=("$f"); continue; fi
+        for entry in "${(@f)$(_sudoers_rule_commands "$ROOT_CMD_OUTPUT")}"; do
+            [[ -z "$entry" ]] && continue
+            nopw=""; [[ "$entry" == 'NOPASSWD '* ]] && { nopw=" (NOPASSWD)"; entry="${entry#NOPASSWD }"; }
+            cmd="${entry%% *}"; bin="${cmd:t}"
+            if (( ${SUDO_SHELL_ESCAPE_BINS[(Ie)$bin]} )); then
+                escape+=("$f: $entry$nopw — $bin can start a root shell or write any file")
+            elif (( ${SUDO_FILE_READ_BINS[(Ie)$bin]} )); then
+                readers+=("$f: $entry$nopw — $bin can read any file as root")
+            elif [[ "$entry" == *' '*'*'* ]]; then
+                wild+=("$f: $entry$nopw — a wildcard in the arguments matches more than intended (e.g. ../ or extra options)")
+            elif [[ "$cmd" == /* ]] && { _writable_by_non_root "$cmd" || _writable_by_non_root "${cmd:h}"; }; then
+                escape+=("$f: $entry$nopw — the program or its folder is writable by a non-root user")
+            fi
+        done
+    done
+    local -a fw all
+    fw=(--recommended 'sudo rules only allow programs that cannot run other code, without argument wildcards'
+        --cis 'CIS 5.4' --nist 'AC-6' --mitre 'T1548.003 (Sudo and Sudo Caching)'
+        --iso27001 'A.8.2' --nis2 'Art.21(2)(i)' --cis-macos 'N/A' --mscp 'N/A')
+    all=("${escape[@]}" "${readers[@]}" "${wild[@]}")
+    if (( ${#escape[@]} )); then
+        add_audit_result --category 'Identity, Accounts & Privilege Management' --control 'Sudo Rules Allowing Shell Escapes' \
+            --status FAIL --severity High --current "${#escape[@]} sudo rule(s) amount to full root" --details "${(F)all}" "${fw[@]}" \
+            --recommendation 'A sudo rule for an editor, pager, interpreter, archiver or copier is a root shell (see gtfobins.github.io). Replace it with a root-owned wrapper script that does only the intended task, or remove it. Never allow programs in user-writable folders.'
+    elif (( ${#readers[@]} || ${#wild[@]} )); then
+        add_audit_result --category 'Identity, Accounts & Privilege Management' --control 'Sudo Rules Allowing Shell Escapes' \
+            --status WARN --severity Medium --current "${#all[@]} sudo rule(s) broader than they look" --details "${(F)all}" "${fw[@]}" \
+            --recommendation 'File readers let the user read any file as root (e.g. /etc/master.passwd-equivalents, keychains, SSH keys); wildcards match extra paths and options. Narrow each rule to exact arguments.'
+    elif (( ${#unreadable[@]} )); then
+        add_audit_result --category 'Identity, Accounts & Privilege Management' --control 'Sudo Rules Allowing Shell Escapes' \
+            --status WARN --severity Low --current "Could not read ${#unreadable[@]} sudoers file(s)" --details "${(F)unreadable}" "${fw[@]}" \
+            --recommendation 'Run the audit with sudo so the sudoers files can be read.'
+    else
+        add_audit_result --category 'Identity, Accounts & Privilege Management' --control 'Sudo Rules Allowing Shell Escapes' \
+            --status PASS --severity High --current 'No sudo rule allows a shell-escape program, file reader or argument wildcard' "${fw[@]}" \
             --recommendation 'No action required.'
     fi
 }
@@ -7348,8 +7466,11 @@ check_network_exposed_listeners() {
                 ;;
         esac
     done
-    local fw_state=""
-    fw_state=$(defaults_read_safe /Library/Preferences/com.apple.alf globalstate '')
+    # socketfilterfw, not /Library/Preferences/com.apple.alf: on macOS 15+ the application
+    # firewall is a Network Extension filter and that plist no longer holds the live state.
+    local fw_state="" fw_out=""
+    fw_out=$("$SOCKETFILTERFW" --getglobalstate 2>&1)
+    [[ "$fw_out" =~ 'State = ([0-9])' ]] && fw_state="${match[1]}"
     local -a fw
     fw=(--recommended 'Third-party services listen on loopback only, or are intended and firewalled'
         --cis 'CIS 4.4, 12.4' --nist 'CM-7, SC-7' --mitre 'T1133 (External Remote Services), T1210 (Exploitation of Remote Services)'
@@ -9272,7 +9393,7 @@ AUDIT_CHECKS=(
     check_location_services_enabled check_location_services_menu_icon
     # Domain 7: Identity, Accounts & Privilege Management
     check_root_account_disabled check_guest_account_disabled check_admin_group_membership_inventory check_password_policy_configured
-    check_sudoers_configuration check_sudo_environment_and_dropins check_authorization_db_weakened_rights check_pam_configuration_integrity
+    check_sudoers_configuration check_sudo_environment_and_dropins check_sudo_rules_shell_escape check_authorization_db_weakened_rights check_pam_configuration_integrity
     check_password_lockout_threshold check_password_minimum_length check_password_age check_password_history
     check_sudo_timeout_zero check_sudo_timestamp_per_tty check_sudo_logging_enabled
     check_admin_password_for_system_preferences check_admin_cannot_unlock_other_sessions

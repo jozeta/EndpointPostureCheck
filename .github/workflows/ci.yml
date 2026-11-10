@@ -29,6 +29,38 @@ jobs:
           Write-Host "$($errs.Count) errors, $(@($r).Count - $errs.Count) warnings"
           if ($errs.Count -gt 0) { exit 1 }
 
+  # Full read-only audit runs on a real (elevated) Windows runner, in both shells the script
+  # supports, then a second run against the first one's JSON to exercise -BaselinePath.
+  windows-run:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [powershell, pwsh]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Full audit (${{ matrix.shell }})
+        shell: ${{ matrix.shell }}
+        run: .\Invoke-EndpointPostureCheck.ps1 -ReportPath "$env:RUNNER_TEMP\epc1" -ExportJson -GenerateRemediationScript
+      - name: Validate report
+        shell: pwsh
+        run: ./ci/Test-ReportOutput.ps1 -ReportDir "$env:RUNNER_TEMP\epc1" -MinFindings 150 -MinDomains 30 -Label "Windows (${{ matrix.shell }})"
+      - name: Second run against the first as baseline (${{ matrix.shell }})
+        shell: ${{ matrix.shell }}
+        run: |
+          $base = (Get-ChildItem "$env:RUNNER_TEMP\epc1\*.json" | Select-Object -First 1).FullName
+          .\Invoke-EndpointPostureCheck.ps1 -ReportPath "$env:RUNNER_TEMP\epc2" -ExportJson -BaselinePath $base
+      - name: Validate baseline report
+        shell: pwsh
+        run: ./ci/Test-ReportOutput.ps1 -ReportDir "$env:RUNNER_TEMP\epc2" -MinFindings 150 -MinDomains 30 -Label "Windows baseline (${{ matrix.shell }})" -ExpectBaseline
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: windows-report-${{ matrix.shell }}
+          path: ${{ runner.temp }}/epc*
+          retention-days: 7
+
   macos-script:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -40,3 +72,31 @@ jobs:
         run: |
           sudo apt-get install -y -qq zsh >/dev/null
           zsh -n Invoke-MacPostureCheck.sh
+
+  # Full audit as root on a macOS runner (sudo never prompts there, so sfltool is safe).
+  macos-run:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - name: Full audit
+        run: sudo zsh ./Invoke-MacPostureCheck.sh --report-path "$RUNNER_TEMP/epc1" --export-json --generate-remediation --generate-profile
+      - name: Validate report
+        shell: pwsh
+        run: ./ci/Test-ReportOutput.ps1 -ReportDir "$env:RUNNER_TEMP/epc1" -MinFindings 180 -MinDomains 28 -Label 'macOS'
+      - name: Second run against the first as baseline
+        run: |
+          base=$(ls "$RUNNER_TEMP"/epc1/*.json | head -1)
+          sudo zsh ./Invoke-MacPostureCheck.sh --report-path "$RUNNER_TEMP/epc2" --export-json --baseline "$base"
+      - name: Validate baseline report
+        shell: pwsh
+        run: ./ci/Test-ReportOutput.ps1 -ReportDir "$env:RUNNER_TEMP/epc2" -MinFindings 180 -MinDomains 28 -Label 'macOS baseline' -ExpectBaseline
+      - name: Make reports readable for upload
+        if: always()
+        run: sudo chown -R "$(id -u)" "$RUNNER_TEMP"/epc* || true
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: macos-report
+          path: ${{ runner.temp }}/epc*
+          retention-days: 7

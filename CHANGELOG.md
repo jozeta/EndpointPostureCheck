@@ -6,6 +6,19 @@ The project has no tagged releases yet, so changes are grouped by date. Entries 
 
 ## Unreleased
 
+- macOS: the "Third-Party Services Listening on the Network" check read the application firewall
+  state from `/Library/Preferences/com.apple.alf`, which macOS 15+ no longer uses, so it always
+  said "state unknown" and scored Medium. It now asks `socketfilterfw`.
+- macOS (199 checks): extended ACLs are now part of every "writable by someone else" test
+  (LaunchDaemon/LaunchAgent items and folders, privileged helpers, PAM modules, PATH and dylib
+  folders). A root-owned 0644 file with `user:bob allow write` was reported as safe.
+- macOS: new "Sudo Rules Allowing Shell Escapes" check. Rules and `Cmnd_Alias` entries that allow
+  an editor, pager, interpreter, archiver or copier (GTFOBins) are full root; file readers and
+  argument wildcards are a WARN.
+- CI runs both audits for real: Windows PowerShell 5.1 and 7 on `windows-latest`, `sudo` on
+  `macos-latest`, each a second time with the first run as baseline, validated by
+  `ci/Test-ReportOutput.ps1`; the reports are uploaded as build artifacts.
+
 - New attack-path and privilege-escalation checks on both platforms, each in its existing domain.
   - macOS (198 checks): TCC grants to terminals/interpreters or not pinned to a code signature;
     sudo environment (env_reset, env_keep of DYLD_/LD_/PYTHONPATH/..., SETENV) and sudoers file

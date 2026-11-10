@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Two independent, zero-dependency security posture auditors that share one design:
 
 - `Invoke-EndpointPostureCheck.ps1`: Windows 11 Enterprise, PowerShell, 161 checks / 35 domains (plus `-BaselinePath`).
-- `Invoke-MacPostureCheck.sh`: macOS 15/26, zsh, 198 checks / 32 domains.
+- `Invoke-MacPostureCheck.sh`: macOS 15/26, zsh, 199 checks / 32 domains.
 
 Each produces a self-contained HTML dashboard with weighted compliance scoring and framework
 mappings, plus optional JSON export and a generated remediation script.
@@ -85,5 +85,9 @@ Invoke-Pester -Path tests                                                       
 
 `tests/` stays local and unpublished (gitignored; waived in `.claude-standards`). The Pester tests
 load helper functions from the script's syntax tree and never run the audit. CI lints on Windows,
-plus ShellCheck on `build.sh` and `zsh -n` on the macOS script.
+plus ShellCheck on `build.sh` and `zsh -n` on the macOS script, and runs the full audit for real:
+Windows PowerShell 5.1 and PowerShell 7 on `windows-latest`, `sudo` on `macos-latest`, each twice
+(the second run with the first one's JSON as baseline). `ci/Test-ReportOutput.ps1` validates the
+output and lists every check that could not query the runner in the job summary; the reports are
+uploaded as build artifacts.
 
