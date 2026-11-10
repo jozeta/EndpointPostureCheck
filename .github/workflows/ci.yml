@@ -53,16 +53,16 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: Validate report
         shell: pwsh
-        run: ./ci/Test-ReportOutput.ps1 -ReportDir "$env:RUNNER_TEMP\epc1" -MinFindings 150 -MinDomains 30 -Label "Windows (${{ matrix.shell }})"
-      - name: Second run against the first as baseline (${{ matrix.shell }})
+        run: ./ci/Test-ReportOutput.ps1 -ReportDir "$env:RUNNER_TEMP\epc1" -MinFindings 150 -MinDomains 30 -Label "Windows (${{ matrix.shell }})" -ExpectInventory processes,connections,services,fwrules,fwprofiles,exposure,pipes
+      - name: Second run with the first as baseline, and exceptions (${{ matrix.shell }})
         shell: pwsh
         run: |
           $base = (Get-ChildItem "$env:RUNNER_TEMP\epc1\*.json" | Select-Object -First 1).FullName
-          & ${{ matrix.shell }} -NoProfile -ExecutionPolicy Bypass -File .\Invoke-EndpointPostureCheck.ps1 -ReportPath "$env:RUNNER_TEMP\epc2" -ExportJson -BaselinePath $base
+          & ${{ matrix.shell }} -NoProfile -ExecutionPolicy Bypass -File .\Invoke-EndpointPostureCheck.ps1 -ReportPath "$env:RUNNER_TEMP\epc2" -ExportJson -BaselinePath $base -ExceptionPath .\ci\sample-exceptions.json
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: Validate baseline report
         shell: pwsh
-        run: ./ci/Test-ReportOutput.ps1 -ReportDir "$env:RUNNER_TEMP\epc2" -MinFindings 150 -MinDomains 30 -Label "Windows baseline (${{ matrix.shell }})" -ExpectBaseline
+        run: ./ci/Test-ReportOutput.ps1 -ReportDir "$env:RUNNER_TEMP\epc2" -MinFindings 150 -MinDomains 30 -Label "Windows baseline (${{ matrix.shell }})" -ExpectBaseline -ExpectExceptions
       - uses: actions/upload-artifact@v7
         if: always()
         with:
@@ -92,14 +92,14 @@ jobs:
         run: sudo zsh ./Invoke-MacPostureCheck.sh --report-path "$RUNNER_TEMP/epc1" --export-json --generate-remediation --generate-profile
       - name: Validate report
         shell: pwsh
-        run: ./ci/Test-ReportOutput.ps1 -ReportDir "$env:RUNNER_TEMP/epc1" -MinFindings 180 -MinDomains 28 -Label 'macOS'
+        run: ./ci/Test-ReportOutput.ps1 -ReportDir "$env:RUNNER_TEMP/epc1" -MinFindings 180 -MinDomains 28 -Label 'macOS' -ExpectInventory processes,connections,services,alf,exposure
       - name: Second run against the first as baseline
         run: |
           base=$(ls "$RUNNER_TEMP"/epc1/*.json | head -1)
-          sudo zsh ./Invoke-MacPostureCheck.sh --report-path "$RUNNER_TEMP/epc2" --export-json --baseline "$base"
+          sudo zsh ./Invoke-MacPostureCheck.sh --report-path "$RUNNER_TEMP/epc2" --export-json --baseline "$base" --exceptions ci/sample-exceptions.json
       - name: Validate baseline report
         shell: pwsh
-        run: ./ci/Test-ReportOutput.ps1 -ReportDir "$env:RUNNER_TEMP/epc2" -MinFindings 180 -MinDomains 28 -Label 'macOS baseline' -ExpectBaseline
+        run: ./ci/Test-ReportOutput.ps1 -ReportDir "$env:RUNNER_TEMP/epc2" -MinFindings 180 -MinDomains 28 -Label 'macOS baseline' -ExpectBaseline -ExpectExceptions
       - name: Make reports readable for upload
         if: always()
         run: sudo chown -R "$(id -u)" "$RUNNER_TEMP"/epc* || true

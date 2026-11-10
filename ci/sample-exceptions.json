@@ -1,0 +1,16 @@
+{
+  "exceptions": [
+    {
+      "control": "End-of-Life Runtimes",
+      "reason": "Build agent image: runtimes are pinned by the CI provider",
+      "approvedBy": "Security team",
+      "expires": "2099-12-31"
+    },
+    {
+      "control": "Control That Does Not Exist",
+      "reason": "Shows how an unmatched entry is reported",
+      "approvedBy": "Security team",
+      "expires": "2099-12-31"
+    }
+  ]
+}

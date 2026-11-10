@@ -1,5 +1,5 @@
 #!/usr/bin/env zsh
-# EndpointPostureCheck for macOS — built 2026-11-10 20:57:12 from src/*.zsh. Do not edit directly.
+# EndpointPostureCheck for macOS — built 2026-11-10 21:14:18 from src/*.zsh. Do not edit directly.
 
 # ---- 00-header.zsh ----
 #
@@ -33,6 +33,7 @@ EXPORT_JSON=0
 GENERATE_REMEDIATION=0
 GENERATE_PROFILE=0
 BASELINE_PATH=""
+EXCEPTIONS_PATH=""
 
 print_usage() {
     cat <<'EOF'
@@ -56,6 +57,9 @@ Options:
   --baseline <file.json>       Compare with an earlier --export-json report:
                                flags new autostart items, admins, permissions
                                and extensions, and lists what got worse/better.
+  --exceptions <file.json>     Accepted risks: matching FAIL/WARN findings are
+                               marked "Accepted risk" and left out of the score
+                               until their expiry date (see README).
   --help                       Show this help text and exit.
 
 Must be run with sudo (root). No changes are made to the system during
@@ -91,6 +95,14 @@ while [[ $# -gt 0 ]]; do
                 exit 1
             fi
             BASELINE_PATH="$2"
+            shift 2
+            ;;
+        --exceptions)
+            if [[ $# -lt 2 ]]; then
+                echo "Error: --exceptions requires a JSON file" >&2
+                exit 1
+            fi
+            EXCEPTIONS_PATH="$2"
             shift 2
             ;;
         --help|-h)
@@ -167,12 +179,17 @@ typeset -ga AUDIT_CISMACOS=()
 typeset -ga AUDIT_MSCP=()
 typeset -ga AUDIT_RECOMMENDATION=()
 typeset -ga AUDIT_TIMESTAMP=()
+# Where a value was read (--evidence), and an accepted-risk note set by apply_risk_exceptions;
+# AUDIT_ACCEPTED is 1 for findings an exceptions file accepts (left out of the score).
+typeset -ga AUDIT_EVIDENCE=()
+typeset -ga AUDIT_EXCEPTION=()
+typeset -ga AUDIT_ACCEPTED=()
 
 reset_audit_results() {
     AUDIT_IDS=() AUDIT_CATEGORY=() AUDIT_CONTROL=() AUDIT_STATUS=() AUDIT_SEVERITY=()
     AUDIT_CURRENT=() AUDIT_DETAILS=() AUDIT_RECOMMENDED=() AUDIT_CIS=() AUDIT_NIST=() AUDIT_MITRE=()
     AUDIT_ISO27001=() AUDIT_NIS2=() AUDIT_NSA=() AUDIT_CISMACOS=() AUDIT_MSCP=()
-    AUDIT_RECOMMENDATION=() AUDIT_TIMESTAMP=()
+    AUDIT_RECOMMENDATION=() AUDIT_TIMESTAMP=() AUDIT_EVIDENCE=() AUDIT_EXCEPTION=() AUDIT_ACCEPTED=()
 }
 
 add_audit_result() {
@@ -184,7 +201,7 @@ add_audit_result() {
     local details_value=""
     local cis="N/A" nist="N/A" mitre="N/A" iso27001="N/A" nis2="N/A" nsa="N/A"
     local cis_macos="N/A" mscp="N/A"
-    local recommendation="No remediation required."
+    local recommendation="No remediation required." evidence=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -204,6 +221,7 @@ add_audit_result() {
             --cis-macos) cis_macos="$2"; shift 2 ;;
             --mscp) mscp="$2"; shift 2 ;;
             --recommendation) recommendation="$2"; shift 2 ;;
+            --evidence) evidence="$2"; shift 2 ;;
             *) echo "add_audit_result: unknown argument: $1" >&2; shift ;;
         esac
     done
@@ -242,6 +260,9 @@ add_audit_result() {
     AUDIT_MSCP+=("$mscp")
     AUDIT_RECOMMENDATION+=("$recommendation")
     AUDIT_TIMESTAMP+=("$(date '+%Y-%m-%d %H:%M:%S')")
+    AUDIT_EVIDENCE+=("$evidence")
+    AUDIT_EXCEPTION+=("")
+    AUDIT_ACCEPTED+=("")
 
     local color="" reset=$'\033[0m'
     case "$status_val" in
@@ -414,6 +435,22 @@ write_section_banner() {
 # setting as unset. Booleans are normalized to 1/0.
 # Returns 0 = key set (value printed), 1 = key not set anywhere,
 # 2 = the osascript query itself failed (never conflated with "unset").
+# Like managed_pref_read, but prints "<managed|local>\x1f<value>": whether a configuration
+# profile forces the key (NSUserDefaults objectIsForcedForKey). Same return codes.
+managed_pref_read_with_source() {
+    local suite="$1" key="$2" out="" value="" src=""
+    out=$(osascript -l JavaScript -e "var d = \$.NSUserDefaults.alloc.initWithSuiteName('$suite'); var v = d.objectForKey('$key'); (d.objectIsForcedForKey('$key') ? 'managed' : 'local') + '\x1f' + (v.isNil() ? '' : String(ObjC.deepUnwrap(v)))" 2>/dev/null)
+    [[ $? -ne 0 ]] && return 2
+    src="${out%%$'\x1f'*}"; value="${out#*$'\x1f'}"
+    case "$value" in
+        true) value=1 ;;
+        false) value=0 ;;
+    esac
+    [[ -z "$value" ]] && { print -rn -- "$src"$'\x1f'; return 1; }
+    print -rn -- "$src"$'\x1f'"$value"
+    return 0
+}
+
 managed_pref_read() {
     local suite="$1" key="$2" value
     value=$(osascript -l JavaScript -e "var v = \$.NSUserDefaults.alloc.initWithSuiteName('$suite').objectForKey('$key'); v.isNil() ? '' : String(ObjC.deepUnwrap(v))" 2>/dev/null)
@@ -477,9 +514,16 @@ evaluate_managed_pref() {
     local -a base
     base=(--category "$category" --control "$control" --recommended "$recommended" "${fw[@]}")
 
-    local value rc
-    value=$(managed_pref_read "$suite" "$key")
+    local value rc src evidence
+    value=$(managed_pref_read_with_source "$suite" "$key")
     rc=$?
+    src="${value%%$'\x1f'*}"; value="${value#*$'\x1f'}"
+    case "$src" in
+        managed) evidence="Configuration profile (forced): $suite / $key" ;;
+        local) evidence="Local preference, not managed: $suite / $key" ;;
+        *) evidence="NSUserDefaults: $suite / $key" ;;
+    esac
+    base+=(--evidence "$evidence")
 
     if [[ $rc -eq 2 ]]; then
         add_audit_result "${base[@]}" --status WARN --severity Low \
@@ -8265,6 +8309,100 @@ check_network_content_filters() {
         --recommendation 'Informational only. A third-party filter can see and block all traffic: make sure each one is software you installed on purpose. Its own rules are kept in the app and are not listed here.'
 }
 
+# ---------------------------------------------------------------- runtime lifecycle
+
+# Upstream end-of-support dates (same table as the Windows edition). Sources:
+# devguide.python.org/versions, nodejs.org/about/previous-releases, dotnet.microsoft.com
+# support policy, PowerShell lifecycle (learn.microsoft.com), ruby-lang.org, php.net/supported-versions.
+typeset -gA RUNTIME_EOL
+RUNTIME_EOL=(
+    'Python 2.7' 2020-01-01 'Python 3.6' 2021-12-23 'Python 3.7' 2023-06-27 'Python 3.8' 2024-10-07 'Python 3.9' 2025-10-31
+    'Python 3.10' 2026-10-31 'Python 3.11' 2027-10-31 'Python 3.12' 2028-10-31 'Python 3.13' 2029-10-31
+    'Node.js 12' 2022-04-30 'Node.js 14' 2023-04-30 'Node.js 16' 2023-09-11 'Node.js 17' 2022-06-01 'Node.js 18' 2025-04-30
+    'Node.js 19' 2023-06-01 'Node.js 20' 2026-04-30 'Node.js 21' 2024-06-01 'Node.js 22' 2027-04-30 'Node.js 23' 2025-06-01 'Node.js 24' 2028-04-30
+    '.NET 3.1' 2022-12-13 '.NET 5.0' 2022-05-10 '.NET 6.0' 2024-11-12 '.NET 7.0' 2024-05-14 '.NET 8.0' 2026-11-10 '.NET 9.0' 2026-11-10
+    'Ruby 2.7' 2023-03-31 'Ruby 3.0' 2024-04-23 'Ruby 3.1' 2025-03-26 'Ruby 3.2' 2026-03-31 'Ruby 3.3' 2027-03-31
+    'PHP 7.4' 2022-11-28 'PHP 8.0' 2023-11-26 'PHP 8.1' 2025-12-31 'PHP 8.2' 2026-12-31 'PHP 8.3' 2027-12-31
+    'Java 6' 2018-12-31 'Java 7' 2022-07-31
+)
+
+typeset -ga RT_FOUND=()
+_rt_add() {   # _rt_add <product> <version> <where>; product is "Python 3.9" style
+    RT_FOUND+=("$1"$'\t'"$2"$'\t'"$3")
+}
+
+# Version folders only (no binary is run). Every path is a directory name, compared as text.
+_rt_collect() {
+    local prefix="" d="" v="" entry="" home="" n=""
+    RT_FOUND=()
+    for d in /Library/Frameworks/Python.framework/Versions/[0-9]*(N/); do _rt_add "Python ${d:t}" "${d:t}" "$d"; done
+    for prefix in /opt/homebrew /usr/local; do
+        for d in "$prefix"/Cellar/python@*/*(N/); do v="${d:t}"; [[ "$v" =~ '^([0-9]+\.[0-9]+)' ]] && _rt_add "Python ${match[1]}" "$v" "$d"; done
+        for d in "$prefix"/Cellar/node/*(N/) "$prefix"/Cellar/node@*/*(N/); do v="${d:t}"; [[ "$v" =~ '^([0-9]+)\.' ]] && _rt_add "Node.js ${match[1]}" "$v" "$d"; done
+        for d in "$prefix"/Cellar/ruby/*(N/) "$prefix"/Cellar/ruby@*/*(N/); do v="${d:t}"; [[ "$v" =~ '^([0-9]+\.[0-9]+)' ]] && _rt_add "Ruby ${match[1]}" "$v" "$d"; done
+        for d in "$prefix"/Cellar/php/*(N/) "$prefix"/Cellar/php@*/*(N/); do v="${d:t}"; [[ "$v" =~ '^([0-9]+\.[0-9]+)' ]] && _rt_add "PHP ${match[1]}" "$v" "$d"; done
+    done
+    for d in /usr/local/share/dotnet/shared/Microsoft.NETCore.App/*(N/); do v="${d:t}"; [[ "$v" =~ '^([0-9]+\.[0-9]+)\.' ]] && _rt_add ".NET ${match[1]}" "$v" "$d"; done
+    for d in /Library/Java/JavaVirtualMachines/*(N/); do
+        n="${d:t}"
+        [[ "$n" =~ '^jdk1\.([67])\.' ]] && _rt_add "Java ${match[1]}" "$n" "$d"
+    done
+    for entry in "${(@f)$(_local_user_homes)}"; do
+        [[ -z "$entry" ]] && continue
+        home="${entry#*$'\t'}"
+        for d in "$home"/.pyenv/versions/*(N/) "$home"/.asdf/installs/python/*(N/); do v="${d:t}"; [[ "$v" =~ '^([0-9]+\.[0-9]+)' ]] && _rt_add "Python ${match[1]}" "$v" "$d"; done
+        for d in "$home"/.nvm/versions/node/*(N/) "$home"/.asdf/installs/nodejs/*(N/); do v="${d:t#v}"; [[ "$v" =~ '^([0-9]+)\.' ]] && _rt_add "Node.js ${match[1]}" "$v" "$d"; done
+        for d in "$home"/.rbenv/versions/*(N/) "$home"/.asdf/installs/ruby/*(N/); do v="${d:t}"; [[ "$v" =~ '^([0-9]+\.[0-9]+)' ]] && _rt_add "Ruby ${match[1]}" "$v" "$d"; done
+        for d in "$home"/.dotnet/shared/Microsoft.NETCore.App/*(N/); do v="${d:t}"; [[ "$v" =~ '^([0-9]+\.[0-9]+)\.' ]] && _rt_add ".NET ${match[1]}" "$v" "$d"; done
+    done
+    # Apple's Command Line Tools Python: a stock component, listed but not scored.
+    for d in /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/[0-9]*(N/); do
+        _rt_add "Python ${d:t}" "${d:t} (Apple Command Line Tools)" "$d"
+    done
+}
+
+check_end_of_life_runtimes() {
+    write_section_banner 'Third-Party Software & Package Inventory - End-of-Life Runtimes'
+    local today="" soon="" entry="" product="" version="" where="" date="" flag=""
+    local -a eol near
+    today=$(date '+%Y-%m-%d')
+    soon=$(date -v+90d '+%Y-%m-%d' 2>/dev/null || print -r -- "$today")
+    _rt_collect
+    inventory_define runtimes 'Runtimes' \
+        'Language runtimes found by their install folders (python.org, Homebrew, pyenv, nvm, rbenv, asdf, .NET, old JDKs), with the upstream end-of-support date. Apple'"'"'s Command Line Tools Python is listed but not scored.' \
+        'Runtime' 'Version' 'End of support' 'Found in:path' 'Flags:flags'
+    for entry in "${(@u)RT_FOUND}"; do
+        product="${entry%%$'\t'*}"; version="${${entry#*$'\t'}%%$'\t'*}"; where="${entry##*$'\t'}"
+        date="${RUNTIME_EOL[$product]:-}"
+        flag=""
+        if [[ "$version" == *'(Apple Command Line Tools)'* ]]; then flag="apple"
+        elif [[ -n "$date" && ! "$date" > "$today" ]]; then flag="end of life!"; eol+=("$product ($version): support ended $date - $where")
+        elif [[ -n "$date" && ! "$date" > "$soon" ]]; then flag="ends soon?"; near+=("$product ($version): support ends $date - $where")
+        elif [[ -n "$date" ]]; then flag="supported"
+        fi
+        inventory_add_row runtimes "$product" "$version" "${date:-unknown}" "$where" "$flag"
+    done
+    local -a fw all
+    all=("${eol[@]}" "${near[@]}")
+    fw=(--recommended 'No runtime past its end of support' --cis 'CIS 2.2, 7.4' --nist 'SA-22, SI-2'
+        --mitre 'T1068 (Exploitation for Privilege Escalation), T1203 (Exploitation for Client Execution)'
+        --iso27001 'A.8.8' --nis2 'Art.21(2)(e)' --cis-macos 'N/A' --mscp 'N/A')
+    if (( ${#eol[@]} )); then
+        add_audit_result --category 'Third-Party Software & Package Inventory' --control 'End-of-Life Runtimes' \
+            --status WARN --severity Medium --current "${#eol[@]} runtime(s) past end of support${near:+, ${#near[@]} ending within 90 days}" \
+            --details "${(F)all}" "${fw[@]}" \
+            --recommendation 'Remove runtimes nothing uses (brew uninstall, pyenv uninstall, nvm uninstall) and move the rest to a supported release. End-of-life runtimes get no security fixes.'
+    elif (( ${#near[@]} )); then
+        add_audit_result --category 'Third-Party Software & Package Inventory' --control 'End-of-Life Runtimes' \
+            --status WARN --severity Low --current "${#near[@]} runtime(s) reach end of support within 90 days" --details "${(F)all}" "${fw[@]}" \
+            --recommendation 'Plan the upgrade to a supported release before the end-of-support date.'
+    else
+        add_audit_result --category 'Third-Party Software & Package Inventory' --control 'End-of-Life Runtimes' \
+            --status PASS --severity Medium --current "${#RT_FOUND[@]} runtime installation(s), none past end of support" "${fw[@]}" \
+            --recommendation 'No action required.'
+    fi
+}
+
 # ---- 90-scoring.zsh ----
 #
 # Scoring & risk engine. Direct port of Get-CompliancePosture from the
@@ -8294,7 +8432,7 @@ get_compliance_posture() {
     # addition to stay float-typed, so the final (earned/max) division below
     # is never silently truncated to 0 — verified with `zsh -c` during
     # planning, since this is easy to get wrong and would corrupt every score.
-    local max_points=0.0 earned_points=0.0
+    local max_points=0.0 earned_points=0.0 raw_max=0.0 raw_earned=0.0 credit=0.0 accepted_count=0
     local total=${#AUDIT_STATUS[@]}
     local pass_count=0 fail_count=0 warn_count=0 info_count=0
     local critical_fails=0 high_fails=0
@@ -8324,12 +8462,19 @@ get_compliance_posture() {
             continue
         fi
 
-        max_points=$(( max_points + weight ))
+        credit=0.0
         case "$status_val" in
-            PASS) earned_points=$(( earned_points + weight )) ;;
-            WARN) earned_points=$(( earned_points + weight * 0.5 )) ;;
-            FAIL) ;;
+            PASS) credit=$(( weight * 1.0 )) ;;
+            WARN) credit=$(( weight * 0.5 )) ;;
         esac
+        raw_max=$(( raw_max + weight )); raw_earned=$(( raw_earned + credit ))
+        # Accepted risks (--exceptions) are left out of the score and risk level, like INFO.
+        if [[ "${AUDIT_ACCEPTED[$i]:-}" == 1 ]]; then
+            accepted_count=$((accepted_count + 1))
+            continue
+        fi
+        max_points=$(( max_points + weight ))
+        earned_points=$(( earned_points + credit ))
 
         if [[ "$status_val" == "FAIL" && "$severity" == "Critical" ]]; then
             critical_fails=$((critical_fails + 1))
@@ -8342,6 +8487,11 @@ get_compliance_posture() {
     local score="100.0"
     if (( max_points > 0 )); then
         score=$(printf '%.1f' "$(( (earned_points / max_points) * 100 ))")
+    fi
+
+    local score_incl="100.0"
+    if (( raw_max > 0 )); then
+        score_incl=$(printf '%.1f' "$(( (raw_earned / raw_max) * 100 ))")
     fi
 
     local risk
@@ -8364,6 +8514,8 @@ get_compliance_posture() {
     POSTURE_INFO="$info_count"
     POSTURE_CRITICAL_FAILS="$critical_fails"
     POSTURE_HIGH_FAILS="$high_fails"
+    POSTURE_ACCEPTED="$accepted_count"
+    POSTURE_SCORE_INCLUDING_ACCEPTED="$score_incl"
 }
 
 # ---- 90a-lada-glass-assets.zsh ----
@@ -8935,8 +9087,17 @@ _findings_table_rows() {
         if [[ -n "$details_esc" ]]; then
             measured_value="<button type=\"button\" class=\"pc-tip\" data-tip=\"$details_esc\">$current_esc<svg class=\"lg-icon\" aria-hidden=\"true\"><use href=\"#list\"/></svg><span class=\"pc-sr\"> (show list)</span></button>"
         fi
+        if [[ -n "${AUDIT_EVIDENCE[$i]:-}" ]]; then
+            measured_value+="<span class=\"pc-sub lg-muted lg-small\">Source: $(html_escape "${AUDIT_EVIDENCE[$i]}")</span>"
+        fi
+        local exception_html=""
+        if [[ -n "${AUDIT_EXCEPTION[$i]:-}" ]]; then
+            local exc_label="Acceptance expired" exc_tone="lg-warn"
+            [[ "${AUDIT_ACCEPTED[$i]:-}" == 1 ]] && { exc_label="Accepted risk"; exc_tone="lg-plain"; }
+            exception_html="<span class=\"pc-sub\"><span class=\"lg-chip $exc_tone\">$exc_label</span></span><span class=\"pc-sub lg-muted lg-small\">$(html_escape "${AUDIT_EXCEPTION[$i]}")</span>"
+        fi
         local search_blob=""
-        search_blob=$(html_escape "$(print -r -- "${AUDIT_CONTROL[$i]} ${AUDIT_CATEGORY[$i]} ${AUDIT_CURRENT[$i]} ${AUDIT_RECOMMENDATION[$i]}" | tr '[:upper:]' '[:lower:]')")
+        search_blob=$(html_escape "$(print -r -- "${AUDIT_CONTROL[$i]} ${AUDIT_CATEGORY[$i]} ${AUDIT_CURRENT[$i]} ${AUDIT_RECOMMENDATION[$i]} ${AUDIT_EXCEPTION[$i]:-}" | tr '[:upper:]' '[:lower:]')")
 
         local status_tone="" severity_tone="lg-plain"
         case "$status_val" in
@@ -8970,7 +9131,7 @@ _findings_table_rows() {
 
         rows+="<tr class=\"finding-row\" data-status=\"$status_val\" data-severity=\"$severity\" data-category=\"$category_esc\" data-search=\"$search_blob\">"
         rows+="<td data-label=\"Control\"><strong>$control_esc</strong><span class=\"pc-sub lg-muted lg-small\">$category_esc</span></td>"
-        rows+="<td data-label=\"Status\"><span class=\"lg-chip $status_tone\">$status_val</span></td>"
+        rows+="<td data-label=\"Status\"><span class=\"lg-chip $status_tone\">$status_val</span>$exception_html</td>"
         rows+="<td data-label=\"Severity\"><span class=\"lg-chip $severity_tone\">$severity</span></td>"
         rows+="<td data-label=\"Measured / Expected\"><div class=\"pc-mv\"><span class=\"lg-label\">Measured</span>$measured_value</div><div class=\"pc-mv\"><span class=\"lg-label\">Expected</span><span class=\"lg-muted\">$recommended_esc</span></div></td>"
         rows+="<td data-label=\"Frameworks\"><div class=\"pc-fw\">$chips</div></td>"
@@ -9166,7 +9327,7 @@ footer.pc-foot { text-align: center; padding: var(--lg-space-s) 0 var(--lg-space
         <div>
           <p class="lg-label">Compliance score</p>
           <span class="lg-chip lg-{{RISK_TONE}}">Risk: {{RISK_LEVEL}}</span>
-          <p class="lg-muted lg-small" style="margin: var(--lg-space-s) 0 0;">Weighted by severity; WARN counts half, INFO is not scored.</p>
+          <p class="lg-muted lg-small" style="margin: var(--lg-space-s) 0 0;">Weighted by severity; WARN counts half, INFO is not scored.{{SCORE_NOTE}}</p>
         </div>
       </div>
       <button type="button" class="lg-card lg-kpi lg-hover pc-kpi" data-filter="all" aria-pressed="true"><p class="lg-label">Controls</p><div class="lg-kpi-value">{{TOTAL}}</div></button>
@@ -9566,6 +9727,9 @@ render_html_report() {
     html_set_token html '{{FAIL_COUNT}}' "$POSTURE_FAIL"
     html_set_token html '{{WARN_COUNT}}' "$POSTURE_WARN"
     html_set_token html '{{INFO_COUNT}}' "$POSTURE_INFO"
+    local score_note=""
+    [[ "${POSTURE_ACCEPTED:-0}" != 0 ]] && score_note=" ${POSTURE_ACCEPTED} accepted risk(s) left out; ${POSTURE_SCORE_INCLUDING_ACCEPTED}% with them."
+    html_set_token html '{{SCORE_NOTE}}' "$score_note"
     html_set_token html '{{CATEGORY_OPTIONS}}' "$category_options"
     html_set_token html '{{DOMAIN_NAV}}' "$domain_nav"
     html_set_token html '{{TABLE_ROWS}}' "$table_rows"
@@ -9630,7 +9794,7 @@ export_json_report() {
     for (( i = 1; i <= total; i++ )); do
         [[ $i -gt 1 ]] && findings_json+=","
         findings_json+=$(cat <<EOF
-{"Id":${AUDIT_IDS[$i]},"Category":"$(json_escape "${AUDIT_CATEGORY[$i]}")","Control":"$(json_escape "${AUDIT_CONTROL[$i]}")","Status":"${AUDIT_STATUS[$i]}","Severity":"${AUDIT_SEVERITY[$i]}","CurrentValue":"$(json_escape "${AUDIT_CURRENT[$i]}")","Details":"$(json_escape "${AUDIT_DETAILS[$i]}")","RecommendedValue":"$(json_escape "${AUDIT_RECOMMENDED[$i]}")","CIS_Control":"$(json_escape "${AUDIT_CIS[$i]}")","NIST_Control":"$(json_escape "${AUDIT_NIST[$i]}")","MITRE_Technique":"$(json_escape "${AUDIT_MITRE[$i]}")","ISO27001_Control":"$(json_escape "${AUDIT_ISO27001[$i]}")","NIS2_Article":"$(json_escape "${AUDIT_NIS2[$i]}")","NSA_Guidance":"$(json_escape "${AUDIT_NSA[$i]}")","CIS_macOS_Control":"$(json_escape "${AUDIT_CISMACOS[$i]}")","mSCP_Rule":"$(json_escape "${AUDIT_MSCP[$i]}")","Recommendation":"$(json_escape "${AUDIT_RECOMMENDATION[$i]}")","Timestamp":"${AUDIT_TIMESTAMP[$i]}"}
+{"Id":${AUDIT_IDS[$i]},"Category":"$(json_escape "${AUDIT_CATEGORY[$i]}")","Control":"$(json_escape "${AUDIT_CONTROL[$i]}")","Status":"${AUDIT_STATUS[$i]}","Severity":"${AUDIT_SEVERITY[$i]}","CurrentValue":"$(json_escape "${AUDIT_CURRENT[$i]}")","Details":"$(json_escape "${AUDIT_DETAILS[$i]}")","RecommendedValue":"$(json_escape "${AUDIT_RECOMMENDED[$i]}")","CIS_Control":"$(json_escape "${AUDIT_CIS[$i]}")","NIST_Control":"$(json_escape "${AUDIT_NIST[$i]}")","MITRE_Technique":"$(json_escape "${AUDIT_MITRE[$i]}")","ISO27001_Control":"$(json_escape "${AUDIT_ISO27001[$i]}")","NIS2_Article":"$(json_escape "${AUDIT_NIS2[$i]}")","NSA_Guidance":"$(json_escape "${AUDIT_NSA[$i]}")","CIS_macOS_Control":"$(json_escape "${AUDIT_CISMACOS[$i]}")","mSCP_Rule":"$(json_escape "${AUDIT_MSCP[$i]}")","Recommendation":"$(json_escape "${AUDIT_RECOMMENDATION[$i]}")","Evidence":"$(json_escape "${AUDIT_EVIDENCE[$i]:-}")","Exception":"$(json_escape "${AUDIT_EXCEPTION[$i]:-}")","Accepted":$([[ "${AUDIT_ACCEPTED[$i]:-}" == 1 ]] && print true || print false),"Timestamp":"${AUDIT_TIMESTAMP[$i]}"}
 EOF
 )
     done
@@ -9644,6 +9808,8 @@ EOF
   "ScanStartTime": "$START_TIME_HUMAN",
   "ScanEndTime": "$(date '+%Y-%m-%d %H:%M:%S')",
   "BaselineFile": "$(json_escape "${BASELINE_PATH:-}")",
+  "ExceptionFile": "$(json_escape "${EXCEPTIONS_PATH:-}")",
+  "ScoreIncludingAccepted": ${POSTURE_SCORE_INCLUDING_ACCEPTED:-$POSTURE_SCORE},
   "ComplianceScore": $POSTURE_SCORE,
   "RiskLevel": "$POSTURE_RISK",
   "Summary": {
@@ -9652,6 +9818,7 @@ EOF
     "Fail": $POSTURE_FAIL,
     "Warn": $POSTURE_WARN,
     "Info": $POSTURE_INFO,
+    "Accepted": ${POSTURE_ACCEPTED:-0},
     "CriticalFails": $POSTURE_CRITICAL_FAILS,
     "HighFails": $POSTURE_HIGH_FAILS
   },
@@ -10107,6 +10274,69 @@ compare_with_baseline() {
     BASELINE_SUMMARY="${#new_items[@]} new tracked item(s), ${#regressions[@]} control(s) worse, ${#improvements[@]} better (baseline: $since)"
 }
 
+# ---- 96-exceptions.zsh ----
+#
+# Accepted risks (--exceptions <file.json>), same format as the Windows -ExceptionPath:
+#   {"exceptions":[{"control":"<exact control name>","reason":"...","approvedBy":"...","expires":"YYYY-MM-DD"}]}
+# A matching FAIL/WARN finding keeps its status, is marked accepted and is left out of the score
+# and risk level until the expiry date; an expired entry is shown on the finding and scored again.
+# Values from the file are data: compared as strings, never used in arithmetic.
+
+_exc_field() {   # _exc_field <file> <index> <name>: one string field, "" when absent
+    plutil -extract "exceptions.$2.$3" raw -o - "$1" 2>/dev/null
+}
+
+apply_risk_exceptions() {
+    local file="$1" count="" i="" n=0 control="" reason="" approver="" expires="" today="" by="" j=""
+    local -a applied expired unmatched invalid fw
+    fw=(--category 'Risk Acceptance' --cis 'CIS 4.1' --nist 'CA-5, PM-4, RA-7' --iso27001 'A.5.36' --nis2 'Art.21(2)(a)'
+        --cis-macos 'N/A' --mscp 'N/A' --evidence "Exceptions file: $file"
+        --recommended 'Every accepted risk names a reason, an approver and an expiry date that has not passed')
+    count=$(plutil -extract exceptions raw -o - "$file" 2>/dev/null)
+    if [[ "$count" != <-> || "$(plutil -type exceptions "$file" 2>/dev/null)" != array ]]; then
+        add_audit_result "${fw[@]}" --control 'Accepted Risk Exceptions' --status WARN --severity Medium \
+            --current "Could not read an exceptions list from $file" \
+            --recommendation 'The file must be JSON: {"exceptions":[{"control":"<exact control name>","reason":"...","approvedBy":"...","expires":"YYYY-MM-DD"}]}'
+        return 0
+    fi
+    today=$(date '+%Y-%m-%d')
+    for (( i = 0; i < count && i < 500; i++ )); do
+        control=$(_exc_field "$file" "$i" control); reason=$(_exc_field "$file" "$i" reason)
+        approver=$(_exc_field "$file" "$i" approvedBy); expires=$(_exc_field "$file" "$i" expires)
+        if [[ -z "$control" || -z "$reason" || ! "$expires" =~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' ]]; then
+            invalid+=("'$control': control, reason and expires (YYYY-MM-DD) are required"); continue
+        fi
+        by=""; [[ -n "$approver" ]] && by=", approved by $approver"
+        n=0
+        for (( j = 1; j <= ${#AUDIT_CONTROL[@]}; j++ )); do
+            [[ "${(L)AUDIT_CONTROL[$j]}" == "${(L)control}" ]] || continue
+            n=$((n + 1))
+            [[ "${AUDIT_STATUS[$j]}" == (FAIL|WARN) ]] || continue
+            if [[ "$expires" < "$today" ]]; then
+                AUDIT_EXCEPTION[$j]="Expired risk acceptance (ended $expires$by): $reason"
+            else
+                AUDIT_EXCEPTION[$j]="Accepted risk until $expires$by: $reason"
+                AUDIT_ACCEPTED[$j]=1
+            fi
+        done
+        if (( n == 0 )); then unmatched+=("'$control' matches no finding in this run")
+        elif [[ "$expires" < "$today" ]]; then expired+=("'$control' expired $expires ($reason)")
+        else applied+=("'$control': accepted until $expires$by ($reason)")
+        fi
+    done
+    local -a all
+    all=("${applied[@]}" "${expired[@]}" "${unmatched[@]}" "${invalid[@]}")
+    if (( ${#expired[@]} || ${#unmatched[@]} || ${#invalid[@]} )); then
+        add_audit_result "${fw[@]}" --control 'Accepted Risk Exceptions' --status WARN --severity Medium \
+            --current "${#applied[@]} applied, ${#expired[@]} expired, ${#unmatched[@]} unmatched, ${#invalid[@]} invalid" --details "${(F)all}" \
+            --recommendation 'Renew or remove expired acceptances, and fix entries whose control name matches nothing (names must match a Control exactly, as shown in the report).'
+    else
+        add_audit_result "${fw[@]}" --control 'Accepted Risk Exceptions' --status INFO --severity Informational \
+            --current "${#applied[@]} accepted risk(s) applied; they are excluded from the score until they expire" --details "${(F)all}" \
+            --recommendation 'Informational only. Review accepted risks before they expire.'
+    fi
+}
+
 # ---- 99-main.zsh ----
 #
 # Main orchestration: version-support check, run every registered audit
@@ -10207,9 +10437,15 @@ main() {
         compare_with_baseline "$BASELINE_PATH"
     fi
 
+    if [[ -n "${EXCEPTIONS_PATH:-}" ]]; then
+        write_section_banner 'Risk Acceptance'
+        apply_risk_exceptions "$EXCEPTIONS_PATH"
+    fi
+
     get_compliance_posture
     _print_audit_summary
     [[ -n "${BASELINE_SUMMARY:-}" ]] && echo "  Baseline: $BASELINE_SUMMARY" && echo ''
+    [[ "${POSTURE_ACCEPTED:-0}" != 0 ]] && echo "  Accepted risks: $POSTURE_ACCEPTED left out of the score (${POSTURE_SCORE_INCLUDING_ACCEPTED}% with them)" && echo ''
 
     _resolve_output_paths
 
@@ -10322,6 +10558,7 @@ AUDIT_CHECKS=(
     check_time_machine_auto_backup
     # Domain 25: Third-Party Software & Package Inventory
     check_installed_applications_inventory check_homebrew_prefix_permissions check_homebrew_package_inventory
+    check_end_of_life_runtimes
     # Domain 26: System Services & Daemon Exposure
     check_process_inventory check_listening_ports_inventory check_nonapple_running_launchd_services check_network_exposed_listeners
     check_bonjour_advertising_disabled check_http_server_disabled check_nfs_server_disabled

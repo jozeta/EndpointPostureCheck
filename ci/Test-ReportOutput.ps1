@@ -15,7 +15,9 @@ param(
     [Parameter(Mandatory)] [int]$MinFindings,
     [Parameter(Mandatory)] [int]$MinDomains,
     [string]$Label = 'audit',
-    [switch]$ExpectBaseline
+    [switch]$ExpectBaseline,
+    [switch]$ExpectExceptions,
+    [string[]]$ExpectInventory = @()
 )
 
 $ErrorActionPreference = 'Stop'
@@ -33,6 +35,7 @@ if ($json) {
 }
 
 $failedQueries = @()
+$tables = @()
 if ($report) {
     $findings = @($report.Findings)
     if ($findings.Count -lt $MinFindings) { $problems.Add("Only $($findings.Count) findings (expected at least $MinFindings)") }
@@ -48,6 +51,18 @@ if ($report) {
     }
     if ($ExpectBaseline -and -not "$($report.BaselineFile)") { $problems.Add('BaselineFile is empty although a baseline was passed') }
     if ($null -eq $report.ComplianceScore) { $problems.Add('ComplianceScore missing') }
+    if ($ExpectExceptions) {
+        if (-not "$($report.ExceptionFile)") { $problems.Add('ExceptionFile is empty although an exceptions file was passed') }
+        if (-not @($findings | Where-Object { $_.Control -eq 'Accepted Risk Exceptions' }).Count) { $problems.Add('No "Accepted Risk Exceptions" finding') }
+    }
+    $tables = @()
+    if ($report.Inventory -and $report.Inventory.tables) { $tables = @($report.Inventory.tables) }
+    foreach ($id in $ExpectInventory) {
+        $t = @($tables | Where-Object { $_.id -eq $id })
+        if (-not $t.Count) { $problems.Add("Inventory table '$id' missing") }
+        elseif (-not @($t[0].rows).Count) { $problems.Add("Inventory table '$id' is empty") }
+        elseif (@($t[0].rows | Where-Object { @($_).Count -ne @($t[0].columns).Count }).Count) { $problems.Add("Inventory table '$id' has rows whose cell count differs from its columns") }
+    }
 }
 
 if ($html) {
@@ -64,6 +79,11 @@ $summary = [System.Text.StringBuilder]::new()
 if ($report) {
     $s = $report.Summary
     [void]$summary.AppendLine("Score $($report.ComplianceScore)% ($($report.RiskLevel)); $(@($report.Findings).Count) findings: PASS $($s.Pass), FAIL $($s.Fail), WARN $($s.Warn), INFO $($s.Info). OS: $($report.OperatingSystem)")
+    if ($tables.Count) {
+        [void]$summary.AppendLine('')
+        [void]$summary.AppendLine('Inventory: ' + (($tables | ForEach-Object { "$($_.title) $(@($_.rows).Count)" }) -join ', '))
+        foreach ($t in $tables) { if ($t.note) { [void]$summary.AppendLine("- $($t.title): $($t.note)") } }
+    }
     if ($failedQueries.Count) {
         [void]$summary.AppendLine('')
         [void]$summary.AppendLine("<details><summary>$($failedQueries.Count) check(s) could not query the system</summary>")

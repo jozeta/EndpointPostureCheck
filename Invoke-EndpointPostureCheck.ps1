@@ -36,6 +36,12 @@
     Switch. When present, generates a companion Remediate-EndpointPostureCheck.ps1 script
     containing modular, commented remediation commands for every FAIL finding.
 
+.PARAMETER ExceptionPath
+    Optional path to a JSON file of accepted risks:
+    {"exceptions":[{"control":"<exact control name>","reason":"...","approvedBy":"...","expires":"YYYY-MM-DD"}]}
+    Matching FAIL/WARN findings keep their status, are marked "Accepted risk" and are left out
+    of the score until the expiry date. Expired, unmatched and invalid entries are reported.
+
 .PARAMETER BaselinePath
     Optional path to a JSON export (-ExportJson) from an earlier run. Adds two findings: new
     items in tracked inventories (autostart items, administrators, WMI subscriptions, Defender
@@ -77,7 +83,10 @@ param(
     [switch]$GenerateRemediationScript,
 
     [Parameter(Mandatory = $false)]
-    [string]$BaselinePath
+    [string]$BaselinePath,
+
+    [Parameter(Mandatory = $false)]
+    [string]$ExceptionPath
 )
 
 #region ============================== INITIALIZATION ==============================
@@ -150,6 +159,8 @@ function Add-AuditResult {
         JSON export, HTML rendering, and remediation-script generation.
         -Details is an optional item list (one item per line) shown behind the measured value
         in the HTML report and exported in JSON, e.g. the extensions or files behind a count.
+        -Evidence names where the value was read (registry path, command, file). Exception is
+        filled in by Invoke-RiskExceptionPolicy when an -ExceptionPath entry accepts the finding.
     #>
     [CmdletBinding()]
     param(
@@ -166,7 +177,8 @@ function Add-AuditResult {
         [Parameter(Mandatory = $false)] [string]$NIS2_Article     = 'N/A',
         [Parameter(Mandatory = $false)] [string]$NSA_Guidance     = 'N/A',
         [Parameter(Mandatory = $false)] [string]$Recommendation   = 'No remediation required.',
-        [Parameter(Mandatory = $false)] [string]$Details          = ''
+        [Parameter(Mandatory = $false)] [string]$Details          = '',
+        [Parameter(Mandatory = $false)] [string]$Evidence         = ''
     )
 
     $finding = [PSCustomObject]@{
@@ -185,6 +197,9 @@ function Add-AuditResult {
         NSA_Guidance     = $NSA_Guidance
         Recommendation   = $Recommendation
         Details          = $Details
+        Evidence         = $Evidence
+        Exception        = ''
+        Accepted         = $false
         Timestamp        = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
     }
 
@@ -2877,51 +2892,92 @@ function Test-DNSSecurity {
 
 #region ============================== LPE MODULE SHARED HELPERS ==============================
 
-# Well-known low-privilege SIDs used throughout the privilege-escalation audit module.
-$Script:LowPrivilegeSids = @('S-1-1-0', 'S-1-5-11', 'S-1-5-32-545')
+# Accounts that already hold (or can trivially take) SYSTEM: a write grant to one of them is not
+# an escalation path. SYSTEM, Administrators, TrustedInstaller and every per-service SID
+# (S-1-5-80-*), LocalService/NetworkService (SeImpersonate), CREATOR OWNER (a placeholder),
+# Server/Backup Operators, and domain Administrator/Domain/Schema/Enterprise Admins.
+$Script:AdminEquivalentSidPatterns = @(
+    '^S-1-5-18$', '^S-1-5-19$', '^S-1-5-20$', '^S-1-5-32-544$', '^S-1-5-32-549$', '^S-1-5-32-551$',
+    '^S-1-5-80-', '^S-1-3-0$', '^S-1-5-21-[\d-]+-(500|512|518|519)$'
+)
+$Script:LocalAdminMemberSids = $null
+
+function Test-AdminEquivalentSid {
+    param([Parameter(Mandatory = $true)] [string]$Sid)
+    foreach ($p in $Script:AdminEquivalentSidPatterns) { if ($Sid -match $p) { return $true } }
+    if ($null -eq $Script:LocalAdminMemberSids) {
+        $Script:LocalAdminMemberSids = @()
+        try {
+            $Script:LocalAdminMemberSids = @(Get-LocalGroupMember -SID 'S-1-5-32-544' -ErrorAction Stop | ForEach-Object { $_.SID.Value })
+        } catch {
+            # Get-LocalGroupMember fails on orphaned domain SIDs; fall back to ADSI.
+            try {
+                $group = [ADSI]"WinNT://./Administrators,group"
+                $Script:LocalAdminMemberSids = @($group.Invoke('Members') | ForEach-Object {
+                        $bytes = $_.GetType().InvokeMember('objectSid', 'GetProperty', $null, $_, $null)
+                        ([System.Security.Principal.SecurityIdentifier]::new([byte[]]$bytes, 0)).Value
+                    })
+            } catch { Write-Verbose "Administrators membership unavailable: $($_.Exception.Message)" }
+        }
+    }
+    return ($Script:LocalAdminMemberSids -contains $Sid)
+}
+
+function ConvertTo-SidString {
+    param($Identity)
+    try {
+        if ($Identity -is [System.Security.Principal.SecurityIdentifier]) { return $Identity.Value }
+        return ($Identity.Translate([System.Security.Principal.SecurityIdentifier])).Value
+    } catch { return $null }
+}
 
 function Test-LowPrivilegeWriteAccess {
     <#
-        Inspects the ACL of a filesystem or registry path and reports whether Everyone,
-        Authenticated Users, or the local Users group has been granted a write-capable
-        right (Write/Modify/FullControl for files; SetValue/CreateSubKey/FullControl for
-        registry keys). Shared by every ACL-based finding in the LPE module. Non-existent
-        or inaccessible paths are reported as not-vulnerable (the caller decides whether
-        existence itself is significant).
+        Inspects the ACL of a filesystem or registry path and reports every non-admin-equivalent
+        account that can modify it: an Allow entry with a write-type right (write/append data,
+        create files in a folder, set value/create subkey, change permissions, take ownership,
+        or the generic write/all bits) that applies to the object itself, or a non-admin owner
+        (an owner can always rewrite the DACL). Inherit-only entries are ignored and Deny
+        entries for the same account are honoured. Shared by every ACL-based finding.
+        Non-existent or inaccessible paths are reported as not-vulnerable.
     #>
     param(
         [Parameter(Mandatory = $true)]  [string]$Path,
         [Parameter(Mandatory = $false)] [ValidateSet('FileSystem', 'Registry')] [string]$ObjectType = 'FileSystem'
     )
     $result = [PSCustomObject]@{ IsVulnerable = $false; Principals = [System.Collections.Generic.List[string]]::new() }
+    # WriteData/CreateFiles 0x2, AppendData/CreateDirectories 0x4, ChangePermissions 0x40000,
+    # TakeOwnership 0x80000, GENERIC_ALL 0x10000000, GENERIC_WRITE 0x40000000. Registry:
+    # SetValue 0x2, CreateSubKey 0x4 (same bits).
+    $dangerMask = 0x2 -bor 0x4 -bor 0x40000 -bor 0x80000 -bor 0x10000000 -bor 0x40000000
     try {
         $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+        $deny = @{}
+        foreach ($ace in $acl.Access) {
+            if ($ace.AccessControlType -ne 'Deny') { continue }
+            if ([int]$ace.PropagationFlags -band [int][System.Security.AccessControl.PropagationFlags]::InheritOnly) { continue }
+            $sid = ConvertTo-SidString $ace.IdentityReference
+            if (-not $sid) { continue }
+            $rights = if ($ObjectType -eq 'FileSystem') { [int64]$ace.FileSystemRights } else { [int64]$ace.RegistryRights }
+            $deny[$sid] = [int64]$deny[$sid] -bor $rights
+        }
         foreach ($ace in $acl.Access) {
             if ($ace.AccessControlType -ne 'Allow') { continue }
-            $sidValue = $null
-            try {
-                if ($ace.IdentityReference -is [System.Security.Principal.SecurityIdentifier]) {
-                    $sidValue = $ace.IdentityReference.Value
-                } else {
-                    $sidValue = ($ace.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier])).Value
-                }
-            } catch { $sidValue = $null }
-
-            if (-not $sidValue -or ($Script:LowPrivilegeSids -notcontains $sidValue)) { continue }
-
-            $isDangerous = $false
-            $rightsText = ''
-            if ($ObjectType -eq 'FileSystem') {
-                $rightsText = $ace.FileSystemRights.ToString()
-                if ($rightsText -match 'Write|Modify|FullControl') { $isDangerous = $true }
-            } else {
-                $rightsText = $ace.RegistryRights.ToString()
-                if ($rightsText -match 'SetValue|CreateSubKey|FullControl|WriteKey') { $isDangerous = $true }
-            }
-            if ($isDangerous) {
-                $result.IsVulnerable = $true
-                $result.Principals.Add("$($ace.IdentityReference) ($rightsText)")
-            }
+            if ([int]$ace.PropagationFlags -band [int][System.Security.AccessControl.PropagationFlags]::InheritOnly) { continue }
+            $sid = ConvertTo-SidString $ace.IdentityReference
+            if (-not $sid -or (Test-AdminEquivalentSid -Sid $sid)) { continue }
+            $rights = if ($ObjectType -eq 'FileSystem') { [int64]$ace.FileSystemRights } else { [int64]$ace.RegistryRights }
+            $effective = ($rights -band $dangerMask) -band (-bnot [int64]$deny[$sid])
+            if ($effective -eq 0) { continue }
+            $rightsText = if ($ObjectType -eq 'FileSystem') { $ace.FileSystemRights.ToString() } else { $ace.RegistryRights.ToString() }
+            $result.IsVulnerable = $true
+            $result.Principals.Add("$($ace.IdentityReference) ($rightsText)")
+        }
+        $ownerSid = $null
+        try { $ownerSid = ConvertTo-SidString ([System.Security.Principal.NTAccount]::new($acl.Owner)) } catch { $ownerSid = $null }
+        if ($ownerSid -and -not (Test-AdminEquivalentSid -Sid $ownerSid)) {
+            $result.IsVulnerable = $true
+            $result.Principals.Add("$($acl.Owner) (owner: can change the permissions)")
         }
     } catch {
         # Inaccessible/nonexistent path - treated as not-vulnerable; callers handle existence separately.
@@ -3049,7 +3105,7 @@ function Test-ServiceExecutableACLs {
                 $severity = if ($runsAsSystem) { 'Critical' } else { 'High' }
                 Add-AuditResult -Category 'Privilege Escalation - Service & File Permissions' -Control "Service Executable ACL - Writable by Low-Privilege User ($($svc.Name))" `
                     -Status 'FAIL' -Severity $severity -CurrentValue "Account=$($svc.StartName); File=$exePath; Grants: $($check.Principals -join '; ')" `
-                    -RecommendedValue 'No Write/Modify/FullControl grant to Everyone, Authenticated Users, or Users' -CIS_Control 'CIS 4.8' -NIST_Control 'CM-7, AC-6' `
+                    -RecommendedValue 'No write-type grant to, or ownership by, a non-administrative account' -CIS_Control 'CIS 4.8' -NIST_Control 'CM-7, AC-6' `
                     -MITRE_Technique 'T1574 (Hijack Execution Flow), T1543.003 (Windows Service)' -ISO27001_Control 'A.8.19' -NIS2_Article 'Art.21(2)(i)' `
                     -NSA_Guidance 'NSA/CISA Identity and Access Management Best Practices' `
                     -Recommendation "Tighten the ACL on `"$exePath`": icacls `"$exePath`" /remove:g `"Everyone`" `"Authenticated Users`" `"Users`" - then verify the service still starts correctly."
@@ -3087,7 +3143,7 @@ function Test-ServiceRegistryKeyACLs {
                 $severity = if ($runsAsSystem) { 'Critical' } else { 'High' }
                 Add-AuditResult -Category 'Privilege Escalation - Service & File Permissions' -Control "Service Registry Key ACL - Writable by Low-Privilege User ($($svc.Name))" `
                     -Status 'FAIL' -Severity $severity -CurrentValue "Account=$($svc.StartName); Key=$regPath; Grants: $($check.Principals -join '; ')" `
-                    -RecommendedValue 'No SetValue/CreateSubKey/FullControl grant to Everyone, Authenticated Users, or Users' -CIS_Control 'CIS 4.8' -NIST_Control 'CM-7, AC-6' `
+                    -RecommendedValue 'No write-type grant to, or ownership by, a non-administrative account' -CIS_Control 'CIS 4.8' -NIST_Control 'CM-7, AC-6' `
                     -MITRE_Technique 'T1574.011 (Services Registry Permissions Weakness)' -ISO27001_Control 'A.8.19' -NIS2_Article 'Art.21(2)(i)' `
                     -NSA_Guidance 'NSA/CISA Identity and Access Management Best Practices' `
                     -Recommendation "Remove the low-privilege grant from `"$regPath`" via regedit/PowerShell Set-Acl, restoring the standard Windows default (SYSTEM/Administrators Full Control, Authenticated Users Read-only)."
@@ -3616,7 +3672,7 @@ function Test-OrphanedPrivilegedScheduledTasks {
         foreach ($task in $tasks) {
             $principal = $task.Principal
             $runAsUser = [string]$principal.UserId
-            $isPrivileged = ($runAsUser -match '(?i)SYSTEM|TrustedInstaller|Administrators') -or ($principal.RunLevel -eq 'Highest')
+            $isPrivileged = ($runAsUser -match '(?i)SYSTEM|S-1-5-18|TrustedInstaller|Administrators|LOCAL SERVICE|NETWORK SERVICE') -or ($principal.RunLevel -eq 'Highest')
             if (-not $isPrivileged) { continue }
 
             foreach ($action in $task.Actions) {
@@ -3635,9 +3691,16 @@ function Test-OrphanedPrivilegedScheduledTasks {
                 if (-not $resolved) {
                     $orphaned.Add("$taskLabel -> $rawExecute [target not found]")
                 } else {
-                    $check = Test-LowPrivilegeWriteAccess -Path $resolved -ObjectType FileSystem
-                    if ($check.IsVulnerable) {
-                        $writableTarget.Add("$taskLabel -> $resolved [$($check.Principals -join '; ')]")
+                    # The program and its folder, plus any script or binary a script host is
+                    # handed in the arguments (powershell -File C:\x\job.ps1).
+                    $targets = @($resolved)
+                    if ($action.Arguments) {
+                        $argText = [Environment]::ExpandEnvironmentVariables([string]$action.Arguments)
+                        foreach ($m in [regex]::Matches($argText, '(?i)[a-z]:\\[^"''<>|*?\r\n]+?\.(ps1|psm1|bat|cmd|vbs|vbe|js|jse|wsf|py|exe|dll)\b')) { $targets += $m.Value }
+                    }
+                    foreach ($t in @($targets | Select-Object -Unique)) {
+                        $grants = @(Get-CachedWriteAccess $t)
+                        if ($grants.Count) { $writableTarget.Add("$taskLabel -> $t [$($grants -join '; ')]") }
                     }
                 }
             }
@@ -3656,13 +3719,13 @@ function Test-OrphanedPrivilegedScheduledTasks {
 
         if ($writableTarget.Count -eq 0) {
             Add-AuditResult -Category 'Privilege Escalation - Token & Privilege Abuse' -Control 'Privileged Scheduled Task Target ACLs' -Status 'PASS' -Severity 'High' `
-                -CurrentValue 'No privileged scheduled task target is writable by a low-privilege principal' -RecommendedValue 'None found' -CIS_Control 'CIS 4.8' -NIST_Control 'CM-7, AC-6' `
+                -CurrentValue 'No privileged scheduled task program, script argument or folder is writable by a non-admin account' -RecommendedValue 'None found' -CIS_Control 'CIS 4.8' -NIST_Control 'CM-7, AC-6' `
                 -MITRE_Technique 'T1053.005 (Scheduled Task)' -ISO27001_Control 'A.8.19' -NIS2_Article 'Art.21(2)(i)' -Recommendation 'No action required.'
         } else {
             Add-AuditResult -Category 'Privilege Escalation - Token & Privilege Abuse' -Control 'Privileged Scheduled Task Target ACLs' -Status 'FAIL' -Severity 'Critical' `
                 -CurrentValue "$($writableTarget.Count) task target(s) writable by a low-privilege principal: $($writableTarget -join ' | ')" -RecommendedValue 'None found' -CIS_Control 'CIS 4.8' `
                 -NIST_Control 'CM-7, AC-6' -MITRE_Technique 'T1053.005 (Scheduled Task)' -ISO27001_Control 'A.8.19' -NIS2_Article 'Art.21(2)(i)' `
-                -Recommendation 'Tighten the ACL on each listed target so it is not writable by Everyone/Authenticated Users/Users. A low-privileged user can overwrite the binary a SYSTEM-context task will execute on its next scheduled run - a direct and reliable local privilege escalation path.'
+                -Recommendation 'Tighten the ACL on each listed program, script and folder so no non-administrative account can write it (icacls "<path>" /remove:g <account>). A low-privileged user can overwrite the binary or script a SYSTEM-context task runs on its next trigger - a direct and reliable local privilege escalation path.'
         }
     } catch {
         Add-AuditResult -Category 'Privilege Escalation - Token & Privilege Abuse' -Control 'Orphaned/Hijackable Privileged Scheduled Tasks' -Status 'WARN' -Severity 'Low' `
@@ -4493,7 +4556,8 @@ function Test-AppLockerLOLBASExposure {
     Write-SectionBanner 'AppLocker - LOLBAS Execution Bypass Exposure'
     try {
         $xml = Get-AppLockerPolicyXmlCache
-        $denyNames = Get-AppLockerDenyRuleBinaryNames -Xml $xml
+        # @(): an empty set returned from a function unrolls to $null (no AppLocker policy).
+        $denyNames = @(Get-AppLockerDenyRuleBinaryNames -Xml $xml)
 
         $exeCollection = if ($xml) { Get-AppLockerRuleCollectionNode -Xml $xml -CollectionType 'Exe' } else { $null }
         $exeMode = if ($exeCollection) { $exeCollection.EnforcementMode } else { $null }
@@ -4552,7 +4616,7 @@ function Test-AppLockerLOLBASExposure {
             $binName = $entry.Name
             $foundPath = $entry.Path
             $foundAny = $true
-            $isDenied = $denyNames.Contains($binName)
+            $isDenied = $denyNames -contains $binName
             $severity = $severityMap[$binName]
             $mitre = $mitreMap[$binName]
 
@@ -4718,12 +4782,12 @@ function Test-AppLockerPolicyRegistryKeyACLs {
             $check = Test-LowPrivilegeWriteAccess -Path $key -ObjectType Registry
             if ($check.IsVulnerable) {
                 Add-AuditResult -Category 'AppLocker - Registry & Service Integrity' -Control "AppLocker Policy Registry Key ACL - $key" -Status 'FAIL' -Severity 'Critical' `
-                    -CurrentValue "Grants: $($check.Principals -join '; ')" -RecommendedValue 'No SetValue/CreateSubKey/FullControl grant to Everyone, Authenticated Users, or Users' -CIS_Control 'CIS 2.5' `
+                    -CurrentValue "Grants: $($check.Principals -join '; ')" -RecommendedValue 'No write-type grant to, or ownership by, a non-administrative account' -CIS_Control 'CIS 2.5' `
                     -NIST_Control 'AC-6, CM-7' -MITRE_Technique 'T1562.001 (Disable or Modify Tools)' -ISO27001_Control 'A.8.19' -NIS2_Article 'Art.21(2)(e)' -NSA_Guidance 'NSA/CISA Application Allowlisting Guidance' `
                     -Recommendation "Remove the low-privilege write grant on `"$key`". A standard user with write access here can modify or wipe the cached AppLocker policy definitions applied to this endpoint, defeating enforcement entirely without needing to touch the source GPO."
             } else {
                 Add-AuditResult -Category 'AppLocker - Registry & Service Integrity' -Control "AppLocker Policy Registry Key ACL - $key" -Status 'PASS' -Severity 'Critical' `
-                    -CurrentValue 'No low-privilege write grant' -RecommendedValue 'No SetValue/CreateSubKey/FullControl grant to Everyone, Authenticated Users, or Users' -CIS_Control 'CIS 2.5' `
+                    -CurrentValue 'No low-privilege write grant' -RecommendedValue 'No write-type grant to, or ownership by, a non-administrative account' -CIS_Control 'CIS 2.5' `
                     -NIST_Control 'AC-6, CM-7' -ISO27001_Control 'A.8.19' -NIS2_Article 'Art.21(2)(e)' -Recommendation 'No action required.'
             }
         } catch {
@@ -4952,12 +5016,12 @@ function Test-MDMPolicyRegistryACL {
             $check = Test-LowPrivilegeWriteAccess -Path $key -ObjectType Registry
             if ($check.IsVulnerable) {
                 Add-AuditResult -Category 'Intune / MDM Policy Integrity' -Control "MDM Policy Registry Key ACL - $key" -Status 'FAIL' -Severity 'Critical' `
-                    -CurrentValue "Grants: $($check.Principals -join '; ')" -RecommendedValue 'No SetValue/CreateSubKey/FullControl grant to Everyone, Authenticated Users, or Users' -CIS_Control 'CIS 5.1' `
+                    -CurrentValue "Grants: $($check.Principals -join '; ')" -RecommendedValue 'No write-type grant to, or ownership by, a non-administrative account' -CIS_Control 'CIS 5.1' `
                     -NIST_Control 'AC-6, CM-7' -MITRE_Technique 'T1562.001 (Disable or Modify Tools)' -ISO27001_Control 'A.8.19' -NIS2_Article 'Art.21(2)(i)' `
                     -Recommendation "Remove the low-privilege write grant on `"$key`". A standard user with write access here can override or wipe deployed Intune device configuration/compliance policy locally, without needing access to the Intune tenant."
             } else {
                 Add-AuditResult -Category 'Intune / MDM Policy Integrity' -Control "MDM Policy Registry Key ACL - $key" -Status 'PASS' -Severity 'Critical' `
-                    -CurrentValue 'No low-privilege write grant' -RecommendedValue 'No SetValue/CreateSubKey/FullControl grant to Everyone, Authenticated Users, or Users' -CIS_Control 'CIS 5.1' `
+                    -CurrentValue 'No low-privilege write grant' -RecommendedValue 'No write-type grant to, or ownership by, a non-administrative account' -CIS_Control 'CIS 5.1' `
                     -NIST_Control 'AC-6, CM-7' -ISO27001_Control 'A.8.19' -NIS2_Article 'Art.21(2)(i)' -Recommendation 'No action required.'
             }
         } catch {
@@ -6680,92 +6744,6 @@ function Test-FirewallLoggingConfiguration {
     } catch {
         Add-AuditResult -Category 'Network Architecture & Protocol Hardening' -Control 'Windows Firewall Logging Configuration' -Status 'WARN' -Severity 'Low' -CurrentValue 'Query failed' `
             -Recommendation "Unable to query firewall logging configuration: $($_.Exception.Message)"
-    }
-}
-
-function Test-FirewallInboundActiveRulesInventory {
-    <#
-        Inventories every currently-enabled inbound firewall rule with its port/protocol
-        and, where the rule is scoped to a specific program, the bound binary - flagging a
-        binary that is missing on disk, unsigned, or sitting in a user-writable location so
-        a reviewer can spot a suspicious listener without manually walking every rule in the
-        Windows Firewall console. Complements (not replaces) Test-FirewallRuleBroadAllowRules,
-        which only targets a fixed list of high-risk ports opened to any remote address.
-    #>
-    Write-SectionBanner 'Network Architecture - Active Inbound Firewall Rules Inventory'
-    try {
-        $rules = @(Get-NetFirewallRule -Direction Inbound -Enabled True -ErrorAction Stop)
-        if ($rules.Count -eq 0) {
-            Add-AuditResult -Category 'Network Architecture & Protocol Hardening' -Control 'Active Inbound Firewall Rules Inventory' -Status 'INFO' -Severity 'Informational' `
-                -CurrentValue 'No enabled inbound firewall rules found' -Recommendation 'No action required.'
-            return
-        }
-
-        $sigCache = @{}
-        $ruleLines = [System.Collections.Generic.List[string]]::new()
-        $notableLines = [System.Collections.Generic.List[string]]::new()
-
-        foreach ($rule in $rules) {
-            try {
-                $portFilter = $rule | Get-NetFirewallPortFilter -ErrorAction SilentlyContinue
-                $appFilter  = $rule | Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue
-
-                $proto = if ($portFilter -and $portFilter.Protocol -and $portFilter.Protocol -ne 'Any') { $portFilter.Protocol } else { 'Any' }
-                $port  = if ($portFilter -and $portFilter.LocalPort) { ($portFilter.LocalPort -join ',') } else { 'Any' }
-
-                $program = if ($appFilter -and $appFilter.Program -and $appFilter.Program -notin @('Any', 'System')) { $appFilter.Program } else { $null }
-
-                $binaryNote = 'not bound to a specific binary'
-                if ($program) {
-                    $expandedPath = [System.Environment]::ExpandEnvironmentVariables($program)
-                    if (Test-Path -LiteralPath $expandedPath -PathType Leaf -ErrorAction SilentlyContinue) {
-                        if (-not $sigCache.ContainsKey($expandedPath)) {
-                            try { $sigCache[$expandedPath] = (Get-AuthenticodeSignature -LiteralPath $expandedPath -ErrorAction Stop).Status } catch { $sigCache[$expandedPath] = 'Unknown' }
-                        }
-                        $sigStatus = $sigCache[$expandedPath]
-
-                        $writable = ($expandedPath -match '(?i)\\Users\\[^\\]+\\(AppData|Downloads|Desktop)\\' -or $expandedPath -match '(?i)\\Temp\\')
-
-                        $binaryNote = "bound to $expandedPath [Signature=$sigStatus]"
-                        if ($writable) { $binaryNote += ' [user-writable path]' }
-
-                        if ($sigStatus -ne 'Valid') {
-                            $notableLines.Add("$($rule.DisplayName): bound binary '$expandedPath' signature status is '$sigStatus'")
-                        }
-                        if ($writable) {
-                            $notableLines.Add("$($rule.DisplayName): bound binary '$expandedPath' resides in a user-writable location")
-                        }
-                    } else {
-                        $binaryNote = "bound to $expandedPath [file not found on disk]"
-                        $notableLines.Add("$($rule.DisplayName): bound binary '$expandedPath' does not exist on disk")
-                    }
-                }
-
-                $ruleLines.Add("$($rule.DisplayName) [Action=$($rule.Action); Protocol=$proto; Port=$port; Profile=$($rule.Profile)] - $binaryNote")
-            } catch { Write-Verbose "Skipped: $($_.Exception.Message)" }
-        }
-
-        $allowCount = @($rules | Where-Object { $_.Action -eq 'Allow' }).Count
-        $shown = @($ruleLines | Select-Object -First 80)
-        $truncatedNote = if ($ruleLines.Count -gt 80) { " (showing first 80 of $($ruleLines.Count))" } else { '' }
-        $summary = "$($rules.Count) enabled inbound rule(s), $allowCount Allow$($truncatedNote): $($shown -join ' | ')"
-
-        if ($notableLines.Count -gt 0) {
-            $uniqueNotable = @($notableLines | Select-Object -Unique)
-            Add-AuditResult -Category 'Network Architecture & Protocol Hardening' -Control 'Active Inbound Firewall Rules Inventory' -Status 'WARN' -Severity 'Medium' `
-                -CurrentValue $summary -Details ((@($ruleLines) | Sort-Object) -join "`n") -RecommendedValue 'All program-bound rules reference a present, Authenticode-signed binary outside user-writable locations' `
-                -CIS_Control 'CIS 4.4' -NIST_Control 'SC-7, CM-7' -MITRE_Technique 'T1071 (Application Layer Protocol), T1218 (Signed Binary Proxy Execution)' `
-                -ISO27001_Control 'A.8.20' -NIS2_Article 'Art.21(2)(d)' -NSA_Guidance 'NSA/CISA Host-Based Firewall Guidance' `
-                -Recommendation "Review the following notable rule(s): $($uniqueNotable -join ' | '). A rule bound to a missing, unsigned, or user-writable-path binary can indicate stale/leftover software or a persistence mechanism disguising itself as a legitimate listener."
-        } else {
-            Add-AuditResult -Category 'Network Architecture & Protocol Hardening' -Control 'Active Inbound Firewall Rules Inventory' -Status 'INFO' -Severity 'Informational' `
-                -CurrentValue $summary -Details ((@($ruleLines) | Sort-Object) -join "`n") -RecommendedValue 'Reviewed periodically against expected listening services' `
-                -CIS_Control 'CIS 4.4' -NIST_Control 'SC-7, CM-7' -ISO27001_Control 'A.8.20' -NIS2_Article 'Art.21(2)(d)' `
-                -Recommendation 'No action required. Full inventory of active inbound rules (name, port/protocol, profile, bound binary) for review against expected listening services.'
-        }
-    } catch {
-        Add-AuditResult -Category 'Network Architecture & Protocol Hardening' -Control 'Active Inbound Firewall Rules Inventory' -Status 'WARN' -Severity 'Low' -CurrentValue 'Query failed' `
-            -Recommendation "Unable to enumerate inbound firewall rules: $($_.Exception.Message)"
     }
 }
 
@@ -8838,6 +8816,8 @@ function Get-CompliancePosture {
 
     $maxPoints = 0.0
     $earnedPoints = 0.0
+    $rawMax = 0.0
+    $rawEarned = 0.0
 
     foreach ($r in $Script:AuditResults) {
         if ($r.Status -eq 'INFO') { continue }
@@ -8845,16 +8825,18 @@ function Get-CompliancePosture {
         if (-not $weight) { $weight = 0 }
         if ($weight -eq 0) { continue }
 
-        $maxPoints += $weight
-        switch ($r.Status) {
-            'PASS' { $earnedPoints += $weight }
-            'WARN' { $earnedPoints += ($weight * 0.5) }
-            'FAIL' { $earnedPoints += 0 }
-        }
+        $credit = switch ($r.Status) { 'PASS' { $weight } 'WARN' { $weight * 0.5 } default { 0 } }
+        $rawMax += $weight; $rawEarned += $credit
+        # Accepted risks (-ExceptionPath) are left out of the score, like INFO.
+        if ($r.Accepted) { continue }
+        $maxPoints += $weight; $earnedPoints += $credit
     }
 
     $score = 100.0
     if ($maxPoints -gt 0) { $score = [math]::Round(($earnedPoints / $maxPoints) * 100, 1) }
+    $scoreIncludingAccepted = 100.0
+    if ($rawMax -gt 0) { $scoreIncludingAccepted = [math]::Round(($rawEarned / $rawMax) * 100, 1) }
+    $acceptedCount = @($Script:AuditResults | Where-Object { $_.Accepted }).Count
 
     $total = $Script:AuditResults.Count
     $passCount = @($Script:AuditResults | Where-Object { $_.Status -eq 'PASS' }).Count
@@ -8862,8 +8844,8 @@ function Get-CompliancePosture {
     $warnCount = @($Script:AuditResults | Where-Object { $_.Status -eq 'WARN' }).Count
     $infoCount = @($Script:AuditResults | Where-Object { $_.Status -eq 'INFO' }).Count
 
-    $criticalFails = @($Script:AuditResults | Where-Object { $_.Status -eq 'FAIL' -and $_.Severity -eq 'Critical' }).Count
-    $highFails = @($Script:AuditResults | Where-Object { $_.Status -eq 'FAIL' -and $_.Severity -eq 'High' }).Count
+    $criticalFails = @($Script:AuditResults | Where-Object { $_.Status -eq 'FAIL' -and $_.Severity -eq 'Critical' -and -not $_.Accepted }).Count
+    $highFails = @($Script:AuditResults | Where-Object { $_.Status -eq 'FAIL' -and $_.Severity -eq 'High' -and -not $_.Accepted }).Count
 
     if ($criticalFails -ge 1) {
         $risk = 'CRITICAL'
@@ -8885,6 +8867,67 @@ function Get-CompliancePosture {
         InfoCount      = $infoCount
         CriticalFails  = $criticalFails
         HighFails      = $highFails
+        AcceptedCount  = $acceptedCount
+        ScoreIncludingAccepted = $scoreIncludingAccepted
+    }
+}
+
+#endregion
+
+#region ============================== RISK ACCEPTANCE (-ExceptionPath) ==============================
+
+function Invoke-RiskExceptionPolicy {
+    <#
+        Applies an exceptions file to the findings. Format:
+          {"exceptions":[{"control":"<exact control name>","reason":"...","approvedBy":"...","expires":"YYYY-MM-DD"}]}
+        A matching FAIL/WARN finding keeps its status but is marked as accepted and left out of
+        the score and the risk level until the expiry date; an expired entry is shown on the
+        finding and scored again. One summary finding lists applied, expired, unmatched and
+        invalid entries, so nothing is hidden.
+    #>
+    param([Parameter(Mandatory = $true)] [string]$Path)
+    $fwc = @{ Category = 'Risk Acceptance'; CIS_Control = 'CIS 4.1'; NIST_Control = 'CA-5, PM-4, RA-7'; ISO27001_Control = 'A.5.36'; NIS2_Article = 'Art.21(2)(a)'
+        RecommendedValue = 'Every accepted risk names a reason, an approver and an expiry date that has not passed'; Evidence = "Exceptions file: $Path" }
+    $doc = ConvertFrom-JsonFile -Path $Path -MaxBytes 5MB
+    if (-not (Test-JsonKey $doc 'exceptions')) {
+        Add-AuditResult @fwc -Control 'Accepted Risk Exceptions' -Status 'WARN' -Severity 'Medium' -CurrentValue "Could not read an exceptions list from $Path" `
+            -Recommendation 'The file must be JSON: {"exceptions":[{"control":"<exact control name>","reason":"...","approvedBy":"...","expires":"YYYY-MM-DD"}]}'
+        return
+    }
+    $today = (Get-Date).Date
+    $applied = [System.Collections.Generic.List[string]]::new(); $expired = [System.Collections.Generic.List[string]]::new()
+    $unmatched = [System.Collections.Generic.List[string]]::new(); $invalid = [System.Collections.Generic.List[string]]::new()
+    foreach ($e in @($doc['exceptions'])) {
+        if ($e -isnot [System.Collections.IDictionary]) { $invalid.Add('an entry is not a JSON object'); continue }
+        $control = if (Test-JsonKey $e 'control') { [string]$e['control'] } else { '' }
+        $reason = if (Test-JsonKey $e 'reason') { [string]$e['reason'] } else { '' }
+        $approver = if (Test-JsonKey $e 'approvedBy') { [string]$e['approvedBy'] } else { '' }
+        $expires = if (Test-JsonKey $e 'expires') { [string]$e['expires'] } else { '' }
+        $end = [datetime]::MinValue
+        if (-not $control -or -not $reason -or -not [datetime]::TryParseExact($expires, 'yyyy-MM-dd', [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None, [ref]$end)) {
+            $invalid.Add("'$control': control, reason and expires (YYYY-MM-DD) are required"); continue
+        }
+        $matching = @($Script:AuditResults | Where-Object { $_.Control -eq $control })
+        if (-not $matching.Count) { $unmatched.Add("'$control' matches no finding in this run"); continue }
+        $targets = @($matching | Where-Object { $_.Status -in @('FAIL', 'WARN') })
+        $by = if ($approver) { ", approved by $approver" } else { '' }
+        if ($end -lt $today) {
+            foreach ($t in $targets) { $t.Exception = "Expired risk acceptance (ended $expires$by): $reason" }
+            $expired.Add("'$control' expired $expires ($reason)")
+            continue
+        }
+        foreach ($t in $targets) { $t.Exception = "Accepted risk until $expires${by}: $reason"; $t.Accepted = $true }
+        $applied.Add("'$control': $($targets.Count) finding(s) accepted until $expires$by ($reason)")
+    }
+    $details = (@($applied) + @($expired) + @($unmatched) + @($invalid)) -join "`n"
+    if ($expired.Count -or $unmatched.Count -or $invalid.Count) {
+        Add-AuditResult @fwc -Control 'Accepted Risk Exceptions' -Status 'WARN' -Severity 'Medium' `
+            -CurrentValue "$($applied.Count) applied, $($expired.Count) expired, $($unmatched.Count) unmatched, $($invalid.Count) invalid" -Details $details `
+            -Recommendation 'Renew or remove expired acceptances, and fix entries whose control name matches nothing (names must match a Control exactly, as shown in the report).'
+    } else {
+        Add-AuditResult @fwc -Control 'Accepted Risk Exceptions' -Status 'INFO' -Severity 'Informational' `
+            -CurrentValue "$($applied.Count) accepted risk(s) applied; they are excluded from the score until they expire" -Details $details `
+            -Recommendation 'Informational only. Review accepted risks before they expire.'
     }
 }
 
@@ -9441,14 +9484,20 @@ function Get-FindingRowHtml {
     $details = ''
     if ($Result.PSObject.Properties['Details']) { $details = [string]$Result.Details }
     $measuredHtml = Get-ValueCellHtml -RawText $Result.CurrentValue -Details $details
+    if ($Result.PSObject.Properties['Evidence'] -and $Result.Evidence) { $measuredHtml += "<span class=`"pc-sub lg-muted lg-small`">Source: $(Get-HtmlEncoded $Result.Evidence)</span>" }
+    $exceptionHtml = ''
+    if ($Result.PSObject.Properties['Exception'] -and $Result.Exception) {
+        $tone = if ($Result.Accepted) { 'lg-plain' } else { 'lg-warn' }
+        $exceptionHtml = "<span class=`"pc-sub`"><span class=`"lg-chip $tone`">$(if ($Result.Accepted) { 'Accepted risk' } else { 'Acceptance expired' })</span></span><span class=`"pc-sub lg-muted lg-small`">$(Get-HtmlEncoded $Result.Exception)</span>"
+    }
     $expectedHtml = Get-ValueCellHtml -RawText $Result.RecommendedValue
     $remediationHtml = Get-ValueCellHtml -RawText $Result.Recommendation
     $categoryEsc = Get-HtmlEncoded $Result.Category
-    $search = Get-HtmlEncoded ("$($Result.Control) $($Result.Category) $($Result.CurrentValue) $($Result.Recommendation)".ToLowerInvariant())
+    $search = Get-HtmlEncoded ("$($Result.Control) $($Result.Category) $($Result.CurrentValue) $($Result.Recommendation) $(if ($Result.PSObject.Properties['Exception']) { $Result.Exception })".ToLowerInvariant())
 
     return "<tr class=`"finding-row`" data-status=`"$($Result.Status)`" data-severity=`"$($Result.Severity)`" data-category=`"$categoryEsc`" data-search=`"$search`">" +
         "<td data-label=`"Control`"><strong>$(Get-HtmlEncoded $Result.Control)</strong><span class=`"pc-sub lg-muted lg-small`">$categoryEsc</span></td>" +
-        "<td data-label=`"Status`"><span class=`"lg-chip $statusTone`">$($Result.Status)</span></td>" +
+        "<td data-label=`"Status`"><span class=`"lg-chip $statusTone`">$($Result.Status)</span>$exceptionHtml</td>" +
         "<td data-label=`"Severity`"><span class=`"lg-chip $severityTone`">$($Result.Severity)</span></td>" +
         "<td data-label=`"Measured / Expected`"><div class=`"pc-mv`"><span class=`"lg-label`">Measured</span>$measuredHtml</div><div class=`"pc-mv`"><span class=`"lg-label`">Expected</span><span class=`"lg-muted`">$expectedHtml</span></div></td>" +
         "<td data-label=`"Frameworks`"><div class=`"pc-fw`">$(Get-FrameworkChipsHtml $Result)</div></td>" +
@@ -9616,6 +9665,7 @@ function New-HtmlReport {
         '{{INFO_COUNT}}'       = [string]$Posture.InfoCount
         '{{CRITICAL_FAILS}}'   = [string]$Posture.CriticalFails
         '{{HIGH_FAILS}}'       = [string]$Posture.HighFails
+        '{{SCORE_NOTE}}'       = $(if ($Posture.AcceptedCount) { Get-HtmlEncoded (" $($Posture.AcceptedCount) accepted risk(s) left out; {0}% with them." -f ([double]$Posture.ScoreIncludingAccepted).ToString([System.Globalization.CultureInfo]::InvariantCulture)) } else { '' })
         '{{SYS_DOMAIN}}'       = (Get-HtmlEncoded $sysInfo.Domain)
         '{{SYS_OSVERSION}}'    = (Get-HtmlEncoded $sysInfo.OSVersion)
         '{{SYS_MANUFACTURER}}' = (Get-HtmlEncoded $sysInfo.Manufacturer)
@@ -9806,7 +9856,7 @@ footer.pc-foot { text-align: center; padding: var(--lg-space-s) 0 var(--lg-space
         <div>
           <p class="lg-label">Compliance score</p>
           <span class="lg-chip lg-{{RISK_TONE}}">Risk: {{RISK_LEVEL}}</span>
-          <p class="lg-muted lg-small" style="margin: var(--lg-space-s) 0 0;">Weighted by severity; WARN counts half, INFO is not scored.</p>
+          <p class="lg-muted lg-small" style="margin: var(--lg-space-s) 0 0;">Weighted by severity; WARN counts half, INFO is not scored.{{SCORE_NOTE}}</p>
         </div>
       </div>
       <button type="button" class="lg-card lg-kpi lg-hover pc-kpi" data-filter="all" aria-pressed="true"><p class="lg-label">Controls</p><div class="lg-kpi-value">{{TOTAL}}</div></button>
@@ -10254,6 +10304,959 @@ function ConvertTo-InventoryJson {
 
 #endregion
 
+#region ============================== 37. SYSTEM INVENTORIES & FIREWALL RULES ==============================
+
+# Processes, services, connections, network exposure and firewall rules, collected once per run
+# and shown as dashboard tables (Inventory section) and JSON. Inventories are INFO; the checks
+# below derive scored findings from them.
+
+$Script:InvSnapshot = $null
+$Script:FwSnapshot = $null
+$Script:SigCache = @{}
+$Script:WriteAccessCache = @{}
+# Programs that run whatever they are handed: an allow rule for one is a rule for every script.
+$Script:LolBins = @('powershell.exe', 'pwsh.exe', 'powershell_ise.exe', 'cmd.exe', 'mshta.exe', 'rundll32.exe', 'regsvr32.exe',
+    'certutil.exe', 'bitsadmin.exe', 'wscript.exe', 'cscript.exe', 'msbuild.exe', 'installutil.exe', 'regasm.exe', 'regsvcs.exe',
+    'wmic.exe', 'python.exe', 'pythonw.exe', 'node.exe', 'java.exe', 'javaw.exe', 'curl.exe', 'nc.exe', 'nc64.exe', 'ncat.exe', 'socat.exe')
+$Script:AdminPorts = @{ '22' = 'SSH'; '135' = 'RPC'; '139' = 'NetBIOS'; '445' = 'SMB'; '1433' = 'SQL Server'; '3306' = 'MySQL'
+    '3389' = 'RDP'; '5432' = 'PostgreSQL'; '5900' = 'VNC'; '5985' = 'WinRM'; '5986' = 'WinRM HTTPS' }
+
+function Test-WindowsSystemPath {
+    # Files under these folders belong to TrustedInstaller; their Authenticode check is skipped
+    # (catalog lookups are slow) unless a non-admin can write them, which is checked separately.
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    $w = [regex]::Escape($env:windir)
+    return ($Path -match "^(?i)$w\\(System32|SysWOW64|WinSxS|SystemApps|ImmersiveControlPanel)\\")
+}
+
+function Get-CachedBinaryTrust {
+    param([AllowEmptyString()] [string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return '' }
+    $k = $Path.ToLowerInvariant()
+    if (-not $Script:SigCache.ContainsKey($k)) {
+        $Script:SigCache[$k] = if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { 'missing' }
+        elseif (Test-WindowsSystemPath $Path) { 'windows system file' }
+        else { Get-BinaryTrust -Path $Path }
+    }
+    return $Script:SigCache[$k]
+}
+
+# Non-admin accounts that can modify a file, or plant/replace it through its folder (cached).
+function Get-CachedWriteAccess {
+    param([AllowEmptyString()] [string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return @() }
+    $k = $Path.ToLowerInvariant()
+    if (-not $Script:WriteAccessCache.ContainsKey($k)) {
+        $hits = [System.Collections.Generic.List[string]]::new()
+        if (Test-Path -LiteralPath $Path -PathType Leaf) {
+            $f = Test-LowPrivilegeWriteAccess -Path $Path -ObjectType FileSystem
+            foreach ($p in $f.Principals) { $hits.Add("file: $p") }
+        }
+        $dir = Split-Path -Path $Path -Parent
+        if ($dir -and (Test-Path -LiteralPath $dir -PathType Container)) {
+            $d = Test-LowPrivilegeWriteAccess -Path $dir -ObjectType FileSystem
+            foreach ($p in $d.Principals) { $hits.Add("folder: $p") }
+        }
+        $Script:WriteAccessCache[$k] = @($hits)
+    }
+    return $Script:WriteAccessCache[$k]
+}
+
+function Get-RedactedCommandLine {
+    param([AllowEmptyString()] [AllowNull()] [string]$CommandLine)
+    if ([string]::IsNullOrEmpty($CommandLine)) { return '' }
+    $r = [regex]::Replace($CommandLine, '(?i)((?:password|passwd|pwd|token|secret|api[_-]?key|bearer|accountkey|sharedaccesskey)\s*[=:\s]\s*)("[^"]*"|''[^'']*''|[^\s;&|]+)', '$1[REDACTED]')
+    if ($r.Length -gt 400) { $r = $r.Substring(0, 400) + '...' }
+    return $r
+}
+
+function Test-LoopbackAddress {
+    param([string]$Address)
+    return ($Address -match '^(127\.|::1$|::ffff:127\.)')
+}
+
+function Get-InventorySnapshot {
+    if ($Script:InvSnapshot) { return $Script:InvSnapshot }
+    $snap = @{
+        Processes = @(); Users = @{}; Cpu = @{}; Tcp = @(); Udp = @()
+        ServicesByPid = @{}; ListenByPid = @{}; ConnByPid = @{}; ProcById = @{}
+    }
+    try { $snap.Processes = @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop) } catch { Write-Verbose "Win32_Process: $($_.Exception.Message)" }
+    foreach ($p in $snap.Processes) { $snap.ProcById[[int]$p.ProcessId] = $p }
+    # CPU %: two samples of total processor time one second apart, over all cores.
+    $first = @{}
+    try {
+        foreach ($p in @(Get-Process -IncludeUserName -ErrorAction Stop)) { $snap.Users[$p.Id] = $p.UserName; $first[$p.Id] = $p.CPU }
+    } catch {
+        foreach ($p in @(Get-Process -ErrorAction SilentlyContinue)) { $first[$p.Id] = $p.CPU }
+    }
+    Start-Sleep -Milliseconds 1000
+    $cores = [Math]::Max(1, [Environment]::ProcessorCount)
+    foreach ($p in @(Get-Process -ErrorAction SilentlyContinue)) {
+        if ($first.ContainsKey($p.Id) -and $null -ne $p.CPU -and $null -ne $first[$p.Id]) {
+            $snap.Cpu[$p.Id] = [Math]::Round(([double]$p.CPU - [double]$first[$p.Id]) / $cores * 100, 1)
+        }
+    }
+    try { $snap.Tcp = @(Get-NetTCPConnection -ErrorAction Stop) } catch { Write-Verbose "Get-NetTCPConnection: $($_.Exception.Message)" }
+    try { $snap.Udp = @(Get-NetUDPEndpoint -ErrorAction Stop) } catch { Write-Verbose "Get-NetUDPEndpoint: $($_.Exception.Message)" }
+    foreach ($c in $snap.Tcp) {
+        $owner = [int]$c.OwningProcess
+        if ([string]$c.State -eq 'Listen') {
+            $text = "TCP $($c.LocalAddress):$($c.LocalPort)"
+            if (-not $snap.ListenByPid.ContainsKey($owner)) { $snap.ListenByPid[$owner] = [System.Collections.Generic.List[string]]::new() }
+            if (-not $snap.ListenByPid[$owner].Contains($text)) { $snap.ListenByPid[$owner].Add($text) }
+        } else {
+            $snap.ConnByPid[$owner] = [int]$snap.ConnByPid[$owner] + 1
+        }
+    }
+    foreach ($u in $snap.Udp) {
+        $owner = [int]$u.OwningProcess
+        $text = "UDP $($u.LocalAddress):$($u.LocalPort)"
+        if (-not $snap.ListenByPid.ContainsKey($owner)) { $snap.ListenByPid[$owner] = [System.Collections.Generic.List[string]]::new() }
+        if (-not $snap.ListenByPid[$owner].Contains($text)) { $snap.ListenByPid[$owner].Add($text) }
+    }
+    foreach ($s in (Get-ServiceInventoryCache)) {
+        $id = [int]$s.ProcessId
+        if ($id -le 0) { continue }
+        if (-not $snap.ServicesByPid.ContainsKey($id)) { $snap.ServicesByPid[$id] = [System.Collections.Generic.List[string]]::new() }
+        $snap.ServicesByPid[$id].Add([string]$s.Name)
+    }
+    $Script:InvSnapshot = $snap
+    return $snap
+}
+
+function Get-FirewallSnapshot {
+    <#
+        Every firewall rule in the effective (ActiveStore) policy with all of its filters, fetched
+        with one query per filter class and joined in memory on InstanceID: calling the filter
+        cmdlets once per rule takes minutes on a machine with hundreds of rules.
+    #>
+    if ($Script:FwSnapshot) { return $Script:FwSnapshot }
+    $fw = @{ Ok = $false; Error = ''; Rules = @(); InboundEnabled = @(); Profiles = @(); CurrentProfiles = @(); Joined = 0; Seconds = 0; ModifyState = '' }
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
+        $rules = $null
+        try { $rules = @(Get-NetFirewallRule -PolicyStore ActiveStore -TracePolicyStore -ErrorAction Stop) }
+        catch { $rules = @(Get-NetFirewallRule -PolicyStore ActiveStore -ErrorAction Stop) }
+        $filters = @{}
+        $classes = [ordered]@{
+            App = { Get-NetFirewallApplicationFilter -PolicyStore ActiveStore -All -ErrorAction Stop }
+            Port = { Get-NetFirewallPortFilter -PolicyStore ActiveStore -All -ErrorAction Stop }
+            Addr = { Get-NetFirewallAddressFilter -PolicyStore ActiveStore -All -ErrorAction Stop }
+            Svc = { Get-NetFirewallServiceFilter -PolicyStore ActiveStore -All -ErrorAction Stop }
+            Sec = { Get-NetFirewallSecurityFilter -PolicyStore ActiveStore -All -ErrorAction Stop }
+        }
+        foreach ($c in $classes.GetEnumerator()) {
+            $map = @{}
+            try { foreach ($f in @(& $c.Value)) { $map[[string]$f.InstanceID] = $f } } catch { Write-Verbose "$($c.Key) filters: $($_.Exception.Message)" }
+            $filters[$c.Key] = $map
+        }
+        $list = [System.Collections.Generic.List[object]]::new()
+        foreach ($r in $rules) {
+            $id = [string]$r.InstanceID
+            $app = $filters.App[$id]; $port = $filters.Port[$id]; $addr = $filters.Addr[$id]; $svc = $filters.Svc[$id]; $sec = $filters.Sec[$id]
+            if ($port -or $app) { $fw.Joined++ }
+            $program = if ($app -and $app.Program) { [string]$app.Program } else { 'Any' }
+            $list.Add([PSCustomObject]@{
+                    Name          = [string]$r.Name
+                    DisplayName   = [string]$r.DisplayName
+                    Group         = [string]$r.DisplayGroup
+                    Enabled       = ([string]$r.Enabled -eq 'True')
+                    Direction     = [string]$r.Direction
+                    Action        = [string]$r.Action
+                    Profile       = [string]$r.Profile
+                    EdgeTraversal = [string]$r.EdgeTraversalPolicy
+                    Source        = (@([string]$r.PolicyStoreSourceType, [string]$r.PolicyStoreSource) | Where-Object { $_ }) -join ': '
+                    SourceType    = [string]$r.PolicyStoreSourceType
+                    Program       = $program
+                    Package       = $(if ($app) { [string]$app.Package } else { '' })
+                    Service       = $(if ($svc -and $svc.Service) { [string]$svc.Service } else { 'Any' })
+                    Protocol      = $(if ($port -and $port.Protocol) { [string]$port.Protocol } else { 'Any' })
+                    LocalPort     = $(if ($port -and $port.LocalPort) { @($port.LocalPort | ForEach-Object { [string]$_ }) } else { @('Any') })
+                    RemotePort    = $(if ($port -and $port.RemotePort) { @($port.RemotePort | ForEach-Object { [string]$_ }) } else { @('Any') })
+                    LocalAddress  = $(if ($addr -and $addr.LocalAddress) { @($addr.LocalAddress | ForEach-Object { [string]$_ }) } else { @('Any') })
+                    RemoteAddress = $(if ($addr -and $addr.RemoteAddress) { @($addr.RemoteAddress | ForEach-Object { [string]$_ }) } else { @('Any') })
+                    OverrideBlock = [bool]($sec -and [string]$sec.OverrideBlockRules -eq 'True')
+                })
+        }
+        $fw.Rules = @($list)
+        $fw.InboundEnabled = @($list | Where-Object { $_.Enabled -and $_.Direction -eq 'Inbound' })
+        try { $fw.Profiles = @(Get-NetFirewallProfile -PolicyStore ActiveStore -ErrorAction Stop) } catch { Write-Verbose "Profiles: $($_.Exception.Message)" }
+        try {
+            $com = New-Object -ComObject HNetCfg.FwPolicy2
+            $mask = [int]$com.CurrentProfileTypes
+            $fw.CurrentProfiles = @(@{ 1 = 'Domain'; 2 = 'Private'; 4 = 'Public' }.GetEnumerator() | Where-Object { $mask -band $_.Key } | ForEach-Object { $_.Value })
+            $state = [int]$com.LocalPolicyModifyState
+            $fw.ModifyState = switch ($state) { 0 { 'local rules apply' } 1 { 'Group Policy overrides local rules' } 2 { 'inbound rules not applied' } default { "state $state" } }
+        } catch { Write-Verbose "FwPolicy2: $($_.Exception.Message)" }
+        $fw.Ok = $true
+    } catch {
+        $fw.Error = $_.Exception.Message
+    }
+    $fw.Seconds = [Math]::Round($sw.Elapsed.TotalSeconds, 1)
+    $Script:FwSnapshot = $fw
+    return $fw
+}
+
+function Test-FirewallPortMatch {
+    param([string[]]$Spec, [int]$Port)
+    foreach ($s in $Spec) {
+        if ($s -eq 'Any') { return $true }
+        if ($s -match '^\d+$' -and [int]$s -eq $Port) { return $true }
+        if ($s -match '^(\d+)-(\d+)$' -and $Port -ge [int]$Matches[1] -and $Port -le [int]$Matches[2]) { return $true }
+    }
+    return $false
+}
+
+function Test-FirewallProfileOverlap {
+    param([string]$RuleProfile, [string[]]$Current)
+    if ([string]::IsNullOrWhiteSpace($RuleProfile) -or $RuleProfile -match 'Any') { return $true }
+    foreach ($c in $Current) { if ($RuleProfile -match $c) { return $true } }
+    return $false
+}
+
+function Get-ExpandedRuleProgram {
+    # Per-user variables would expand to the auditing admin's profile, so they are left as is.
+    param([string]$Program)
+    if ($Program -in @('Any', 'System', '')) { return $Program }
+    if ($Program -match '(?i)%(USERPROFILE|LOCALAPPDATA|APPDATA|HOMEPATH|TEMP|TMP)%') { return $Program }
+    return [Environment]::ExpandEnvironmentVariables($Program)
+}
+
+# Inbound rules that apply to a listener: profile, program, service, protocol and port all match.
+function Get-ListenerRuleMatch {
+    param($Fw, [string]$Protocol, [int]$Port, [string]$ProcessPath, [string[]]$Services, [int]$ProcessId)
+    $allow = [System.Collections.Generic.List[object]]::new(); $block = [System.Collections.Generic.List[object]]::new()
+    foreach ($r in $Fw.InboundEnabled) {
+        if (-not (Test-FirewallProfileOverlap $r.Profile $Fw.CurrentProfiles)) { continue }
+        if ($r.Protocol -notin @('Any', $Protocol, $(if ($Protocol -eq 'TCP') { '6' } else { '17' }))) { continue }
+        if (-not (Test-FirewallPortMatch $r.LocalPort $Port)) { continue }
+        $prog = Get-ExpandedRuleProgram $r.Program
+        if ($prog -eq 'System') { if ($ProcessId -ne 4) { continue } }
+        elseif ($prog -ne 'Any' -and $prog -ne $ProcessPath) { continue }
+        if ($r.Service -notin @('Any', '*') -and @($Services) -notcontains $r.Service) { continue }
+        if ($r.Action -eq 'Block') { $block.Add($r) } else { $allow.Add($r) }
+    }
+    return @{ Allow = @($allow); Block = @($block) }
+}
+
+function Test-ProcessInventory {
+    <# Every process with owner, CPU, memory, binary, signature, listeners and hosted services. #>
+    Write-SectionBanner 'System Inventory - Processes'
+    try {
+        $snap = Get-InventorySnapshot
+        New-InventoryTable -Id 'processes' -Title 'Processes' -Note 'Every process visible to the elevated audit. CPU is sampled over one second; command lines are redacted by pattern, review them before sharing the report.' `
+            -Columns @('PID:num', 'Parent:ref=processes.PID', 'Name', 'User', 'CPU %:num', 'RAM MB:num', 'Started', 'Binary:path', 'Signature', 'Listening', 'Connections:num', 'Services:ref=services.Name', 'Flags:flags', 'Command line')
+        $listening = 0
+        foreach ($p in $snap.Processes) {
+            $id = [int]$p.ProcessId
+            $path = [string]$p.ExecutablePath
+            $sig = Get-CachedBinaryTrust $path
+            $user = [string]$snap.Users[$id]
+            $flags = [System.Collections.Generic.List[string]]::new()
+            if ($user -match '^NT AUTHORITY\\(SYSTEM|LOCAL SERVICE|NETWORK SERVICE)$') { $flags.Add('system account') }
+            $listen = if ($snap.ListenByPid.ContainsKey($id)) { @($snap.ListenByPid[$id]) -join ', ' } else { '' }
+            if ($listen) { $flags.Add('listening'); $listening++ }
+            if ($sig -eq 'unsigned or invalid signature') { $flags.Add('unsigned!') } elseif ($sig -eq 'missing' -and $path) { $flags.Add('binary missing?') } elseif ($sig -like 'microsoft*' -or $sig -eq 'windows system file') { $flags.Add('microsoft') }
+            if ($flags.Contains('system account') -and $path -and @(Get-CachedWriteAccess $path).Count) { $flags.Add('writable binary!') }
+            $started = ''
+            if ($p.CreationDate) { try { $started = ([datetime]$p.CreationDate).ToString('yyyy-MM-dd HH:mm') } catch { $started = '' } }
+            $svcs = if ($snap.ServicesByPid.ContainsKey($id)) { @($snap.ServicesByPid[$id]) -join ', ' } else { '' }
+            $cpu = if ($snap.Cpu.ContainsKey($id)) { ([double]$snap.Cpu[$id]).ToString([System.Globalization.CultureInfo]::InvariantCulture) } else { '' }
+            Add-InventoryRow -Id 'processes' -Values @($id, [int]$p.ParentProcessId, [string]$p.Name, $user, $cpu,
+                [Math]::Round([double]$p.WorkingSetSize / 1MB), $started, $path, $sig, $listen, [int]$snap.ConnByPid[$id], $svcs,
+                ($flags -join ','), (Get-RedactedCommandLine ([string]$p.CommandLine)))
+        }
+        New-InventoryTable -Id 'connections' -Title 'Network connections' -Note 'TCP connections and UDP endpoints with the owning process.' `
+            -Columns @('Protocol', 'Local address', 'Remote address', 'State', 'PID:ref=processes.PID', 'Process', 'Flags:flags')
+        foreach ($c in $snap.Tcp) {
+            $proc = $snap.ProcById[[int]$c.OwningProcess]
+            $flag = if ([string]$c.State -eq 'Listen') { if (Test-LoopbackAddress ([string]$c.LocalAddress)) { 'loopback' } else { 'network listener?' } } else { '' }
+            Add-InventoryRow -Id 'connections' -Values @('TCP', "$($c.LocalAddress):$($c.LocalPort)", $(if ([string]$c.State -eq 'Listen') { '' } else { "$($c.RemoteAddress):$($c.RemotePort)" }),
+                [string]$c.State, [int]$c.OwningProcess, $(if ($proc) { [string]$proc.Name } else { '' }), $flag)
+        }
+        foreach ($u in $snap.Udp) {
+            $proc = $snap.ProcById[[int]$u.OwningProcess]
+            Add-InventoryRow -Id 'connections' -Values @('UDP', "$($u.LocalAddress):$($u.LocalPort)", '', 'Listen', [int]$u.OwningProcess,
+                $(if ($proc) { [string]$proc.Name } else { '' }), $(if (Test-LoopbackAddress ([string]$u.LocalAddress)) { 'loopback' } else { 'network listener?' }))
+        }
+        Add-AuditResult -Category 'System Inventory & Asset Information' -Control 'Process Inventory' -Status 'INFO' -Severity 'Informational' `
+            -CurrentValue "$(@($snap.Processes).Count) process(es), $listening listening on the network, $(@($snap.Tcp).Count + @($snap.Udp).Count) socket(s); tables in Inventory > Processes and Network connections" `
+            -CIS_Control 'CIS 2.1' -NIST_Control 'CM-8' -ISO27001_Control 'A.5.9' -NIS2_Article 'Art.21(2)(d)' `
+            -Recommendation 'Informational only. Filter the table by "unsigned", "writable binary" or "listening" to review what runs on this machine.'
+    } catch {
+        Add-AuditResult -Category 'System Inventory & Asset Information' -Control 'Process Inventory' -Status 'WARN' -Severity 'Low' -CurrentValue 'Query failed' `
+            -Recommendation "Unable to enumerate processes: $($_.Exception.Message)"
+    }
+}
+
+function Test-ServiceInventory {
+    <# Every service with state, account, binary, ServiceDll, signature and write-access flags. #>
+    Write-SectionBanner 'System Inventory - Services'
+    try {
+        New-InventoryTable -Id 'services' -Title 'Services' -Note 'Every Win32 service and driver entry from Win32_Service, with the binary (and ServiceDll for svchost services), signature, and whether a non-admin account can modify either.' `
+            -Columns @('Name', 'Display name', 'State', 'Start mode', 'Account', 'PID:ref=processes.PID', 'Binary:path', 'ServiceDll:path', 'Signature', 'Flags:flags')
+        $services = @(Get-ServiceInventoryCache)
+        foreach ($s in $services) {
+            $exe = Get-ServiceExecutablePath -PathName $s.PathName
+            if ($exe) { $exe = [Environment]::ExpandEnvironmentVariables($exe) }
+            $dll = ''
+            try {
+                $dllRef = Get-RegistryValueSafe -Path "HKLM:\SYSTEM\CurrentControlSet\Services\$($s.Name)\Parameters" -Name 'ServiceDll' -DefaultValue ''
+                if ($dllRef) { $dll = Resolve-RegisteredDllPath ([string]$dllRef) }
+            } catch { $dll = '' }
+            $target = if ($dll) { $dll } else { $exe }
+            $sig = Get-CachedBinaryTrust $target
+            $flags = [System.Collections.Generic.List[string]]::new()
+            if ($sig -eq 'unsigned or invalid signature') { $flags.Add('unsigned!') } elseif ($sig -eq 'missing' -and $target) { $flags.Add('binary missing?') }
+            if ($sig -notlike 'microsoft*' -and $sig -ne 'windows system file' -and $target) { $flags.Add('third-party') }
+            if ($exe -and @(Get-CachedWriteAccess $exe).Count) { $flags.Add('writable binary!') }
+            if ($dll -and @(Get-CachedWriteAccess $dll).Count) { $flags.Add('writable dll!') }
+            if ([string]$s.PathName -and [string]$s.PathName -notmatch '^\s*"' -and $exe -match ' ' -and $exe -notmatch '(?i)^[a-z]:\\windows\\') { $flags.Add('unquoted path?') }
+            Add-InventoryRow -Id 'services' -Values @([string]$s.Name, [string]$s.DisplayName, [string]$s.State, [string]$s.StartMode, [string]$s.StartName,
+                $(if ([int]$s.ProcessId -gt 0) { [int]$s.ProcessId } else { '' }), $exe, $dll, $sig, ($flags -join ','))
+        }
+        Add-AuditResult -Category 'System Inventory & Asset Information' -Control 'Service Inventory' -Status 'INFO' -Severity 'Informational' `
+            -CurrentValue "$($services.Count) service(s), $(@($services | Where-Object { $_.State -eq 'Running' }).Count) running; table in Inventory > Services" `
+            -CIS_Control 'CIS 4.8' -NIST_Control 'CM-7, CM-8' -ISO27001_Control 'A.8.9' -NIS2_Article 'Art.21(2)(d)' `
+            -Recommendation 'Informational only. Filter by "third-party", "unsigned" or "writable" to review services.'
+    } catch {
+        Add-AuditResult -Category 'System Inventory & Asset Information' -Control 'Service Inventory' -Status 'WARN' -Severity 'Low' -CurrentValue 'Query failed' `
+            -Recommendation "Unable to enumerate services: $($_.Exception.Message)"
+    }
+}
+
+function Test-PrivilegedProcessBinaryPermission {
+    <#
+        Running processes owned by SYSTEM, LocalService or NetworkService that are not services
+        (services are covered by the service ACL checks), whose executable or its folder a
+        non-admin account can modify: replacing it yields code execution in that context.
+    #>
+    Write-SectionBanner 'Privilege Escalation - Privileged Processes Running Writable Binaries'
+    try {
+        $snap = Get-InventorySnapshot
+        $hits = [System.Collections.Generic.List[string]]::new()
+        $seen = @{}
+        foreach ($p in $snap.Processes) {
+            $id = [int]$p.ProcessId
+            $user = [string]$snap.Users[$id]
+            if ($user -notmatch '^NT AUTHORITY\\(SYSTEM|LOCAL SERVICE|NETWORK SERVICE)$') { continue }
+            if ($snap.ServicesByPid.ContainsKey($id)) { continue }
+            $path = [string]$p.ExecutablePath
+            if (-not $path -or $seen.ContainsKey($path)) { continue }
+            $seen[$path] = $true
+            $grants = @(Get-CachedWriteAccess $path)
+            if ($grants.Count) { $hits.Add("$($p.Name) (PID $id, $user): $path - $($grants -join '; ')") }
+        }
+        $fw = @{ Category = 'Privilege Escalation - Service & File Permissions'; CIS_Control = 'CIS 4.8'; NIST_Control = 'AC-6, CM-5'
+            MITRE_Technique = 'T1574.010 (Services File Permissions Weakness)'; ISO27001_Control = 'A.8.2'; NIS2_Article = 'Art.21(2)(i)'
+            RecommendedValue = 'No privileged process runs a binary a non-admin account can modify' }
+        if ($hits.Count) {
+            Add-AuditResult @fw -Control 'Privileged Processes Running Writable Binaries' -Status 'FAIL' -Severity 'Critical' `
+                -CurrentValue "$($hits.Count) privileged process binar(y/ies) modifiable by a non-admin account" -Details ($hits -join "`n") `
+                -Recommendation 'Remove the write grants (icacls "<path>" /remove:g <account>) or reinstall the software into Program Files. Whoever can replace the file runs code as SYSTEM the next time it starts.'
+        } else {
+            Add-AuditResult @fw -Control 'Privileged Processes Running Writable Binaries' -Status 'PASS' -Severity 'Critical' `
+                -CurrentValue 'No running non-service SYSTEM/LocalService/NetworkService process uses a binary a non-admin can modify' -Recommendation 'No action required.'
+        }
+    } catch {
+        Add-AuditResult -Category 'Privilege Escalation - Service & File Permissions' -Control 'Privileged Processes Running Writable Binaries' -Status 'WARN' -Severity 'Low' `
+            -CurrentValue 'Query failed' -Recommendation "Unable to evaluate running processes: $($_.Exception.Message)"
+    }
+}
+
+function Test-FirewallInboundActiveRulesInventory {
+    <#
+        Full firewall rule inventory (every rule in the effective policy, inbound and outbound,
+        enabled or not, with program, service, package, ports, addresses, profiles, edge
+        traversal and source store) plus the per-profile settings, as dashboard tables. The
+        finding itself stays an INFO list of enabled inbound rules (tracked by -BaselinePath);
+        risky rules are scored by Test-FirewallRiskyRules.
+    #>
+    Write-SectionBanner 'Network Architecture - Firewall Rule Inventory'
+    try {
+        $fw = Get-FirewallSnapshot
+        if (-not $fw.Ok) { throw $fw.Error }
+        $exposureByRule = @{}
+        foreach ($row in (Get-NetworkExposureRow)) {
+            foreach ($n in $row.AllowRules) {
+                if (-not $exposureByRule.ContainsKey($n)) { $exposureByRule[$n] = [System.Collections.Generic.List[string]]::new() }
+                $exposureByRule[$n].Add("$($row.Process) $($row.Listener)")
+            }
+        }
+        New-InventoryTable -Id 'fwrules' -Title 'Firewall rules' -Note "Effective policy (ActiveStore), $(@($fw.Rules).Count) rules, read in $($fw.Seconds) s. Current profile(s): $(@($fw.CurrentProfiles) -join ', '); $($fw.ModifyState)." `
+            -Columns @('Name', 'Group', 'Direction', 'Action', 'Enabled', 'Profiles', 'Protocol', 'Local ports', 'Remote ports', 'Local addresses', 'Remote addresses',
+                'Program:path', 'Service', 'Package', 'Edge traversal', 'Source', 'Signature', 'Matched listeners', 'Flags:flags', 'Rule ID')
+        $inboundLines = [System.Collections.Generic.List[string]]::new()
+        foreach ($r in $fw.Rules) {
+            $flags = Get-FirewallRuleFlag -Rule $r -Fw $fw
+            $prog = Get-ExpandedRuleProgram $r.Program
+            $sig = if ($r.Enabled -and $r.Action -eq 'Allow' -and $prog -notin @('Any', 'System') -and $prog -notmatch '%') { Get-CachedBinaryTrust $prog } else { '' }
+            Add-InventoryRow -Id 'fwrules' -Values @($r.DisplayName, $r.Group, $r.Direction, $r.Action, $(if ($r.Enabled) { 'Yes' } else { 'No' }), $r.Profile, $r.Protocol,
+                ($r.LocalPort -join ', '), ($r.RemotePort -join ', '), ($r.LocalAddress -join ', '), ($r.RemoteAddress -join ', '), $r.Program, $r.Service, $r.Package,
+                $r.EdgeTraversal, $r.Source, $sig, $(if ($exposureByRule.ContainsKey($r.Name)) { @($exposureByRule[$r.Name]) -join ', ' } else { '' }), ($flags.Tags -join ','), $r.Name)
+            if ($r.Enabled -and $r.Direction -eq 'Inbound') {
+                $bound = if ($r.Program -ne 'Any') { " - bound to $($r.Program)" } else { ' - not bound to a specific binary' }
+                $inboundLines.Add("$($r.DisplayName) [Action=$($r.Action); Protocol=$($r.Protocol); Port=$($r.LocalPort -join ','); Profile=$($r.Profile)]$bound")
+            }
+        }
+        New-InventoryTable -Id 'fwprofiles' -Title 'Firewall profiles' -Note 'Per-profile settings from the effective policy.' `
+            -Columns @('Profile', 'Enabled', 'Default inbound', 'Default outbound', 'Local rules apply', 'Notify on listen', 'Log blocked', 'Log allowed', 'Log file', 'Log size KB', 'Disabled on interfaces', 'Current')
+        foreach ($p in $fw.Profiles) {
+            Add-InventoryRow -Id 'fwprofiles' -Values @([string]$p.Name, [string]$p.Enabled, [string]$p.DefaultInboundAction, [string]$p.DefaultOutboundAction,
+                [string]$p.AllowLocalFirewallRules, [string]$p.NotifyOnListen, [string]$p.LogBlocked, [string]$p.LogAllowed, [string]$p.LogFileName,
+                [string]$p.LogMaxSizeKilobytes, (@($p.DisabledInterfaceAliases) -join ', '), $(if (@($fw.CurrentProfiles) -contains [string]$p.Name) { 'Yes' } else { '' }))
+        }
+        $inCount = $inboundLines.Count
+        $coverage = if (@($fw.Rules).Count) { [Math]::Round(100 * $fw.Joined / @($fw.Rules).Count) } else { 0 }
+        Add-AuditResult -Category 'Network Architecture & Protocol Hardening' -Control 'Active Inbound Firewall Rules Inventory' -Status 'INFO' -Severity 'Informational' `
+            -CurrentValue "$(@($fw.Rules).Count) rule(s) in the effective policy, $inCount enabled inbound; filter data joined for $coverage%; tables in Inventory > Firewall rules" `
+            -Details ((@($inboundLines) | Sort-Object) -join "`n") -RecommendedValue 'Reviewed periodically against expected listening services' `
+            -CIS_Control 'CIS 4.4' -NIST_Control 'SC-7, CM-7' -ISO27001_Control 'A.8.20' -NIS2_Article 'Art.21(2)(d)' `
+            -Recommendation 'Informational only. Risky rules are scored separately (Firewall Rules - Risky Allow Rules).'
+    } catch {
+        Add-AuditResult -Category 'Network Architecture & Protocol Hardening' -Control 'Active Inbound Firewall Rules Inventory' -Status 'WARN' -Severity 'Low' -CurrentValue 'Query failed' `
+            -Recommendation "Unable to enumerate firewall rules: $($_.Exception.Message)"
+    }
+}
+
+function Get-FirewallRuleFlag {
+    <# Tags for the rule table, plus the scored reasons (Bad = FAIL-worthy, Weak = WARN-worthy). #>
+    param($Rule, $Fw)
+    $tags = [System.Collections.Generic.List[string]]::new(); $bad = [System.Collections.Generic.List[string]]::new(); $weak = [System.Collections.Generic.List[string]]::new()
+    $r = $Rule
+    if (-not $r.Enabled) { $tags.Add('disabled'); return @{ Tags = @($tags); Bad = @(); Weak = @() } }
+    if ($r.SourceType -match 'GroupPolicy|MDM' -or $r.Source -match 'MDM') { $tags.Add('managed') }
+    if ($r.Action -ne 'Allow') { $tags.Add('block'); return @{ Tags = @($tags); Bad = @(); Weak = @() } }
+    $prog = Get-ExpandedRuleProgram $r.Program
+    $isIn = $r.Direction -eq 'Inbound'
+    if ($isIn -and $r.Program -eq 'Any' -and $r.Service -eq 'Any' -and $r.Package -eq '' -and ($r.LocalPort -contains 'Any') -and ($r.RemoteAddress -contains 'Any') -and $r.Protocol -eq 'Any') {
+        $tags.Add('allows everything!'); $bad.Add('allows every inbound connection (no program, service, port or address condition)')
+    }
+    if ($r.OverrideBlock) { $tags.Add('overrides block rules!'); $bad.Add('authenticated bypass: overrides block rules') }
+    if ($prog -match '%') { $tags.Add('per-user path') }
+    elseif ($prog -notin @('Any', 'System')) {
+        if (-not (Test-Path -LiteralPath $prog -PathType Leaf)) {
+            if ($r.Package -eq '') { $tags.Add('program missing?'); $weak.Add("program not on disk: $prog") }
+        } else {
+            $grants = @(Get-CachedWriteAccess $prog)
+            if ($grants.Count) { $tags.Add('writable program!'); $bad.Add("program can be replaced by a non-admin: $prog ($($grants[0]))") }
+            if ((Get-CachedBinaryTrust $prog) -eq 'unsigned or invalid signature') { $tags.Add('unsigned!'); $weak.Add("unsigned program: $prog") }
+        }
+        $leaf = Split-Path -Path $prog -Leaf
+        if ($Script:LolBins -contains $leaf.ToLowerInvariant()) {
+            $outBlock = @($Fw.Profiles | Where-Object { [string]$_.DefaultOutboundAction -eq 'Block' }).Count -gt 0
+            if ($isIn -or $outBlock) { $tags.Add('script host?'); $weak.Add("script host or LOLBin allowed $($r.Direction.ToLowerInvariant()): $leaf") }
+        }
+    }
+    if ($isIn -and $r.EdgeTraversal -in @('Allow', 'DeferToApp', 'DeferToUser')) { $tags.Add('edge traversal?'); $weak.Add("edge traversal $($r.EdgeTraversal) (reachable through NAT via Teredo)") }
+    if ($isIn -and ($r.RemoteAddress -contains 'Any') -and (Test-FirewallProfileOverlap $r.Profile @('Public'))) {
+        foreach ($port in $r.LocalPort) { if ($Script:AdminPorts.ContainsKey($port)) { $tags.Add("$($Script:AdminPorts[$port]) from anywhere?") } }
+    }
+    return @{ Tags = @($tags); Bad = @($bad); Weak = @($weak) }
+}
+
+function Test-FirewallRiskyRules {
+    <# Scores enabled allow rules that admit everything, bypass blocks, or run replaceable, unsigned or script-host programs. #>
+    Write-SectionBanner 'Network Architecture - Risky Firewall Allow Rules'
+    $fwc = @{ Category = 'Network Architecture & Protocol Hardening'; CIS_Control = 'CIS 4.4, 4.5'; NIST_Control = 'SC-7, CM-7'
+        MITRE_Technique = 'T1562.004 (Disable or Modify System Firewall)'; ISO27001_Control = 'A.8.20'; NIS2_Article = 'Art.21(2)(d)'
+        NSA_Guidance = 'NSA/CISA Host-Based Firewall Guidance'
+        RecommendedValue = 'Allow rules bound to signed, admin-owned programs with port and address conditions; no bypass rules' }
+    try {
+        $fw = Get-FirewallSnapshot
+        if (-not $fw.Ok) { throw $fw.Error }
+        $bad = [System.Collections.Generic.List[string]]::new(); $weak = [System.Collections.Generic.List[string]]::new()
+        foreach ($r in $fw.Rules) {
+            $f = Get-FirewallRuleFlag -Rule $r -Fw $fw
+            foreach ($b in $f.Bad) { $bad.Add("$($r.DisplayName) [$($r.Direction), $($r.Profile)]: $b") }
+            foreach ($w in $f.Weak) { $weak.Add("$($r.DisplayName) [$($r.Direction), $($r.Profile)]: $w") }
+        }
+        $all = @($bad) + @($weak)
+        if ($bad.Count) {
+            Add-AuditResult @fwc -Control 'Firewall Rules - Risky Allow Rules' -Status 'FAIL' -Severity 'High' -CurrentValue "$($bad.Count) high-risk and $($weak.Count) weaker allow rule(s)" -Details ($all -join "`n") `
+                -Recommendation 'Remove or narrow each rule (Windows Defender Firewall with Advanced Security, or Remove-NetFirewallRule -Name <Rule ID from the inventory>). Bind allow rules to a program in Program Files and to specific ports and remote addresses.'
+        } elseif ($weak.Count) {
+            Add-AuditResult @fwc -Control 'Firewall Rules - Risky Allow Rules' -Status 'WARN' -Severity 'Medium' -CurrentValue "$($weak.Count) allow rule(s) worth a look" -Details ($all -join "`n") `
+                -Recommendation 'Remove stale rules for programs that are gone, sign or replace unsigned programs, and do not allow script hosts through the firewall.'
+        } else {
+            Add-AuditResult @fwc -Control 'Firewall Rules - Risky Allow Rules' -Status 'PASS' -Severity 'High' -CurrentValue "$(@($fw.Rules).Count) rule(s) checked, no risky allow rule" -Recommendation 'No action required.'
+        }
+    } catch {
+        Add-AuditResult @fwc -Control 'Firewall Rules - Risky Allow Rules' -Status 'WARN' -Severity 'Low' -CurrentValue 'Query failed' -Recommendation "Unable to evaluate firewall rules: $($_.Exception.Message)"
+    }
+}
+
+function Test-FirewallProfileAdvancedSettings {
+    <# Per-profile settings the basic profile checks do not cover: notifications, local rule merge, disabled interfaces. #>
+    Write-SectionBanner 'Network Architecture - Firewall Profile Settings'
+    $fwc = @{ Category = 'Network Architecture & Protocol Hardening'; CIS_Control = 'CIS 4.5'; NIST_Control = 'SC-7'; ISO27001_Control = 'A.8.20'; NIS2_Article = 'Art.21(2)(d)'
+        MITRE_Technique = 'T1562.004 (Disable or Modify System Firewall)'
+        RecommendedValue = 'Public profile: no listen notifications; firewall active on every interface' }
+    try {
+        $fw = Get-FirewallSnapshot
+        if (-not $fw.Ok) { throw $fw.Error }
+        $warn = [System.Collections.Generic.List[string]]::new(); $notes = [System.Collections.Generic.List[string]]::new()
+        foreach ($p in $fw.Profiles) {
+            $n = [string]$p.Name
+            if ($n -eq 'Public' -and [string]$p.NotifyOnListen -eq 'True') { $warn.Add('Public: users are prompted to allow programs that listen, and one click creates a permanent allow rule') }
+            $disabled = @($p.DisabledInterfaceAliases | Where-Object { $_ -and $_ -ne 'NotConfigured' })
+            if ($disabled.Count) { $warn.Add("${n}: firewall turned off for interface(s) $($disabled -join ', ')") }
+            if ([string]$p.AllowLocalFirewallRules -eq 'False') { $notes.Add("${n}: local rules are not applied (only Group Policy/MDM rules)") }
+        }
+        if ($fw.ModifyState) { $notes.Add("Local policy: $($fw.ModifyState)") }
+        $all = @($warn) + @($notes)
+        if ($warn.Count) {
+            Add-AuditResult @fwc -Control 'Firewall Profile Advanced Settings' -Status 'WARN' -Severity 'Medium' -CurrentValue "$($warn.Count) weak profile setting(s)" -Details ($all -join "`n") `
+                -Recommendation 'Set-NetFirewallProfile -Profile Public -NotifyOnListen False; remove interfaces from DisabledInterfaceAliases (Set-NetFirewallProfile -DisabledInterfaceAliases @()).'
+        } else {
+            Add-AuditResult @fwc -Control 'Firewall Profile Advanced Settings' -Status 'PASS' -Severity 'Medium' -CurrentValue "No weak profile setting$(if ($notes.Count) { '; ' + ($notes -join '; ') })" -Recommendation 'No action required.'
+        }
+    } catch {
+        Add-AuditResult @fwc -Control 'Firewall Profile Advanced Settings' -Status 'WARN' -Severity 'Low' -CurrentValue 'Query failed' -Recommendation "Unable to read firewall profiles: $($_.Exception.Message)"
+    }
+}
+
+$Script:ExposureRows = $null
+function Get-NetworkExposureRow {
+    <# One row per non-loopback listener with its process, signature, matching rules and the firewall decision. #>
+    if ($null -ne $Script:ExposureRows) { return $Script:ExposureRows }
+    $rows = [System.Collections.Generic.List[object]]::new()
+    $snap = Get-InventorySnapshot
+    $fw = Get-FirewallSnapshot
+    $listeners = @($snap.Tcp | Where-Object { [string]$_.State -eq 'Listen' } | ForEach-Object { @{ Proto = 'TCP'; Addr = [string]$_.LocalAddress; Port = [int]$_.LocalPort; Pid = [int]$_.OwningProcess } }) +
+    @($snap.Udp | ForEach-Object { @{ Proto = 'UDP'; Addr = [string]$_.LocalAddress; Port = [int]$_.LocalPort; Pid = [int]$_.OwningProcess } })
+    $seen = @{}
+    $current = @($fw.CurrentProfiles)
+    $activeProfiles = @($fw.Profiles | Where-Object { $current -contains [string]$_.Name })
+    $fwOff = $activeProfiles.Count -gt 0 -and @($activeProfiles | Where-Object { [string]$_.Enabled -eq 'True' }).Count -eq 0
+    $defaultAllow = @($activeProfiles | Where-Object { [string]$_.DefaultInboundAction -eq 'Allow' }).Count -gt 0
+    foreach ($l in $listeners) {
+        if (Test-LoopbackAddress $l.Addr) { continue }
+        $key = "$($l.Proto) $($l.Addr):$($l.Port) $($l.Pid)"
+        if ($seen.ContainsKey($key)) { continue }
+        $seen[$key] = $true
+        $proc = $snap.ProcById[$l.Pid]
+        $path = if ($proc) { [string]$proc.ExecutablePath } else { '' }
+        $svcs = if ($snap.ServicesByPid.ContainsKey($l.Pid)) { @($snap.ServicesByPid[$l.Pid]) } else { @() }
+        $match = if ($fw.Ok) { Get-ListenerRuleMatch -Fw $fw -Protocol $l.Proto -Port $l.Port -ProcessPath $path -Services $svcs -ProcessId $l.Pid } else { @{ Allow = @(); Block = @() } }
+        $decision = if (-not $fw.Ok) { 'firewall rules unreadable' }
+        elseif ($fwOff) { 'firewall off: reachable' }
+        elseif (@($match.Block).Count) { "blocked (rule: $(@($match.Block)[0].DisplayName))" }
+        elseif (@($match.Allow).Count) { "allowed ($(@($match.Allow).Count) rule(s))" }
+        elseif ($defaultAllow) { 'reachable (default inbound allow)' }
+        else { 'blocked (default inbound block)' }
+        $rows.Add([PSCustomObject]@{
+                Proto = $l.Proto; Listener = "$($l.Proto) $($l.Addr):$($l.Port)"; Address = "$($l.Addr):$($l.Port)"; Pid = $l.Pid
+                Process = $(if ($proc) { [string]$proc.Name } else { '' }); User = [string]$snap.Users[$l.Pid]; Path = $path
+                Services = ($svcs -join ', '); Signature = (Get-CachedBinaryTrust $path); Decision = $decision
+                AllowRules = @(@($match.Allow) | ForEach-Object { $_.Name }); AllowNames = @(@($match.Allow) | ForEach-Object { $_.DisplayName })
+                Reachable = ($decision -match '^(allowed|firewall off|reachable)')
+            })
+    }
+    $Script:ExposureRows = @($rows)
+    return $Script:ExposureRows
+}
+
+function Test-NetworkExposureMap {
+    <# Which listeners the network can reach, through which rules, and whether their binaries are trustworthy. #>
+    Write-SectionBanner 'Network Architecture - Network Exposure Map'
+    $fwc = @{ Category = 'Network Architecture & Protocol Hardening'; CIS_Control = 'CIS 4.4, 12.4'; NIST_Control = 'SC-7, CM-7'
+        MITRE_Technique = 'T1133 (External Remote Services), T1571 (Non-Standard Port)'; ISO27001_Control = 'A.8.20'; NIS2_Article = 'Art.21(2)(e)'
+        RecommendedValue = 'Only signed, intended services are reachable from the network' }
+    try {
+        $rows = @(Get-NetworkExposureRow)
+        New-InventoryTable -Id 'exposure' -Title 'Network exposure' -Note "Every listener on a non-loopback address, the binary behind it, and what the firewall does with inbound connections in the current profile(s): $(@((Get-FirewallSnapshot).CurrentProfiles) -join ', ')." `
+            -Columns @('Protocol', 'Listening on', 'PID:ref=processes.PID', 'Process', 'Runs as', 'Services:ref=services.Name', 'Binary:path', 'Signature', 'Firewall decision', 'Allowed by', 'Rule IDs:ref=fwrules.Rule ID', 'Flags:flags')
+        $risky = [System.Collections.Generic.List[string]]::new()
+        foreach ($r in $rows) {
+            $flags = [System.Collections.Generic.List[string]]::new()
+            if ($r.Reachable) {
+                $flags.Add('reachable?')
+                $grants = @(Get-CachedWriteAccess $r.Path)
+                if ($r.Signature -eq 'unsigned or invalid signature') { $flags.Add('unsigned!'); $risky.Add("$($r.Process) on $($r.Address): unsigned binary $($r.Path) ($($r.Decision))") }
+                if ($r.Path -and $grants.Count) { $flags.Add('writable binary!'); $risky.Add("$($r.Process) on $($r.Address): binary or folder writable by a non-admin ($($grants[0]))") }
+            } else { $flags.Add('filtered') }
+            Add-InventoryRow -Id 'exposure' -Values @($r.Proto, $r.Address, $r.Pid, $r.Process, $r.User, $r.Services, $r.Path, $r.Signature, $r.Decision,
+                ($r.AllowNames -join ', '), ($r.AllowRules -join ', '), ($flags -join ','))
+        }
+        $reach = @($rows | Where-Object { $_.Reachable }).Count
+        if ($risky.Count) {
+            Add-AuditResult @fwc -Control 'Network Exposure Map' -Status 'WARN' -Severity 'High' -CurrentValue "$($risky.Count) reachable listener(s) with an unsigned or replaceable binary" -Details ($risky -join "`n") `
+                -Recommendation 'Stop the program, bind it to 127.0.0.1, or remove the allow rule. See Inventory > Network exposure for every listener and the rules that admit it.'
+        } else {
+            Add-AuditResult @fwc -Control 'Network Exposure Map' -Status 'INFO' -Severity 'Informational' -CurrentValue "$($rows.Count) network listener(s), $reach reachable through the firewall; table in Inventory > Network exposure" `
+                -Recommendation 'Informational only. Review the listeners the firewall admits.'
+        }
+    } catch {
+        Add-AuditResult @fwc -Control 'Network Exposure Map' -Status 'WARN' -Severity 'Low' -CurrentValue 'Query failed' -Recommendation "Unable to map listeners to firewall rules: $($_.Exception.Message)"
+    }
+}
+
+#endregion
+
+#region ============================== 38. ACCESS RIGHTS, STORED SECRETS & RUNTIME LIFECYCLE ==============================
+
+function Get-CommandLineExecutable {
+    <# The program a command line starts: quoted path, or the text up to the first .exe/.com/.bat/.cmd. #>
+    param([AllowEmptyString()] [string]$CommandLine)
+    if ([string]::IsNullOrWhiteSpace($CommandLine)) { return '' }
+    $c = [Environment]::ExpandEnvironmentVariables($CommandLine.Trim())
+    if ($c.StartsWith('"')) { $end = $c.IndexOf('"', 1); if ($end -gt 0) { return $c.Substring(1, $end - 1) } }
+    if ($c -match '(?i)^(.+?\.(exe|com|bat|cmd|ps1|vbs|js|scr))(\s|,|$)') { return $Matches[1] }
+    return ($c -split '\s+')[0]
+}
+
+function Test-ServiceBinaryFolderAndDllPermission {
+    <#
+        Beyond the service executable file itself (Test-ServiceExecutableACLs): the folder that
+        holds it (a writable folder allows DLL planting next to the binary, or renaming and
+        replacing it), the ServiceDll of svchost-hosted services and its folder, and the program
+        in a service's FailureCommand recovery action, which runs when the service crashes.
+    #>
+    Write-SectionBanner 'Privilege Escalation - Service Folders, ServiceDll & Recovery Commands'
+    $fwc = @{ Category = 'Privilege Escalation - Service & File Permissions'; CIS_Control = 'CIS 4.8'; NIST_Control = 'CM-7, AC-6'
+        MITRE_Technique = 'T1574.001 (DLL Search Order Hijacking), T1574.010 (Services File Permissions Weakness)'; ISO27001_Control = 'A.8.19'
+        NIS2_Article = 'Art.21(2)(i)'; NSA_Guidance = 'NSA/CISA Identity and Access Management Best Practices'
+        RecommendedValue = 'No non-admin account can write a service binary folder, ServiceDll or recovery program' }
+    try {
+        $hits = [System.Collections.Generic.List[string]]::new()
+        $systemHit = $false
+        foreach ($svc in (Get-ServiceInventoryCache)) {
+            $asSystem = [string]$svc.StartName -in @('LocalSystem', 'NT AUTHORITY\SYSTEM', '')
+            $exe = Get-ServiceExecutablePath -PathName $svc.PathName
+            if ($exe) {
+                $exe = [Environment]::ExpandEnvironmentVariables($exe)
+                $dir = Split-Path -Path $exe -Parent
+                if ($dir -and (Test-Path -LiteralPath $dir -PathType Container)) {
+                    $d = Test-LowPrivilegeWriteAccess -Path $dir -ObjectType FileSystem
+                    if ($d.IsVulnerable) { $hits.Add("$($svc.Name) ($($svc.StartName)): binary folder $dir - $($d.Principals -join '; ')"); if ($asSystem) { $systemHit = $true } }
+                }
+            }
+            $dllRef = Get-RegistryValueSafe -Path "HKLM:\SYSTEM\CurrentControlSet\Services\$($svc.Name)\Parameters" -Name 'ServiceDll' -DefaultValue ''
+            if ($dllRef) {
+                $dll = Resolve-RegisteredDllPath ([string]$dllRef)
+                foreach ($g in @(Get-CachedWriteAccess $dll)) { $hits.Add("$($svc.Name) ($($svc.StartName)): ServiceDll $dll - $g"); if ($asSystem) { $systemHit = $true } }
+            }
+            $failCmd = Get-RegistryValueSafe -Path "HKLM:\SYSTEM\CurrentControlSet\Services\$($svc.Name)" -Name 'FailureCommand' -DefaultValue ''
+            if ($failCmd) {
+                $prog = Get-CommandLineExecutable ([string]$failCmd)
+                foreach ($g in @(Get-CachedWriteAccess $prog)) { $hits.Add("$($svc.Name) ($($svc.StartName)): recovery command $prog - $g"); if ($asSystem) { $systemHit = $true } }
+            }
+        }
+        if ($hits.Count) {
+            Add-AuditResult @fwc -Control 'Service Folder, ServiceDll & Recovery Command Permissions' -Status 'FAIL' -Severity $(if ($systemHit) { 'Critical' } else { 'High' }) `
+                -CurrentValue "$($hits.Count) writable service folder(s), DLL(s) or recovery program(s)" -Details (($hits | Select-Object -Unique) -join "`n") `
+                -Recommendation 'Remove the write grants (icacls "<folder>" /remove:g <account>, then icacls "<folder>" /inheritance:r if the grant is inherited from C:\ProgramData), or move the software into Program Files. A writable folder lets a user plant a DLL the service loads at its next start.'
+        } else {
+            Add-AuditResult @fwc -Control 'Service Folder, ServiceDll & Recovery Command Permissions' -Status 'PASS' -Severity 'Critical' `
+                -CurrentValue 'No service binary folder, ServiceDll or recovery program is writable by a non-admin account' -Recommendation 'No action required.'
+        }
+    } catch {
+        Add-AuditResult @fwc -Control 'Service Folder, ServiceDll & Recovery Command Permissions' -Status 'WARN' -Severity 'Low' -CurrentValue 'Query failed' `
+            -Recommendation "Unable to evaluate service folders: $($_.Exception.Message)"
+    }
+}
+
+function Test-MachineAutorunTargetPermission {
+    <#
+        Machine-wide autoruns run for every user who logs on, administrators included. If a
+        standard user can replace the program behind an HKLM Run/RunOnce entry, the Winlogon
+        Userinit/Shell values or an item in the All Users Startup folder, the next admin logon
+        runs their code with admin rights.
+    #>
+    Write-SectionBanner 'Privilege Escalation - Machine-Wide Autorun Targets'
+    $fwc = @{ Category = 'Persistence & Post-Exploitation Vectors'; CIS_Control = 'CIS 4.8'; NIST_Control = 'CM-7, AC-6'
+        MITRE_Technique = 'T1547.001 (Registry Run Keys / Startup Folder)'; ISO27001_Control = 'A.8.19'; NIS2_Article = 'Art.21(2)(i)'
+        RecommendedValue = 'No machine-wide autorun target is writable by a non-admin account' }
+    try {
+        $entries = [System.Collections.Generic.List[object]]::new()
+        foreach ($key in @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run', 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce',
+                'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\RunOnce')) {
+            $props = Get-ItemProperty -Path $key -ErrorAction SilentlyContinue
+            if (-not $props) { continue }
+            foreach ($p in $props.PSObject.Properties) {
+                if ($p.Name -like 'PS*') { continue }
+                $entries.Add(@{ Where = "$key\$($p.Name)"; Target = (Get-CommandLineExecutable ([string]$p.Value)) })
+            }
+        }
+        $winlogon = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+        foreach ($n in @('Userinit', 'Shell')) {
+            $v = [string](Get-RegistryValueSafe -Path $winlogon -Name $n -DefaultValue '')
+            foreach ($part in ($v -split ',')) {
+                $t = Get-CommandLineExecutable $part
+                if ($t -and $t -notmatch '\\') { $t = Join-Path (Join-Path $env:windir 'System32') $t; if (-not (Test-Path -LiteralPath $t)) { $t = Join-Path $env:windir (Split-Path $t -Leaf) } }
+                if ($t) { $entries.Add(@{ Where = "Winlogon\$n"; Target = $t }) }
+            }
+        }
+        $startup = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\StartUp'
+        if (Test-Path -LiteralPath $startup) {
+            $shell = $null
+            try { $shell = New-Object -ComObject WScript.Shell } catch { $shell = $null }
+            foreach ($f in @(Get-ChildItem -LiteralPath $startup -File -ErrorAction SilentlyContinue)) {
+                $target = $f.FullName
+                if ($f.Extension -eq '.lnk' -and $shell) { try { $lnk = $shell.CreateShortcut($f.FullName); if ($lnk.TargetPath) { $target = [string]$lnk.TargetPath } } catch { Write-Verbose "Shortcut: $($_.Exception.Message)" } }
+                $entries.Add(@{ Where = "All Users Startup\$($f.Name)"; Target = $target })
+            }
+        }
+        $hits = [System.Collections.Generic.List[string]]::new()
+        foreach ($e in $entries) {
+            foreach ($g in @(Get-CachedWriteAccess $e.Target)) { $hits.Add("$($e.Where) -> $($e.Target): $g") }
+        }
+        if ($hits.Count) {
+            Add-AuditResult @fwc -Control 'Machine-Wide Autorun Target Permissions' -Status 'FAIL' -Severity 'High' -CurrentValue "$($hits.Count) machine-wide autorun target(s) writable by a non-admin account" `
+                -Details ($hits -join "`n") -Recommendation 'Remove the write grants on each target and its folder (icacls), or move the program into Program Files. The next administrator who logs on runs whatever a standard user put there.'
+        } else {
+            Add-AuditResult @fwc -Control 'Machine-Wide Autorun Target Permissions' -Status 'PASS' -Severity 'High' -CurrentValue "$($entries.Count) machine-wide autorun target(s), none writable by a non-admin account" -Recommendation 'No action required.'
+        }
+    } catch {
+        Add-AuditResult @fwc -Control 'Machine-Wide Autorun Target Permissions' -Status 'WARN' -Severity 'Low' -CurrentValue 'Query failed' -Recommendation "Unable to evaluate autorun targets: $($_.Exception.Message)"
+    }
+}
+
+function Test-StoredApplicationCredential {
+    <#
+        Passwords that common admin tools keep on disk or in the registry, recoverable by anyone
+        who can read them (and often trivially decrypted): PuTTY proxy passwords, WinSCP saved
+        session passwords, FileZilla site manager entries, mRemoteNG connection files, and
+        RealVNC/TightVNC/UltraVNC server passwords. Counts and locations only - never values.
+    #>
+    Write-SectionBanner 'Credential Exposure - Passwords Stored by Admin Tools'
+    $fwc = @{ Category = 'Credential Exposure & Secret Leaks'; CIS_Control = 'CIS 3.11'; NIST_Control = 'IA-5(7), SC-28'
+        MITRE_Technique = 'T1552.001 (Credentials In Files), T1552.002 (Credentials in Registry)'; ISO27001_Control = 'A.5.17'; NIS2_Article = 'Art.21(2)(j)'
+        RecommendedValue = 'Admin tools keep no saved passwords (use a password manager, keys or a master password)' }
+    try {
+        $hits = [System.Collections.Generic.List[string]]::new()
+        $hives = @(Get-ChildItem -Path 'Registry::HKEY_USERS' -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -match '^S-1-5-21-[\d-]+$' })
+        foreach ($h in $hives) {
+            $root = "Registry::HKEY_USERS\$($h.PSChildName)"
+            $n = 0
+            foreach ($s in @(Get-ChildItem -Path "$root\Software\SimonTatham\PuTTY\Sessions" -ErrorAction SilentlyContinue)) {
+                if ([string](Get-ItemProperty -Path $s.PSPath -Name ProxyPassword -ErrorAction SilentlyContinue).ProxyPassword) { $n++ }
+            }
+            if ($n) { $hits.Add("PuTTY: $n session(s) with a saved proxy password (user $($h.PSChildName))") }
+            $n = 0
+            foreach ($s in @(Get-ChildItem -Path "$root\Software\Martin Prikryl\WinSCP 2\Sessions" -ErrorAction SilentlyContinue)) {
+                if ([string](Get-ItemProperty -Path $s.PSPath -Name Password -ErrorAction SilentlyContinue).Password) { $n++ }
+            }
+            if ($n) { $hits.Add("WinSCP: $n session(s) with a saved password (user $($h.PSChildName))") }
+        }
+        foreach ($k in @('HKLM:\SOFTWARE\RealVNC\vncserver', 'HKLM:\SOFTWARE\TightVNC\Server', 'HKLM:\SOFTWARE\WOW6432Node\TightVNC\Server', 'HKLM:\SOFTWARE\ORL\WinVNC3')) {
+            $p = Get-ItemProperty -Path $k -ErrorAction SilentlyContinue
+            if ($p -and ($p.Password -or $p.PasswordViewOnly)) { $hits.Add("VNC server password stored in $k (weakly obfuscated, recoverable)") }
+        }
+        foreach ($ini in @("$env:ProgramFiles\uvnc bvba\UltraVNC\ultravnc.ini", "${env:ProgramFiles(x86)}\uvnc bvba\UltraVNC\ultravnc.ini", "$env:ProgramFiles\UltraVNC\ultravnc.ini")) {
+            if ($ini -and (Test-Path -LiteralPath $ini) -and (Select-String -LiteralPath $ini -Pattern '^\s*passwd2?\s*=\s*\S' -Quiet -ErrorAction SilentlyContinue)) { $hits.Add("UltraVNC password stored in $ini") }
+        }
+        foreach ($profileDir in @(Get-ChildItem -LiteralPath (Join-Path $env:SystemDrive 'Users') -Directory -ErrorAction SilentlyContinue)) {
+            foreach ($f in @('AppData\Roaming\FileZilla\sitemanager.xml', 'AppData\Roaming\FileZilla\recentservers.xml')) {
+                $path = Join-Path $profileDir.FullName $f
+                if (Test-Path -LiteralPath $path) {
+                    $count = @(Select-String -LiteralPath $path -Pattern '<Pass[ >]' -ErrorAction SilentlyContinue).Count
+                    if ($count) { $hits.Add("FileZilla: $count saved password(s) in $path") }
+                }
+            }
+            $mr = Join-Path $profileDir.FullName 'AppData\Roaming\mRemoteNG\confCons.xml'
+            if (Test-Path -LiteralPath $mr) {
+                $count = @(Select-String -LiteralPath $mr -Pattern 'Password="[^"]+"' -AllMatches -ErrorAction SilentlyContinue | ForEach-Object { $_.Matches.Count } | Measure-Object -Sum).Sum
+                if ($count) { $hits.Add("mRemoteNG: $count saved password(s) in $mr") }
+            }
+        }
+        if ($hits.Count) {
+            Add-AuditResult @fwc -Control 'Passwords Stored by Admin Tools' -Status 'WARN' -Severity 'Medium' -CurrentValue "$($hits.Count) location(s) with saved passwords" -Details ($hits -join "`n") `
+                -Recommendation 'Delete the saved passwords (WinSCP: set a master password or use keys; PuTTY: use Pageant and keys; FileZilla: Settings > Interface > do not save passwords; mRemoteNG: set a master password; VNC: use Windows authentication). These stores are decrypted by off-the-shelf tools.'
+        } else {
+            Add-AuditResult @fwc -Control 'Passwords Stored by Admin Tools' -Status 'PASS' -Severity 'Medium' -CurrentValue "No saved PuTTY, WinSCP, FileZilla, mRemoteNG or VNC passwords in $($hives.Count) loaded user hive(s) and the user profiles" -Recommendation 'No action required.'
+        }
+    } catch {
+        Add-AuditResult @fwc -Control 'Passwords Stored by Admin Tools' -Status 'WARN' -Severity 'Low' -CurrentValue 'Query failed' -Recommendation "Unable to check stored passwords: $($_.Exception.Message)"
+    }
+}
+
+# Pipes Windows itself creates with broad access (RPC endpoints and well-known services).
+$Script:DefaultPipePatterns = @('^(lsass|ntsvcs|scerpc|epmapper|eventlog|srvsvc|wkssvc|spoolss|atsvc|browser|netlogon|samr|winreg|InitShutdown|LSM_API_service|protected_storage|W32TIME_ALT|PIPE_EVENTROOT|Winsock2|ROUTER|MsFteWds|tapsrv|trkwks|keysvc|efsrpc|dhcpcsvc|openssh-ssh-agent|wmi|SearchTextHarvester|Ctx_|TermSrv|RpcProxy|LSA_|MSSQL|SQLLocal|cert|dnsrpc|policy|ProtectedPrefix|Spooler|sql\\query|ExtEventPipe|SessEnvPublicRpc|Display|tsvcs|SfcApi|AppContracts|UIA_PIPE|chrome\.|mojo\.|crashpad_|dotnet-diagnostic-|PSHost\.|vscode-|GoogleCrashServices|edge\.|msedge|Winsock|iisipm|PowerShellISE|ShortcutNotifier)', '\{[0-9A-Fa-f-]{36}\}', '^[0-9a-f]{16,}$')
+
+function Test-NamedPipePermission {
+    <#
+        Named pipes are IPC endpoints, often served by privileged processes. A pipe that
+        Everyone or Anonymous can write to is an input channel into its server; that is only a
+        flaw if the server trusts the input, so this is a review list (WARN Low), not a verdict.
+        Pipes Windows creates with broad access by design are excluded.
+    #>
+    Write-SectionBanner 'Privilege Escalation - Named Pipe Permissions'
+    $fwc = @{ Category = 'Privilege Escalation - Token & Privilege Abuse'; CIS_Control = 'CIS 4.1'; NIST_Control = 'AC-3, AC-6'
+        MITRE_Technique = 'T1559 (Inter-Process Communication), T1134.001 (Token Impersonation/Theft)'; ISO27001_Control = 'A.8.2'; NIS2_Article = 'Art.21(2)(i)'
+        RecommendedValue = 'Non-default named pipes do not grant write access to Everyone or Anonymous' }
+    try {
+        $pipes = @([System.IO.Directory]::GetFiles('\\.\pipe\') | Select-Object -First 600)
+        New-InventoryTable -Id 'pipes' -Title 'Named pipes' -Note 'Named pipes and the broad groups that can write to them. Pipe server processes cannot be named without opening each pipe, which the audit does not do.' `
+            -Columns @('Pipe', 'Broad write access', 'Flags:flags')
+        $broadSids = @{ 'S-1-1-0' = 'Everyone'; 'S-1-5-7' = 'Anonymous'; 'S-1-5-11' = 'Authenticated Users'; 'S-1-5-32-545' = 'Users' }
+        $review = [System.Collections.Generic.List[string]]::new()
+        $unreadable = 0
+        foreach ($p in $pipes) {
+            $name = $p.Substring(9)
+            $grants = [System.Collections.Generic.List[string]]::new()
+            try {
+                $acl = Get-Acl -LiteralPath $p -ErrorAction Stop
+                foreach ($ace in $acl.Access) {
+                    if ($ace.AccessControlType -ne 'Allow') { continue }
+                    $sid = ConvertTo-SidString $ace.IdentityReference
+                    if ($sid -and $broadSids.ContainsKey($sid) -and ([int64]$ace.FileSystemRights -band (0x2 -bor 0x40000000 -bor 0x10000000))) { $grants.Add($broadSids[$sid]) }
+                }
+            } catch { $unreadable++; continue }
+            $default = $false
+            foreach ($pat in $Script:DefaultPipePatterns) { if ($name -match $pat) { $default = $true; break } }
+            $flags = if ($default) { 'windows default' } elseif ($grants -contains 'Everyone' -or $grants -contains 'Anonymous') { 'everyone can write?' } else { '' }
+            if (-not $default -and ($grants -contains 'Everyone' -or $grants -contains 'Anonymous')) { $review.Add("\\.\pipe\$name - writable by $(@($grants | Select-Object -Unique) -join ', ')") }
+            Add-InventoryRow -Id 'pipes' -Values @($name, (@($grants | Select-Object -Unique) -join ', '), $flags)
+        }
+        if ($pipes.Count -and $unreadable -gt ($pipes.Count / 2)) {
+            Add-AuditResult @fwc -Control 'Named Pipes Writable by Everyone' -Status 'WARN' -Severity 'Low' -CurrentValue "Could not read the ACL of $unreadable of $($pipes.Count) pipe(s)" `
+                -Recommendation 'Not evaluated: pipe security descriptors were unreadable from this PowerShell host. Review pipes with Sysinternals accesschk -p *.'
+        } elseif ($review.Count) {
+            Add-AuditResult @fwc -Control 'Named Pipes Writable by Everyone' -Status 'WARN' -Severity 'Low' -CurrentValue "$($review.Count) non-default pipe(s) writable by Everyone or Anonymous (of $($pipes.Count))" -Details ($review -join "`n") `
+                -Recommendation 'For each pipe, find the server (Sysinternals pipelist / handle -a \Device\NamedPipe\<name>) and ask the vendor whether it validates its callers. A privileged pipe server that trusts its input is a privilege-escalation path.'
+        } else {
+            Add-AuditResult @fwc -Control 'Named Pipes Writable by Everyone' -Status 'PASS' -Severity 'Low' -CurrentValue "$($pipes.Count) pipe(s), no non-default pipe writable by Everyone or Anonymous$(if ($unreadable) { " ($unreadable unreadable)" })" -Recommendation 'No action required.'
+        }
+    } catch {
+        Add-AuditResult @fwc -Control 'Named Pipes Writable by Everyone' -Status 'WARN' -Severity 'Low' -CurrentValue 'Query failed' -Recommendation "Unable to enumerate named pipes: $($_.Exception.Message)"
+    }
+}
+
+# End-of-life dates (upstream support end) for runtimes that are often left behind.
+# Sources: devguide.python.org/versions, nodejs.org/about/previous-releases,
+# dotnet.microsoft.com/platform/support/policy, learn.microsoft.com PowerShell lifecycle,
+# ruby-lang.org, php.net/supported-versions. Same table as the macOS edition.
+$Script:RuntimeEol = @{
+    'Python 2.7' = '2020-01-01'; 'Python 3.6' = '2021-12-23'; 'Python 3.7' = '2023-06-27'; 'Python 3.8' = '2024-10-07'; 'Python 3.9' = '2025-10-31'; 'Python 3.10' = '2026-10-31'
+    'Python 3.11' = '2027-10-31'; 'Python 3.12' = '2028-10-31'; 'Python 3.13' = '2029-10-31'
+    'Node.js 12' = '2022-04-30'; 'Node.js 14' = '2023-04-30'; 'Node.js 16' = '2023-09-11'; 'Node.js 17' = '2022-06-01'; 'Node.js 18' = '2025-04-30'; 'Node.js 19' = '2023-06-01'
+    'Node.js 20' = '2026-04-30'; 'Node.js 21' = '2024-06-01'; 'Node.js 22' = '2027-04-30'; 'Node.js 23' = '2025-06-01'; 'Node.js 24' = '2028-04-30'
+    '.NET 3.1' = '2022-12-13'; '.NET 5.0' = '2022-05-10'; '.NET 6.0' = '2024-11-12'; '.NET 7.0' = '2024-05-14'; '.NET 8.0' = '2026-11-10'; '.NET 9.0' = '2026-11-10'
+    'PowerShell 7.0' = '2022-12-03'; 'PowerShell 7.1' = '2022-05-08'; 'PowerShell 7.2' = '2024-11-08'; 'PowerShell 7.3' = '2024-05-08'; 'PowerShell 7.4' = '2026-11-10'
+    'Java 6' = '2018-12-31'; 'Java 7' = '2022-07-31'
+    'Ruby 2.7' = '2023-03-31'; 'Ruby 3.0' = '2024-04-23'; 'Ruby 3.1' = '2025-03-26'; 'Ruby 3.2' = '2026-03-31'; 'Ruby 3.3' = '2027-03-31'
+    'PHP 7.4' = '2022-11-28'; 'PHP 8.0' = '2023-11-26'; 'PHP 8.1' = '2025-12-31'; 'PHP 8.2' = '2026-12-31'; 'PHP 8.3' = '2027-12-31'
+}
+
+function Get-InstalledRuntime {
+    <# Runtimes from the Uninstall registry and the .NET shared folders: Product (key into $Script:RuntimeEol), Version, Source. #>
+    $found = [System.Collections.Generic.List[object]]::new()
+    foreach ($app in (Get-InstalledApplicationsCache)) {
+        $n = [string]$app.DisplayName; $v = [string]$app.DisplayVersion
+        $key = $null
+        if ($n -match '^Python (\d+)\.(\d+)') { $key = "Python $($Matches[1]).$($Matches[2])" }
+        elseif ($n -match '^Node\.js' -and $v -match '^(\d+)\.') { $key = "Node.js $($Matches[1])" }
+        elseif ($n -match '^Microsoft (ASP\.NET Core|\.NET( Core)? Runtime|Windows Desktop Runtime|\.NET Runtime)\b.*?(\d+)\.(\d+)\.\d+') { $key = ".NET $($Matches[3]).$($Matches[4])"; if ($key -eq '.NET 3.1') { $key = '.NET 3.1' } }
+        elseif ($n -match '^PowerShell 7' -and $v -match '^7\.(\d+)') { $key = "PowerShell 7.$($Matches[1])" }
+        elseif ($n -match '^Java(\(TM\))? (\d+)( Update|\b)' ) { $key = "Java $($Matches[2])" }
+        elseif ($n -match '^Java\(TM\) SE (Runtime Environment|Development Kit) (\d+)') { $key = "Java $($Matches[2])" }
+        elseif ($n -match '^Ruby (\d+)\.(\d+)') { $key = "Ruby $($Matches[1]).$($Matches[2])" }
+        if ($key) { $found.Add([PSCustomObject]@{ Product = $key; Version = $(if ($v) { $v } else { $n }); Source = $n }) }
+    }
+    $dotnet = Join-Path $env:ProgramFiles 'dotnet\shared\Microsoft.NETCore.App'
+    foreach ($d in @(Get-ChildItem -LiteralPath $dotnet -Directory -ErrorAction SilentlyContinue)) {
+        if ($d.Name -match '^(\d+)\.(\d+)\.') { $found.Add([PSCustomObject]@{ Product = ".NET $($Matches[1]).$($Matches[2])"; Version = $d.Name; Source = $d.FullName }) }
+    }
+    return @($found | Sort-Object Product, Version -Unique)
+}
+
+function Test-EndOfLifeRuntime {
+    <# Installed language runtimes past their upstream end of support (no more security fixes). #>
+    Write-SectionBanner 'Software Lifecycle - End-of-Life Runtimes'
+    $fwc = @{ Category = 'System Inventory & Asset Information'; CIS_Control = 'CIS 2.2, 7.4'; NIST_Control = 'SA-22, SI-2'
+        MITRE_Technique = 'T1068 (Exploitation for Privilege Escalation), T1203 (Exploitation for Client Execution)'; ISO27001_Control = 'A.8.8'; NIS2_Article = 'Art.21(2)(e)'
+        RecommendedValue = 'No runtime past its end of support' }
+    try {
+        $today = (Get-Date).Date
+        New-InventoryTable -Id 'runtimes' -Title 'Runtimes' -Note 'Language runtimes found in the Uninstall registry and the .NET shared folders, with their upstream end-of-support date.' `
+            -Columns @('Runtime', 'Version', 'End of support', 'Found in:path', 'Flags:flags')
+        $eol = [System.Collections.Generic.List[string]]::new(); $soon = [System.Collections.Generic.List[string]]::new()
+        $all = @(Get-InstalledRuntime)
+        foreach ($r in $all) {
+            $date = $Script:RuntimeEol[$r.Product]
+            $flag = ''
+            if ($date) {
+                $end = [datetime]::ParseExact($date, 'yyyy-MM-dd', [System.Globalization.CultureInfo]::InvariantCulture)
+                if ($end -le $today) { $flag = 'end of life!'; $eol.Add("$($r.Product) ($($r.Version)): support ended $date - $($r.Source)") }
+                elseif ($end -le $today.AddDays(90)) { $flag = 'ends soon?'; $soon.Add("$($r.Product) ($($r.Version)): support ends $date - $($r.Source)") }
+                else { $flag = 'supported' }
+            }
+            Add-InventoryRow -Id 'runtimes' -Values @($r.Product, $r.Version, $(if ($date) { $date } else { 'unknown' }), $r.Source, $flag)
+        }
+        $details = (@($eol) + @($soon)) -join "`n"
+        if ($eol.Count) {
+            Add-AuditResult @fwc -Control 'End-of-Life Runtimes' -Status 'WARN' -Severity 'Medium' -CurrentValue "$($eol.Count) runtime(s) past end of support$(if ($soon.Count) { ", $($soon.Count) ending within 90 days" })" -Details $details `
+                -Recommendation 'Uninstall runtimes nothing uses, and move the rest to a supported release. End-of-life runtimes get no security fixes, and anything that runs on them inherits their known vulnerabilities.'
+        } elseif ($soon.Count) {
+            Add-AuditResult @fwc -Control 'End-of-Life Runtimes' -Status 'WARN' -Severity 'Low' -CurrentValue "$($soon.Count) runtime(s) reach end of support within 90 days" -Details $details `
+                -Recommendation 'Plan the upgrade to a supported release before the end-of-support date.'
+        } else {
+            Add-AuditResult @fwc -Control 'End-of-Life Runtimes' -Status 'PASS' -Severity 'Medium' -CurrentValue "$($all.Count) runtime installation(s), none past end of support" -Recommendation 'No action required.'
+        }
+    } catch {
+        Add-AuditResult @fwc -Control 'End-of-Life Runtimes' -Status 'WARN' -Severity 'Low' -CurrentValue 'Query failed' -Recommendation "Unable to evaluate runtimes: $($_.Exception.Message)"
+    }
+}
+
+function Test-RegistryKeyHasValue {
+    # True when the key, or any key below it, holds at least one value.
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return $false }
+    $item = Get-Item -LiteralPath $Path -ErrorAction SilentlyContinue
+    if ($item -and @($item.GetValueNames()).Count) { return $true }
+    return [bool](@(Get-ChildItem -LiteralPath $Path -Recurse -ErrorAction SilentlyContinue | Where-Object { @($_.GetValueNames()).Count -gt 0 } | Select-Object -First 1).Count)
+}
+
+function Test-PolicySourceConflict {
+    <#
+        Where settings come from. Several checks read Group Policy registry keys; a device
+        managed by Intune gets the same settings through the MDM PolicyManager store instead,
+        and a check that only reads one of them can report a setting as missing. This lists the
+        policy areas each channel configures, flags areas set by both (and which one wins), so a
+        FAIL can be read against the channel that actually manages the device.
+    #>
+    Write-SectionBanner 'Management - Policy Sources (Group Policy vs MDM)'
+    $fwc = @{ Category = 'Intune / MDM Policy Integrity'; CIS_Control = 'CIS 4.1'; NIST_Control = 'CM-2, CM-6'; ISO27001_Control = 'A.8.9'; NIS2_Article = 'Art.21(2)(d)'
+        RecommendedValue = 'One management channel per policy area, or MDMWinsOverGP set deliberately' }
+    try {
+        $pairs = [ordered]@{
+            'Defender' = 'Windows Defender'; 'BitLocker' = 'FVE'; 'Update' = 'Windows\WindowsUpdate'; 'DeviceGuard' = 'Windows\DeviceGuard'
+            'Firewall' = 'WindowsFirewall'; 'SmartScreen' = 'Windows\System'; 'Experience' = 'Windows\CloudContent'; 'Privacy' = 'Windows\AppPrivacy'
+            'Browser' = 'Microsoft\Edge'; 'LAPS' = 'Windows\LAPS'; 'DeviceLock' = 'Windows\Personalization'
+        }
+        $mdmRoot = 'HKLM:\SOFTWARE\Microsoft\PolicyManager\current\device'
+        $mdmAreas = @(Get-ChildItem -Path $mdmRoot -ErrorAction SilentlyContinue | Where-Object { @($_.GetValueNames()).Count -gt 0 } | ForEach-Object { $_.PSChildName })
+        $gpoCount = 0
+        try { $gpoCount = @(Get-ChildItem -Path 'HKLM:\SOFTWARE\Policies' -Recurse -ErrorAction SilentlyContinue | Where-Object { @($_.GetValueNames()).Count -gt 0 }).Count } catch { $gpoCount = 0 }
+        $both = [System.Collections.Generic.List[string]]::new()
+        foreach ($p in $pairs.GetEnumerator()) {
+            $gpoKey = "HKLM:\SOFTWARE\Policies\Microsoft\$($p.Value)"
+            if ($p.Value -like 'Microsoft\*') { $gpoKey = "HKLM:\SOFTWARE\Policies\$($p.Value)" }
+            if ((Test-RegistryKeyHasValue $gpoKey) -and $mdmAreas -contains $p.Key) { $both.Add("$($p.Key): set by MDM ($mdmRoot\$($p.Key)) and Group Policy ($gpoKey)") }
+        }
+        $mdmWins = Get-RegistryValueSafe -Path "$mdmRoot\ControlPolicyConflict" -Name 'MDMWinsOverGP' -DefaultValue $null
+        $winner = if ([string]$mdmWins -eq '1') { 'MDM wins (MDMWinsOverGP = 1)' } else { 'Group Policy wins where both set a value (MDMWinsOverGP not set)' }
+        $summary = "MDM policy areas: $(if ($mdmAreas.Count) { $mdmAreas -join ', ' } else { 'none' }); Group Policy registry keys with values: $gpoCount"
+        $evidence = "Registry: $mdmRoot and HKLM:\SOFTWARE\Policies"
+        if ($both.Count) {
+            Add-AuditResult @fwc -Control 'Policy Sources (Group Policy vs MDM)' -Status 'WARN' -Severity 'Low' -CurrentValue "$($both.Count) policy area(s) configured by both channels; $winner" `
+                -Details ((@($both) + @($summary)) -join "`n") -Evidence $evidence `
+                -Recommendation 'Manage each area through one channel. Where both set a value, check which one wins on this device before acting on a FAIL that reads the other channel.'
+        } else {
+            Add-AuditResult @fwc -Control 'Policy Sources (Group Policy vs MDM)' -Status 'INFO' -Severity 'Informational' -CurrentValue $summary -Evidence $evidence `
+                -Recommendation 'Informational only. Settings delivered by Intune live in the MDM store; findings that read Group Policy keys may not see them.'
+        }
+    } catch {
+        Add-AuditResult @fwc -Control 'Policy Sources (Group Policy vs MDM)' -Status 'WARN' -Severity 'Low' -CurrentValue 'Query failed' -Recommendation "Unable to read policy sources: $($_.Exception.Message)"
+    }
+}
+
+#endregion
+
 #region ============================== JSON EXPORT ==============================
 
 function Export-JsonReport {
@@ -10282,12 +11285,15 @@ function Export-JsonReport {
         ComplianceScore = $Posture.Score
         RiskLevel     = $Posture.RiskLevel
         BaselineFile  = $(if ([string]::IsNullOrWhiteSpace($BaselinePath)) { $null } else { $BaselinePath })
+        ExceptionFile = $(if ([string]::IsNullOrWhiteSpace($ExceptionPath)) { $null } else { $ExceptionPath })
+        ScoreIncludingAccepted = $Posture.ScoreIncludingAccepted
         Summary       = [PSCustomObject]@{
             TotalControls = $Posture.Total
             Pass          = $Posture.PassCount
             Fail          = $Posture.FailCount
             Warn          = $Posture.WarnCount
             Info          = $Posture.InfoCount
+            Accepted      = $Posture.AcceptedCount
             CriticalFails = $Posture.CriticalFails
             HighFails     = $Posture.HighFails
         }
@@ -11287,6 +12293,18 @@ $auditChecks = @(
     'Test-USBDeviceConnectionHistory',
     'Test-FirewallLoggingConfiguration',
     'Test-FirewallInboundActiveRulesInventory',
+    'Test-FirewallRiskyRules',
+    'Test-FirewallProfileAdvancedSettings',
+    'Test-NetworkExposureMap',
+    'Test-ProcessInventory',
+    'Test-ServiceInventory',
+    'Test-PrivilegedProcessBinaryPermission',
+    'Test-ServiceBinaryFolderAndDllPermission',
+    'Test-MachineAutorunTargetPermission',
+    'Test-StoredApplicationCredential',
+    'Test-NamedPipePermission',
+    'Test-EndOfLifeRuntime',
+    'Test-PolicySourceConflict',
     'Test-HostsFileIntegrity',
     'Test-LSASSCrashDumpExposure',
     'Test-CredentialGuardUEFILock',
@@ -11336,6 +12354,17 @@ if (-not [string]::IsNullOrWhiteSpace($BaselinePath)) {
     }
 }
 
+# --- Optional accepted risks (after every check and the baseline, before scoring) ---
+if (-not [string]::IsNullOrWhiteSpace($ExceptionPath)) {
+    Write-SectionBanner 'Risk Acceptance'
+    try {
+        Invoke-RiskExceptionPolicy -Path $ExceptionPath
+    } catch {
+        Add-AuditResult -Category 'Risk Acceptance' -Control 'Accepted Risk Exceptions' -Status 'WARN' -Severity 'Medium' `
+            -CurrentValue 'Exceptions not applied' -Recommendation "Applying the exceptions file failed: $($_.Exception.Message)"
+    }
+}
+
 # --- Scoring & risk ---
 $posture = Get-CompliancePosture
 
@@ -11349,6 +12378,7 @@ Write-Host ("  Total Controls   : {0}" -f $posture.Total) -ForegroundColor Gray
 Write-Host ("  PASS / FAIL / WARN / INFO : {0} / {1} / {2} / {3}" -f $posture.PassCount, $posture.FailCount, $posture.WarnCount, $posture.InfoCount) -ForegroundColor Gray
 Write-Host ("  Critical Failures: {0}   High-Severity Failures: {1}" -f $posture.CriticalFails, $posture.HighFails) -ForegroundColor Gray
 if ($Script:BaselineSummary) { Write-Host ("  Baseline         : {0}" -f $Script:BaselineSummary) -ForegroundColor Gray }
+if ($posture.AcceptedCount) { Write-Host ("  Accepted risks   : {0} left out of the score ({1}% with them)" -f $posture.AcceptedCount, $posture.ScoreIncludingAccepted) -ForegroundColor Gray }
 Write-Host '=================================================================================' -ForegroundColor DarkCyan
 Write-Host ''
 

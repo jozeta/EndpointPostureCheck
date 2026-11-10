@@ -1,6 +1,8 @@
 # Report output
 *.html
 *.json
+# ...except the CI fixtures (sample exceptions file)
+!ci/*.json
 Remediate-*.ps1
 Remediate-EndpointPostureCheck.sh
 EndpointPostureCheck-Hardening.mobileconfig
