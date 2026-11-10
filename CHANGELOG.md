@@ -6,6 +6,19 @@ The project has no tagged releases yet, so changes are grouped by date. Entries 
 
 ## Unreleased
 
+- macOS (205 checks): inventories in the dashboard's Inventory section and the JSON export:
+  processes (PID, parent, user, CPU, RAM, uptime, binary, signature, listeners, connections,
+  launchd label, redacted command line), launchd services (every daemon and agent with status,
+  program, signature and writability), network connections, network exposure (each non-loopback
+  listener with the application firewall's decision for it), application firewall rules
+  (Allow/Block per app), pf rules with anchors, and network filters (system extensions and
+  content filter providers). New findings: Privileged Processes Running Writable Binaries,
+  Application Firewall Risky App Rules (interpreters, unsigned, stale, replaceable apps), Packet
+  Filter (pf) Rules (pass-any, port redirects, non-stock configuration), Network Content
+  Filters, Network Exposure Map (unsigned listeners the firewall admits).
+- Windows: `-ReportPath` with a folder that does not exist yet and no .html extension now
+  creates that folder, as on macOS. It used to become the HTML file name, with the JSON next to it.
+
 - Windows: fixed a parse error that stopped the whole script from running since the
   attack-path batch (`"$pw:"` in the OpenSSH check reads as a drive-qualified variable).
   PSScriptAnalyzer reported the file clean; CI now parses every .ps1 in both Windows PowerShell

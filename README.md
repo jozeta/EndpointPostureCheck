@@ -5,7 +5,7 @@
 This repository contains two independent tools sharing one design philosophy (fault-isolated checks, weighted compliance scoring, a self-contained HTML dashboard, optional JSON export and generated remediation script):
 
 - [`Invoke-EndpointPostureCheck.ps1`](#endpointposturecheck-for-windows) — Windows 11 Enterprise, 161 checks across 35 domains.
-- [`Invoke-MacPostureCheck.sh`](#endpointposturecheck-for-macos) — macOS 15 (Sequoia) / 26 (Tahoe), 199 checks across 32 domains.
+- [`Invoke-MacPostureCheck.sh`](#endpointposturecheck-for-macos) — macOS 15 (Sequoia) / 26 (Tahoe), 205 checks across 32 domains.
 
 ---
 
@@ -225,7 +225,7 @@ This tool includes deep-inspection checks — LSASS/credential exposure, ACL/pri
 
 **A comprehensive, standalone zsh security posture auditor for macOS 15 (Sequoia) and 26 (Tahoe) endpoints.**
 
-`Invoke-MacPostureCheck.sh` runs **199 read-only security controls** across 32 hardening domains — from Secure Enclave/T2 platform integrity and System Integrity Protection through Gatekeeper, TCC privacy controls, FileVault, credential exposure, and ransomware resilience — and renders the results as a single-file, interactive HTML dashboard, in the same visual language as the Windows edition. Every finding is mapped to CIS Controls v8, NIST SP 800-53 Rev.5, MITRE ATT&CK, ISO/IEC 27001:2022, the NIS2 Directive, NSA/CISA guidance, the CIS Apple macOS Benchmark, and the macOS Security Compliance Project (mSCP) — two mappings the Windows edition doesn't carry, since they're macOS-specific authoritative baselines. Findings backed by a real item list (installed apps, listening ports, admin group members, TCC grants, and more) show a popover in the HTML dashboard with the full list, one item per line, instead of cluttering the table with a long inline value. Both editions share the same dashboard (Låda Glass design, sidebar domain filter, KPI filters, theme switch).
+`Invoke-MacPostureCheck.sh` runs **205 read-only security controls** across 32 hardening domains — from Secure Enclave/T2 platform integrity and System Integrity Protection through Gatekeeper, TCC privacy controls, FileVault, credential exposure, and ransomware resilience — and renders the results as a single-file, interactive HTML dashboard, in the same visual language as the Windows edition. Every finding is mapped to CIS Controls v8, NIST SP 800-53 Rev.5, MITRE ATT&CK, ISO/IEC 27001:2022, the NIS2 Directive, NSA/CISA guidance, the CIS Apple macOS Benchmark, and the macOS Security Compliance Project (mSCP) — two mappings the Windows edition doesn't carry, since they're macOS-specific authoritative baselines. Findings backed by a real item list (installed apps, listening ports, admin group members, TCC grants, and more) show a popover in the HTML dashboard with the full list, one item per line, instead of cluttering the table with a long inline value. Both editions share the same dashboard (Låda Glass design, sidebar domain filter, KPI filters, theme switch).
 
 It runs standalone with zero external dependencies: no Homebrew packages, no Python, nothing beyond the zsh shell and command-line tools Apple ships on every Mac.
 
@@ -272,7 +272,7 @@ Identical `PASS`/`FAIL`/`WARN`/`INFO` status semantics, `Critical`/`High`/`Mediu
 
 ### Audit Domains
 
-199 checks organized across 32 domains:
+205 checks organized across 32 domains:
 
 | # | Domain |
 |---|---|
@@ -283,7 +283,7 @@ Identical `PASS`/`FAIL`/`WARN`/`INFO` status semantics, `Critical`/`High`/`Mediu
 | 5 | Malware Defense (XProtect / MRT / EDR) |
 | 6 | TCC & Privacy Controls (including powerful grants to terminals/interpreters and grants not pinned to a code signature) |
 | 7 | Identity, Accounts & Privilege Management (including sudo environment and drop-in permissions, sudo rules that allow shell escapes, weakened authorization-database rights, PAM integrity) |
-| 8 | Network Firewall & Packet Filtering |
+| 8 | Network Firewall & Packet Filtering (application firewall app rules with signature and interpreter checks, pf rules and anchors, network content filters, network exposure map) |
 | 9 | Remote Access & Sharing Services (including legacy VNC passwords) |
 | 10 | SSH Server & Client Hardening (including risky sshd options) |
 | 11 | Cryptography & Certificate Trust |
@@ -291,7 +291,7 @@ Identical `PASS`/`FAIL`/`WARN`/`INFO` status semantics, `Critical`/`High`/`Mediu
 | 13 | Software Update & Patch Compliance |
 | 14 | MDM, Profiles & Supervision |
 | 15 | Persistence Mechanisms & Auto-Runs |
-| 16 | Privilege Escalation — File & Directory Permissions |
+| 16 | Privilege Escalation — File & Directory Permissions (including ACL-aware writability and running root processes whose binary another account can modify) |
 | 17 | Dylib Hijacking & Code Injection (including Electron fuses and system-wide library validation) |
 | 18 | Credential Exposure & Secret Leaks (including root and other users' shell/database histories) |
 | 19 | Screen Lock & Physical Access |
@@ -301,7 +301,7 @@ Identical `PASS`/`FAIL`/`WARN`/`INFO` status semantics, `Critical`/`High`/`Mediu
 | 23 | Browser & Application Hardening |
 | 24 | Ransomware Resilience & Recovery |
 | 25 | Third-Party Software & Package Inventory |
-| 26 | System Services & Daemon Exposure (including third-party services listening on the network) |
+| 26 | System Services & Daemon Exposure (process inventory, launchd services, network connections, third-party services listening on the network) |
 | 27 | Kernel & Boot Security |
 | 28 | Virtualization & Container Escape Surface (including exposed container engine sockets and the unauthenticated Docker TCP API) |
 | 29 | Data Loss Prevention & Sensitive Data |

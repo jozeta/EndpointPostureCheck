@@ -9739,7 +9739,8 @@ footer.pc-foot { text-align: center; padding: var(--lg-space-s) 0 var(--lg-space
 .pc-inv-table td.pc-num { text-align: right; font-variant-numeric: tabular-nums; }
 .pc-inv-table td.pc-path { font-family: var(--lg-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace); font-size: 11.5px; }
 .pc-inv-table td.pc-inv-wrap { white-space: normal; overflow: visible; }
-.pc-inv-table .lg-chip { font-size: 10.5px; margin: 0 3px 2px 0; }
+.pc-inv-table td.pc-inv-tags { white-space: nowrap; overflow: visible; max-width: none; }
+.pc-inv-table .lg-chip { font-size: 10.5px; margin-right: 3px; }
 .pc-inv-ref { font: inherit; color: var(--lg-accent); background: none; border: 0; padding: 0; cursor: pointer; text-decoration: underline; }
 .pc-inv-ref + .pc-inv-ref::before { content: ", "; color: var(--lg-muted); text-decoration: none; display: inline-block; white-space: pre; }
 .pc-inv-row { cursor: pointer; }
@@ -10064,7 +10065,7 @@ footer.pc-foot { text-align: center; padding: var(--lg-space-s) 0 var(--lg-space
     if (c.type === 'num') td.className = 'pc-num';
     if (c.type === 'path') td.className = 'pc-path';
     if (c.type === 'flags') {
-      td.className = 'pc-inv-wrap';
+      td.className = 'pc-inv-tags';
       splitList(v).forEach(function (f) { var tone = flagTone(f); td.appendChild(el('span', 'lg-chip lg-plain' + (tone ? ' lg-' + tone : ''), flagText(f))); });
       return td;
     }
@@ -11116,6 +11117,14 @@ $basePath = if ([string]::IsNullOrWhiteSpace($ReportPath)) { (Get-Location).Prov
 $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
 $defaultHtmlName = "EndpointPostureCheck_${Script:ComputerName}_${timestamp}.html"
 $defaultJsonName = "EndpointPostureCheck_${Script:ComputerName}_${timestamp}.json"
+
+# A path that does not exist yet and has no .htm/.html extension is a folder to create, as in
+# the macOS edition (-ReportPath C:\Reports\run once wrote the dashboard to a file named "run").
+if (-not [string]::IsNullOrWhiteSpace($ReportPath) -and -not (Test-Path -LiteralPath $ReportPath) -and
+    [System.IO.Path]::GetExtension($ReportPath) -notmatch '^\.html?$') {
+    New-Item -Path $ReportPath -ItemType Directory -Force | Out-Null
+    $basePath = $ReportPath
+}
 
 if (Test-Path -LiteralPath $basePath -PathType Container) {
     $htmlOutputPath = Join-Path -Path $basePath -ChildPath $defaultHtmlName

@@ -1,5 +1,5 @@
 #!/usr/bin/env zsh
-# EndpointPostureCheck for macOS — built 2026-11-10 20:46:30 from src/*.zsh. Do not edit directly.
+# EndpointPostureCheck for macOS — built 2026-11-10 20:57:12 from src/*.zsh. Do not edit directly.
 
 # ---- 00-header.zsh ----
 #
@@ -2368,6 +2368,7 @@ check_firewall_per_app_exceptions() {
         --details "$joined" \
         --recommended 'N/A' --cis-macos 'N/A' --mscp 'N/A' \
         --recommendation 'Informational only. Review the per-app exception list periodically for unrecognized or stale entries.'
+    _inv_table_alf
 }
 
 # Baseline entries every stock macOS /etc/hosts ships with — anything
@@ -6361,6 +6362,7 @@ check_listening_ports_inventory() {
         --recommended 'N/A' \
         --cis 'CIS 12.4' --nist 'CA-9' --iso27001 'A.8.20' --nis2 'Art.21(2)(d)' --cis-macos 'N/A' --mscp 'N/A' \
         --recommendation 'Informational only.'
+    _inv_table_connections
 }
 
 check_nonapple_running_launchd_services() {
@@ -6392,6 +6394,7 @@ check_nonapple_running_launchd_services() {
         --status INFO --severity Informational --current "$count non-Apple running service(s)" --details "$joined" \
         --recommended 'N/A' --cis-macos 'N/A' --mscp 'N/A' \
         --recommendation 'Informational only.'
+    _inv_table_services
 }
 
 # --- CIS Apple macOS 26 Tahoe v1.0.0 sections 4.1-4.3 ---
@@ -7705,6 +7708,563 @@ check_legacy_vnc_password() {
     fi
 }
 
+# ---- 43-inventories.zsh ----
+#
+# System inventories shown as dashboard tables (processes, launchd services, network
+# connections, network exposure, application firewall, pf rules, network filters) and the
+# findings derived from them. Everything is collected once per run by _inv_snapshot.
+# Values from ps/lsof/plists are data: never used in arithmetic without a digits-only check.
+
+typeset -g INV_SNAPSHOT_DONE=0
+typeset -ga PS_PIDS=()
+typeset -gA PS_PPID=() PS_USER=() PS_CPU=() PS_MEM=() PS_RSS=() PS_ETIME=() PS_PATH=() PS_ARGS=()
+typeset -ga SOCK_PROTO=() SOCK_LOCAL=() SOCK_REMOTE=() SOCK_STATE=() SOCK_PID=() SOCK_CMD=() SOCK_USER=()
+typeset -gA PID_LISTEN=() PID_CONN=() PID_LABEL=() SIG_CACHE=()
+typeset -ga ALF_PATHS=()
+typeset -gA ALF_STATE=()
+typeset -g ALF_GLOBAL="" ALF_BLOCKALL="" ALF_SIGNED_BUILTIN="" ALF_SIGNED_DOWNLOADED="" ALF_STEALTH=""
+
+# Programs that run whatever code they are handed: a firewall exception for one is an
+# exception for every script it runs.
+typeset -ga INV_INTERPRETERS
+INV_INTERPRETERS=(python python2 python3 ruby perl node deno bun osascript bash zsh sh dash ksh tcsh csh nc ncat
+    socat java php lua tclsh expect)
+
+_inv_is_loopback() {
+    [[ "$1" == (127.*|\[::1\]*|localhost*|\[::ffff:127.*) ]]
+}
+
+# Sealed system volume locations: Apple-signed by construction, never codesign'd one by one.
+_inv_is_system_path() {
+    [[ "$1" == (/System/*|/usr/*|/bin/*|/sbin/*|/Library/Apple/*) && "$1" != /usr/local/* ]]
+}
+
+# Code signature summary for a path, cached. REPLY = apple | team XXXX | ad-hoc | unsigned | signed | missing
+_inv_signer() {
+    local p="$1"
+    if [[ -n "${SIG_CACHE[$p]+x}" ]]; then REPLY="${SIG_CACHE[$p]}"; return; fi
+    if [[ "$p" != /* ]]; then REPLY=""
+    elif [[ ! -e "$p" ]]; then REPLY="missing"
+    elif _inv_is_system_path "$p"; then REPLY="apple"
+    else REPLY=$(_code_signer "$p")
+    fi
+    SIG_CACHE[$p]="$REPLY"
+}
+
+# _redact_secrets without a subshell (called for every process command line).
+_inv_redact() {
+    setopt localoptions extendedglob
+    local line="$1"
+    REPLY="${line//(#ib)(token|secret|password|passwd|bearer|api[_-]#key)([\"' ]#[=: ][\"' ]#)[^\"' &|;]##/${match[1]}${match[2]}[REDACTED]}"
+    (( ${#REPLY} > 400 )) && REPLY="${REPLY[1,400]}..."
+    return 0
+}
+
+# The innermost .app bundle that contains a path ("" when none).
+_inv_app_bundle() {
+    local p="$1"
+    while [[ "$p" == */* && "$p" != / ]]; do
+        [[ "$p" == *.app ]] && { REPLY="$p"; return; }
+        p="${p:h}"
+    done
+    REPLY=""
+}
+
+_inv_collect_processes() {
+    local line=""
+    run_root ps -axww -o pid= -o ppid= -o user= -o %cpu= -o %mem= -o rss= -o etime= -o comm=
+    for line in "${(@f)ROOT_CMD_OUTPUT}"; do
+        [[ "$line" =~ '^ *([0-9]+) +([0-9]+) +([^ ]+) +([0-9.]+) +([0-9.]+) +([0-9]+) +([^ ]+) +(.*)$' ]] || continue
+        local pid="${match[1]}"
+        PS_PIDS+=("$pid")
+        PS_PPID[$pid]="${match[2]}"; PS_USER[$pid]="${match[3]}"; PS_CPU[$pid]="${match[4]}"
+        PS_MEM[$pid]="${match[5]}"; PS_RSS[$pid]="${match[6]}"; PS_ETIME[$pid]="${match[7]}"; PS_PATH[$pid]="${match[8]}"
+    done
+    run_root ps -axww -o pid= -o args=
+    for line in "${(@f)ROOT_CMD_OUTPUT}"; do
+        [[ "$line" =~ '^ *([0-9]+) (.*)$' ]] || continue
+        [[ -n "${PS_PATH[${match[1]}]+x}" ]] && PS_ARGS[${match[1]}]="${match[2]}"
+    done
+}
+
+_inv_collect_sockets() {
+    local line="" pid="" cmd="" user="" proto="" name="" state="" key=""
+    local -A seen
+    run_root lsof +c 0 -nP -iTCP -iUDP -FpcLPnT
+    _inv_flush_socket() {
+        [[ -z "$name" || "$pid" != <-> ]] && return
+        local local_addr="${name%%->*}" remote=""
+        [[ "$name" == *'->'* ]] && remote="${name#*->}"
+        [[ "$proto" == UDP && -z "$state" ]] && state=$([[ -n "$remote" ]] && print CONNECTED || print LISTEN)
+        key="$pid $proto $name $state"
+        [[ -n "${seen[$key]:-}" ]] && return
+        seen[$key]=1
+        SOCK_PROTO+=("$proto"); SOCK_LOCAL+=("$local_addr"); SOCK_REMOTE+=("$remote"); SOCK_STATE+=("$state")
+        SOCK_PID+=("$pid"); SOCK_CMD+=("$cmd"); SOCK_USER+=("$user")
+        if [[ "$state" == LISTEN ]]; then
+            [[ ", ${PID_LISTEN[$pid]:-}, " == *", $proto $local_addr, "* ]] || PID_LISTEN[$pid]+="${PID_LISTEN[$pid]:+, }$proto $local_addr"
+        else
+            PID_CONN[$pid]=$(( ${PID_CONN[$pid]:-0} + 1 ))
+        fi
+    }
+    for line in "${(@f)ROOT_CMD_OUTPUT}"; do
+        case "$line" in
+            p*) _inv_flush_socket; name=""; state=""; proto=""; pid="${line#p}" ;;
+            c*) cmd="${line#c}" ;;
+            L*) user="${line#L}" ;;
+            f*) _inv_flush_socket; name=""; state=""; proto="" ;;
+            P*) proto="${line#P}" ;;
+            n*) name="${line#n}" ;;
+            TST=*) state="${line#TST=}" ;;
+        esac
+    done
+    _inv_flush_socket
+    unfunction _inv_flush_socket
+}
+
+_inv_collect_launchd() {
+    local line=""
+    local -a w
+    run_root launchctl list
+    for line in "${(@f)ROOT_CMD_OUTPUT}"; do
+        w=(${=line})
+        (( ${#w[@]} >= 3 )) || continue
+        [[ "${w[1]}" == <-> ]] && PID_LABEL[${w[1]}]="${w[3]}"
+    done
+}
+
+_inv_collect_alf() {
+    local line="" app=""
+    run_root "$SOCKETFILTERFW" --getglobalstate
+    [[ "$ROOT_CMD_OUTPUT" =~ 'State = ([0-9])' ]] && ALF_GLOBAL="${match[1]}"
+    run_root "$SOCKETFILTERFW" --getblockall
+    [[ "$ROOT_CMD_OUTPUT" == *"set to enabled"* || "$ROOT_CMD_OUTPUT" == *"is enabled"* ]] && ALF_BLOCKALL=on || ALF_BLOCKALL=off
+    run_root "$SOCKETFILTERFW" --getstealthmode
+    [[ "$ROOT_CMD_OUTPUT" == *" is on"* || "$ROOT_CMD_OUTPUT" == *"enabled"* ]] && ALF_STEALTH=on || ALF_STEALTH=off
+    run_root "$SOCKETFILTERFW" --getallowsigned
+    [[ "$ROOT_CMD_OUTPUT" == *"built-in signed software ENABLED"* ]] && ALF_SIGNED_BUILTIN=on || ALF_SIGNED_BUILTIN=off
+    [[ "$ROOT_CMD_OUTPUT" == *"downloaded signed software ENABLED"* ]] && ALF_SIGNED_DOWNLOADED=on || ALF_SIGNED_DOWNLOADED=off
+    run_root "$SOCKETFILTERFW" --listapps
+    # "N : <path>" then an indented "(Allow|Block incoming connections)" line (verified live).
+    for line in "${(@f)ROOT_CMD_OUTPUT}"; do
+        if [[ "$line" =~ '^ *[0-9]+ : (.*[^ ]) *$' ]]; then
+            app="${match[1]}"; ALF_PATHS+=("$app"); ALF_STATE[$app]="?"
+        elif [[ -n "$app" && "$line" == *'(Allow incoming'* ]]; then ALF_STATE[$app]=Allow; app=""
+        elif [[ -n "$app" && "$line" == *'(Block incoming'* ]]; then ALF_STATE[$app]=Block; app=""
+        fi
+    done
+}
+
+_inv_snapshot() {
+    (( INV_SNAPSHOT_DONE )) && return 0
+    INV_SNAPSHOT_DONE=1
+    _inv_collect_processes
+    _inv_collect_sockets
+    _inv_collect_launchd
+    _inv_collect_alf
+}
+
+# The application firewall's decision for incoming connections to a binary. REPLY = text.
+_inv_alf_decision() {
+    local p="$1" probe=""
+    probe="$p"
+    if [[ "$ALF_GLOBAL" == 0 ]]; then REPLY="firewall off: reachable"; return; fi
+    if [[ -z "$ALF_GLOBAL" ]]; then REPLY="firewall state unknown"; return; fi
+    if [[ "$ALF_BLOCKALL" == on || "$ALF_GLOBAL" == 2 ]]; then REPLY="blocked (block all incoming)"; return; fi
+    while [[ "$probe" == /* && "$probe" != / ]]; do
+        if [[ -n "${ALF_STATE[$probe]+x}" ]]; then
+            [[ "${ALF_STATE[$probe]}" == Block ]] && REPLY="blocked (app rule)" || REPLY="allowed (app rule)"
+            return
+        fi
+        probe="${probe:h}"
+    done
+    _inv_signer "$p"
+    case "$REPLY" in
+        apple) [[ "$ALF_SIGNED_BUILTIN" == on ]] && REPLY="allowed (built-in signed software)" || REPLY="prompt / blocked (not in list)" ;;
+        team*|signed) [[ "$ALF_SIGNED_DOWNLOADED" == on ]] && REPLY="allowed (downloaded signed software)" || REPLY="prompt / blocked (not in list)" ;;
+        *) REPLY="prompt / blocked (unsigned, not in list)" ;;
+    esac
+}
+
+# Writable by an account other than the file's owner (group/other bits, or an ACL). Used for
+# firewall rules: a drag-installed app owned by its user is normal; one others can swap is not.
+_inv_writable_by_others() {
+    local p="$1" om="" target=""
+    [[ "$p" == /* && -e "$p" ]] || return 1
+    _inv_is_system_path "$p" && return 1
+    for target in "$p" "${p:h}"; do
+        om=$(_owner_mode "$target") || continue
+        _mode_group_or_other_writable "${om##* }" && return 0
+        _acl_write_grantees "$target" "${om%% *}" >/dev/null && return 0
+    done
+    return 1
+}
+
+_inv_bin_writable() {
+    local p="$1"
+    [[ "$p" == /* && -e "$p" ]] || return 1
+    _inv_is_system_path "$p" && return 1
+    _writable_by_non_root "$p" || _writable_by_non_root "${p:h}"
+}
+
+# ---------------------------------------------------------------- processes
+
+check_process_inventory() {
+    write_section_banner 'System Services & Daemon Exposure - Process Inventory'
+    _inv_snapshot
+    inventory_define processes 'Processes' \
+        'Every process visible to the audit (all of them when run with sudo). CPU is the recent average from ps; command lines are redacted by pattern, review them before sharing the report.' \
+        'PID:num' 'Parent:ref=processes.PID' 'Name' 'User' 'CPU %:num' 'RAM MB:num' 'Running for' 'Binary:path' \
+        'Signature' 'Listening' 'Connections:num' 'launchd label' 'Flags:flags' 'Command line'
+    local pid="" p="" name="" mb="" flags="" sig="" n=0 listening=0
+    for pid in "${PS_PIDS[@]}"; do
+        p="${PS_PATH[$pid]}"; name="${p:t}"
+        mb=""; [[ "${PS_RSS[$pid]}" == <-> ]] && mb=$(( ${PS_RSS[$pid]} / 1024 ))
+        _inv_signer "$p"; sig="$REPLY"
+        flags=""
+        [[ "${PS_USER[$pid]}" == root ]] && flags+="root,"
+        [[ -n "${PID_LISTEN[$pid]:-}" ]] && { flags+="listening,"; listening=$((listening + 1)); }
+        case "$sig" in
+            unsigned) flags+="unsigned!," ;;
+            ad-hoc) flags+="ad-hoc?," ;;
+            missing) flags+="binary missing?," ;;
+            apple) flags+="apple," ;;
+        esac
+        if [[ "${PS_USER[$pid]}" == (root|_*) ]] && _inv_bin_writable "$p"; then flags+="writable binary!,"; fi
+        _inv_redact "${PS_ARGS[$pid]:-}"
+        inventory_add_row processes "$pid" "${PS_PPID[$pid]}" "$name" "${PS_USER[$pid]}" "${PS_CPU[$pid]}" "$mb" \
+            "${PS_ETIME[$pid]}" "$p" "$sig" "${PID_LISTEN[$pid]:-}" "${PID_CONN[$pid]:-}" "${PID_LABEL[$pid]:-}" "${flags%,}" "$REPLY"
+        n=$((n + 1))
+    done
+    add_audit_result --category 'System Services & Daemon Exposure' --control 'Process Inventory' \
+        --status INFO --severity Informational --current "$n process(es), $listening listening on the network; full table in Inventory > Processes" \
+        --recommended 'N/A' --cis 'CIS 2.1' --nist 'CM-8' --iso27001 'A.5.9' --nis2 'Art.21(2)(d)' --cis-macos 'N/A' --mscp 'N/A' \
+        --recommendation 'Informational only. Filter the table by "unsigned", "writable binary" or "listening" to review what runs on this Mac.'
+}
+
+check_privileged_process_binary_permissions() {
+    _inv_snapshot
+    local pid="" p="" reason=""
+    local -a hits
+    local -A done_paths
+    for pid in "${PS_PIDS[@]}"; do
+        [[ "${PS_USER[$pid]}" == (root|_*) ]] || continue
+        p="${PS_PATH[$pid]}"
+        [[ -n "${done_paths[$p]:-}" ]] && continue
+        done_paths[$p]=1
+        _inv_bin_writable "$p" || continue
+        reason=$(_tamper_reason "$p" root) || reason="writable by a non-root account"
+        hits+=("${p:t} (PID $pid, runs as ${PS_USER[$pid]}): $reason")
+    done
+    local -a fw
+    fw=(--recommended 'No process running as root or a system account runs a binary that another account can modify'
+        --cis 'CIS 3.3' --nist 'AC-6, CM-5' --mitre 'T1574.010 (Services File Permissions Weakness), T1543.004 (Launch Daemon)'
+        --iso27001 'A.8.2' --nis2 'Art.21(2)(i)' --cis-macos 'N/A' --mscp 'N/A')
+    if (( ${#hits[@]} )); then
+        add_audit_result --category 'Privilege Escalation: File & Directory Permissions' --control 'Privileged Processes Running Writable Binaries' \
+            --status FAIL --severity Critical --current "${#hits[@]} privileged process binar(y/ies) modifiable by another account" \
+            --details "${(F)hits}" "${fw[@]}" \
+            --recommendation 'Whoever can replace these files gets their code run as root on the next start. Make each binary and its folder root:wheel and not group/other-writable (sudo chown root:wheel <path>; sudo chmod go-w <path>; remove ACLs with sudo chmod -N), or reinstall the software from its vendor package.'
+    else
+        add_audit_result --category 'Privilege Escalation: File & Directory Permissions' --control 'Privileged Processes Running Writable Binaries' \
+            --status PASS --severity Critical --current 'No running root or system-account process uses a binary another account can modify' "${fw[@]}" \
+            --recommendation 'No action required.'
+    fi
+}
+
+# ---------------------------------------------------------------- launchd services
+
+_inv_table_services() {
+    _inv_snapshot
+    inventory_define services 'launchd services' \
+        'Launch daemons and agents: system (Apple, sealed volume), third-party system-wide, and every user'"'"'s agents. Status comes from launchctl in the system domain, so per-user agents show as not loaded.' \
+        'Label' 'Kind' 'Status' 'PID:ref=processes.PID' 'Program:path' 'Signature' 'Plist:path' 'Flags:flags'
+    local -A label_pid
+    local pid="" plist="" label="" kind="" dir="" owner="" program="" sig="" flags="" svc_status="" reason="" entry="" user="" home=""
+    for pid in "${(@k)PID_LABEL}"; do label_pid[${PID_LABEL[$pid]}]="$pid"; done
+    run_root launchctl list
+    local -A loaded
+    local line=""; local -a w
+    for line in "${(@f)ROOT_CMD_OUTPUT}"; do w=(${=line}); (( ${#w[@]} >= 3 )) && loaded[${w[3]}]=1; done
+    _inv_add_service_dir() {
+        local d="$1" k="$2" expect="$3" f=""
+        [[ -d "$d" ]] || return 0
+        for f in "$d"/*.plist(N); do
+            label="${f:t:r}"
+            svc_status="not loaded"; [[ -n "${loaded[$label]:-}" ]] && svc_status="loaded"; [[ -n "${label_pid[$label]:-}" ]] && svc_status="running"
+            program=""; sig=""; flags=""
+            if [[ "$k" == apple* ]]; then
+                sig="apple"; flags="apple"
+            else
+                _launchd_resolve_target "$f"
+                program="${REPLY_PROGRAM:-}"
+                if [[ -n "$program" ]]; then _inv_signer "$program"; sig="$REPLY"; fi
+                case "$sig" in unsigned) flags+="unsigned!," ;; ad-hoc) flags+="ad-hoc?," ;; missing) flags+="program missing?," ;; esac
+                reason=$(_tamper_reason "$f" "$expect") && flags+="plist writable!,"
+                [[ -n "$program" ]] && reason=$(_tamper_reason "$program" "$expect") && flags+="program writable!,"
+                [[ "$REPLY_KIND" == (script|inline) ]] && flags+="script,"
+                flags="${flags%,}"
+            fi
+            inventory_add_row services "$label" "$k" "$svc_status" "${label_pid[$label]:-}" "$program" "$sig" "$f" "$flags"
+        done
+    }
+    _inv_add_service_dir /Library/LaunchDaemons 'daemon (third-party)' root
+    _inv_add_service_dir /Library/LaunchAgents 'agent (third-party)' root
+    for entry in "${(@f)$(_local_user_homes)}"; do
+        [[ -z "$entry" ]] && continue
+        user="${entry%%$'\t'*}"; home="${entry#*$'\t'}"
+        _inv_add_service_dir "$home/Library/LaunchAgents" "user agent ($user)" "$user"
+    done
+    _inv_add_service_dir /System/Library/LaunchDaemons 'apple daemon' root
+    _inv_add_service_dir /System/Library/LaunchAgents 'apple agent' root
+    unfunction _inv_add_service_dir
+}
+
+# ---------------------------------------------------------------- network
+
+_inv_table_connections() {
+    _inv_snapshot
+    inventory_define connections 'Network connections' \
+        'TCP and UDP sockets from lsof: listeners and connections, with the owning process.' \
+        'Protocol' 'Local address' 'Remote address' 'State' 'PID:ref=processes.PID' 'Process' 'User' 'Flags:flags'
+    local i="" flags=""
+    for (( i = 1; i <= ${#SOCK_PID[@]}; i++ )); do
+        flags=""
+        if [[ "${SOCK_STATE[$i]}" == LISTEN ]]; then
+            _inv_is_loopback "${SOCK_LOCAL[$i]}" && flags="loopback" || flags="network listener?"
+        fi
+        inventory_add_row connections "${SOCK_PROTO[$i]}" "${SOCK_LOCAL[$i]}" "${SOCK_REMOTE[$i]}" "${SOCK_STATE[$i]}" \
+            "${SOCK_PID[$i]}" "${SOCK_CMD[$i]}" "${SOCK_USER[$i]}" "$flags"
+    done
+}
+
+check_network_exposure_map() {
+    write_section_banner 'Network Firewall & Packet Filtering - Network Exposure Map'
+    _inv_snapshot
+    inventory_define exposure 'Network exposure' \
+        'Every listener on a non-loopback address, the binary behind it, its signature, and what the application firewall does with incoming connections to it.' \
+        'Protocol' 'Listening on' 'PID:ref=processes.PID' 'Process' 'Runs as' 'Binary:path' 'Signature' 'Firewall decision' 'Flags:flags'
+    local i="" pid="" p="" flags="" decision="" reachable=0 total=0
+    local -a risky
+    for (( i = 1; i <= ${#SOCK_PID[@]}; i++ )); do
+        [[ "${SOCK_STATE[$i]}" == LISTEN ]] || continue
+        _inv_is_loopback "${SOCK_LOCAL[$i]}" && continue
+        pid="${SOCK_PID[$i]}"; p="${PS_PATH[$pid]:-}"
+        total=$((total + 1))
+        _inv_alf_decision "$p"; decision="$REPLY"
+        _inv_signer "$p"
+        flags=""
+        if [[ "$decision" == (allowed*|firewall\ off*) ]]; then
+            flags="reachable?"; reachable=$((reachable + 1))
+            [[ "$REPLY" == (unsigned|ad-hoc) ]] && { flags="reachable!,$REPLY!"; risky+=("${SOCK_CMD[$i]} on ${SOCK_LOCAL[$i]} ($REPLY, $decision)"); }
+            [[ "${PS_USER[$pid]:-}" == root ]] && flags+=",root"
+        else
+            flags="filtered"
+        fi
+        inventory_add_row exposure "${SOCK_PROTO[$i]}" "${SOCK_LOCAL[$i]}" "$pid" "${SOCK_CMD[$i]}" "${PS_USER[$pid]:-${SOCK_USER[$i]}}" \
+            "$p" "$REPLY" "$decision" "$flags"
+    done
+    local -a fw
+    fw=(--recommended 'Only signed, intended services accept connections from the network'
+        --cis 'CIS 4.4, 12.4' --nist 'SC-7, CM-7' --mitre 'T1133 (External Remote Services), T1571 (Non-Standard Port)'
+        --iso27001 'A.8.20' --nis2 'Art.21(2)(e)' --cis-macos 'N/A' --mscp 'N/A')
+    if (( ${#risky[@]} )); then
+        add_audit_result --category 'Network Firewall & Packet Filtering' --control 'Network Exposure Map' \
+            --status WARN --severity High --current "${#risky[@]} unsigned or ad-hoc signed listener(s) reachable from the network" \
+            --details "${(F)risky}" "${fw[@]}" \
+            --recommendation 'An unsigned program that accepts connections from the network has no verified origin. Stop it, bind it to 127.0.0.1, or block it: System Settings > Network > Firewall > Options. See Inventory > Network exposure for every listener.'
+    else
+        add_audit_result --category 'Network Firewall & Packet Filtering' --control 'Network Exposure Map' \
+            --status INFO --severity Informational --current "$total network listener(s), $reachable admitted by the application firewall; table in Inventory > Network exposure" \
+            "${fw[@]}" --recommendation 'Informational only. Review the listeners the firewall admits.'
+    fi
+}
+
+# ---------------------------------------------------------------- application firewall
+
+_inv_table_alf() {
+    _inv_snapshot
+    inventory_define alf 'Application firewall' \
+        "Per-app rules from socketfilterfw (global: state ${ALF_GLOBAL:-?}, block all $ALF_BLOCKALL, stealth $ALF_STEALTH, auto-allow built-in signed $ALF_SIGNED_BUILTIN, downloaded signed $ALF_SIGNED_DOWNLOADED)." \
+        'Application' 'Incoming' 'Path:path' 'Signature' 'Running PIDs:ref=processes.PID' 'Listening' 'Flags:flags'
+    local app="" sig="" flags="" pid="" pids="" listen="" base=""
+    for app in "${ALF_PATHS[@]}"; do
+        _inv_signer "$app"; sig="$REPLY"
+        flags=""; pids=""; listen=""
+        base="${app:t}"; base="${base%.app}"
+        case "$sig" in unsigned) flags+="unsigned!," ;; ad-hoc) flags+="ad-hoc?," ;; missing) flags+="missing?," ;; esac
+        (( ${INV_INTERPRETERS[(Ie)${app:t}]} )) && [[ "${ALF_STATE[$app]}" == Allow ]] && flags+="interpreter!,"
+        [[ "${ALF_STATE[$app]}" == Allow ]] && _inv_writable_by_others "$app" && flags+="writable by others?,"
+        for pid in "${PS_PIDS[@]}"; do
+            [[ "${PS_PATH[$pid]}" == "$app" || "${PS_PATH[$pid]}" == "$app"/* ]] || continue
+            pids+="${pids:+, }$pid"
+            [[ -n "${PID_LISTEN[$pid]:-}" ]] && listen+="${listen:+, }${PID_LISTEN[$pid]}"
+        done
+        inventory_add_row alf "$base" "${ALF_STATE[$app]}" "$app" "$sig" "$pids" "$listen" "${flags%,}"
+    done
+}
+
+check_application_firewall_app_rules() {
+    _inv_snapshot
+    local app="" sig=""
+    local -a bad weak
+    for app in "${ALF_PATHS[@]}"; do
+        [[ "${ALF_STATE[$app]}" == Allow ]] || continue
+        _inv_signer "$app"; sig="$REPLY"
+        if (( ${INV_INTERPRETERS[(Ie)${app:t}]} )); then bad+=("$app: interpreter allowed incoming, so every script it runs may accept connections")
+        elif [[ "$sig" == unsigned ]]; then bad+=("$app: unsigned program allowed incoming")
+        elif [[ "$sig" == missing ]]; then weak+=("$app: no longer on disk (stale rule)")
+        elif [[ "$sig" == ad-hoc ]]; then weak+=("$app: ad-hoc signed (no developer identity)")
+        fi
+        if [[ "$sig" != missing ]] && _inv_writable_by_others "$app"; then weak+=("$app: another account can replace it (group/other write or ACL)")
+        fi
+    done
+    local -a fw all
+    all=("${bad[@]}" "${weak[@]}")
+    fw=(--recommended 'Firewall exceptions only for signed, intended apps outside user-writable locations; none for interpreters'
+        --cis 'CIS 4.4' --nist 'SC-7, CM-7' --mitre 'T1562.004 (Disable or Modify System Firewall)'
+        --iso27001 'A.8.20' --nis2 'Art.21(2)(d)' --cis-macos 'N/A' --mscp 'N/A')
+    if (( ${#ALF_PATHS[@]} == 0 )) && [[ -z "$ALF_GLOBAL" ]]; then
+        add_audit_result --category 'Network Firewall & Packet Filtering' --control 'Application Firewall Risky App Rules' \
+            --status WARN --severity Low --current 'socketfilterfw gave no usable output' "${fw[@]}" \
+            --recommendation 'Verify manually with "/usr/libexec/ApplicationFirewall/socketfilterfw --listapps".'
+    elif (( ${#bad[@]} )); then
+        add_audit_result --category 'Network Firewall & Packet Filtering' --control 'Application Firewall Risky App Rules' \
+            --status FAIL --severity Medium --current "${#all[@]} risky app rule(s)" --details "${(F)all}" "${fw[@]}" \
+            --recommendation 'Remove the rule (System Settings > Network > Firewall > Options, select the app, minus) or set it to Block incoming connections. Run development servers on 127.0.0.1 instead of allowing an interpreter.'
+    elif (( ${#weak[@]} )); then
+        add_audit_result --category 'Network Firewall & Packet Filtering' --control 'Application Firewall Risky App Rules' \
+            --status WARN --severity Low --current "${#weak[@]} app rule(s) worth a look" --details "${(F)weak}" "${fw[@]}" \
+            --recommendation 'Remove stale rules for apps that are gone, and prefer apps installed in /Applications by an administrator.'
+    else
+        add_audit_result --category 'Network Firewall & Packet Filtering' --control 'Application Firewall Risky App Rules' \
+            --status PASS --severity Medium --current "${#ALF_PATHS[@]} app rule(s), none for interpreters, unsigned or stale apps" "${fw[@]}" \
+            --recommendation 'No action required.'
+    fi
+}
+
+# ---------------------------------------------------------------- pf
+
+# Stock /etc/pf.conf and /etc/pf.anchors/com.apple statements (macOS 15/26, comments removed).
+typeset -ga PF_STOCK_CONF PF_STOCK_APPLE_ANCHOR
+PF_STOCK_CONF=('scrub-anchor "com.apple/*"' 'nat-anchor "com.apple/*"' 'rdr-anchor "com.apple/*"' 'dummynet-anchor "com.apple/*"'
+    'anchor "com.apple/*"' 'load anchor "com.apple" from "/etc/pf.anchors/com.apple"')
+PF_STOCK_APPLE_ANCHOR=('anchor "200.AirDrop/*"' 'anchor "250.ApplicationFirewall/*"')
+
+_pf_nonstock_lines() {   # _pf_nonstock_lines <file> <stock array name>
+    local f="$1" line="" t=""
+    local -a stock
+    stock=("${(@P)2}")
+    [[ -r "$f" ]] || return 0
+    for line in "${(@f)$(<"$f")}"; do
+        t="${line#"${line%%[![:space:]]*}"}"; t="${t%"${t##*[![:space:]]}"}"
+        [[ -z "$t" || "$t" == \#* ]] && continue
+        (( ${stock[(Ie)$t]} )) || print -r -- "$f: $t"
+    done
+}
+
+check_packet_filter_rules() {
+    write_section_banner 'Network Firewall & Packet Filtering - Packet Filter (pf)'
+    local pf_status="unknown" line="" anchor="" t="" flags="" action="" dir="" n=0
+    local -a stack risky extra
+    run_root pfctl -s info
+    [[ "$ROOT_CMD_OUTPUT" == *"Status: Enabled"* ]] && pf_status=enabled
+    [[ "$ROOT_CMD_OUTPUT" == *"Status: Disabled"* ]] && pf_status=disabled
+    inventory_define pf 'pf rules' \
+        "Packet filter rules from pfctl, including anchors (pf is $pf_status). pf is off by default on macOS; the application firewall is separate." \
+        '#:num' 'Anchor' 'Action' 'Direction' 'Rule' 'Flags:flags'
+    if [[ "$pf_status" != unknown ]]; then
+        run_root pfctl -a '*' -s rules
+        local rules="$ROOT_CMD_OUTPUT"
+        run_root pfctl -a '*' -s nat
+        rules+=$'\n'"$ROOT_CMD_OUTPUT"
+        for line in "${(@f)rules}"; do
+            t="${line#"${line%%[![:space:]]*}"}"
+            [[ -z "$t" || "$t" == (No\ ALTQ*|ALTQ*|pfctl:*) ]] && continue
+            if [[ "$t" == '}' ]]; then stack=("${(@)stack[1,-2]}"); continue; fi
+            action="${t%% *}"; dir=""
+            [[ " $t " == *' in '* ]] && dir=in; [[ " $t " == *' out '* ]] && dir=out
+            anchor="${(j:/:)stack}"
+            flags=""
+            if [[ "$action" == pass && "$dir" != out && "$t" != *' port '* && ( "$t" == *'from any to any'* || "$t" == 'pass in all'* || "$t" == 'pass all'* ) && "$anchor" != com.apple* ]]; then
+                flags="pass any!"; risky+=("${anchor:+$anchor: }$t")
+            fi
+            [[ "$action" == rdr && "$anchor" != com.apple* ]] && { flags="port redirect?"; risky+=("${anchor:+$anchor: }$t"); }
+            n=$((n + 1))
+            inventory_add_row pf "$n" "${anchor:-main}" "$action" "$dir" "$t" "$flags"
+            if [[ "$t" =~ '^anchor "([^"]+)".*\{$' ]]; then stack+=("${match[1]}"); fi
+        done
+    fi
+    extra=("${(@f)$(_pf_nonstock_lines /etc/pf.conf PF_STOCK_CONF; _pf_nonstock_lines /etc/pf.anchors/com.apple PF_STOCK_APPLE_ANCHOR)}")
+    extra=(${extra:#})
+    local f=""
+    for f in /etc/pf.anchors/*(N); do [[ "${f:t}" == com.apple ]] || extra+=("$f: extra anchor file"); done
+    local -a fw all
+    all=("${risky[@]}" "${extra[@]}")
+    fw=(--recommended 'pf either off (default) or only rules that are understood and documented; no pass-any or port redirects outside Apple anchors'
+        --cis 'CIS 4.4' --nist 'SC-7' --mitre 'T1562.004 (Disable or Modify System Firewall)'
+        --iso27001 'A.8.20' --nis2 'Art.21(2)(d)' --cis-macos 'N/A' --mscp 'N/A')
+    if [[ "$pf_status" == unknown ]]; then
+        add_audit_result --category 'Network Firewall & Packet Filtering' --control 'Packet Filter (pf) Rules' \
+            --status WARN --severity Low --current "pfctl could not be read: ${ROOT_CMD_OUTPUT[1,120]}" --details "${(F)extra}" "${fw[@]}" \
+            --recommendation 'Run the audit with sudo; pfctl needs root to read the rules.'
+    elif (( ${#risky[@]} )); then
+        add_audit_result --category 'Network Firewall & Packet Filtering' --control 'Packet Filter (pf) Rules' \
+            --status WARN --severity Medium --current "pf $pf_status, ${#risky[@]} broad pass or redirect rule(s)" --details "${(F)all}" "${fw[@]}" \
+            --recommendation 'Find what loaded these rules (a VPN, Internet Sharing, a firewall app, or a LaunchDaemon running "pfctl -f"), and remove rules nobody can explain. See Inventory > pf rules.'
+    elif (( ${#extra[@]} )); then
+        add_audit_result --category 'Network Firewall & Packet Filtering' --control 'Packet Filter (pf) Rules' \
+            --status INFO --severity Informational --current "pf $pf_status, $n rule(s); configuration differs from stock" --details "${(F)extra}" "${fw[@]}" \
+            --recommendation 'Informational: confirm the extra pf configuration is intended.'
+    else
+        add_audit_result --category 'Network Firewall & Packet Filtering' --control 'Packet Filter (pf) Rules' \
+            --status INFO --severity Informational --current "pf $pf_status, $n rule(s), stock configuration" "${fw[@]}" \
+            --recommendation 'Informational only.'
+    fi
+}
+
+# ---------------------------------------------------------------- network extension filters
+
+: ${NE_PREFS_PLIST:=/Library/Preferences/com.apple.networkextension.plist}
+
+check_network_content_filters() {
+    local line="" cat="" name="" team="" state="" xml="" id=""
+    local -a filters
+    inventory_define netfilters 'Network filters' \
+        'System extensions and Network Extension content filters (firewall apps such as LuLu or Little Snitch, VPNs, EDR). The application firewall itself is an Apple filter and is listed too.' \
+        'Name / bundle' 'Kind' 'Team' 'State' 'Flags:flags'
+    run_root systemextensionsctl list
+    for line in "${(@f)ROOT_CMD_OUTPUT}"; do
+        [[ "$line" == ---\ * ]] && { cat="${${line#--- }%% *}"; continue; }
+        [[ "$line" == *'['*']'* && "$line" == *$'\t'* ]] || continue
+        local -a cols
+        cols=("${(@ps:\t:)line}")
+        [[ "${cols[3]:-}" == teamID ]] && continue
+        team="${cols[3]:-}"; name="${cols[4]:-}"; state="${line##*\[}"; state="${state%\]*}"
+        inventory_add_row netfilters "$name" "${cat#com.apple.system_extension.}" "$team" "$state" \
+            "$([[ "$cat" == *network_extension* ]] && print network)"
+        [[ "$cat" == *network_extension* && "$state" == *enabled* ]] && filters+=("$name (team $team)")
+    done
+    if [[ -r "$NE_PREFS_PLIST" ]]; then
+        # Undocumented NSKeyedArchiver file: only read as text to name the filter providers.
+        xml=$(plutil -convert xml1 -o - "$NE_PREFS_PLIST" 2>/dev/null)
+        for id in ${(u)${(M)${(f)xml}:#*<string>*.*</string>*}}; do
+            id="${${id#*<string>}%</string>*}"
+            [[ "$id" == (com.apple.ALF.ApplicationFirewall|*.lulu*|*littlesnitch*|*LittleSnitch*|*.filter*|*Filter*) ]] || continue
+            [[ "$id" =~ '^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$' ]] || continue
+            inventory_add_row netfilters "$id" 'content filter provider' '' 'configured' "$([[ "$id" == com.apple.* ]] && print apple || print third-party)"
+            [[ "$id" == com.apple.* ]] || filters+=("$id (content filter)")
+        done
+    fi
+    filters=(${(u)filters})
+    add_audit_result --category 'Network Firewall & Packet Filtering' --control 'Network Content Filters' \
+        --status INFO --severity Informational \
+        --current "$([[ ${#filters[@]} -gt 0 ]] && print "${#filters[@]} third-party network filter(s)" || print 'No third-party network filter; the Apple application firewall only')" \
+        --details "${(F)filters}" --recommended 'N/A' --cis 'CIS 4.4, 13.1' --nist 'SC-7' --iso27001 'A.8.20' --nis2 'Art.21(2)(d)' \
+        --cis-macos 'N/A' --mscp 'N/A' \
+        --recommendation 'Informational only. A third-party filter can see and block all traffic: make sure each one is software you installed on purpose. Its own rules are kept in the app and are not listed here.'
+}
+
 # ---- 90-scoring.zsh ----
 #
 # Scoring & risk engine. Direct port of Get-CompliancePosture from the
@@ -8539,7 +9099,8 @@ footer.pc-foot { text-align: center; padding: var(--lg-space-s) 0 var(--lg-space
 .pc-inv-table td.pc-num { text-align: right; font-variant-numeric: tabular-nums; }
 .pc-inv-table td.pc-path { font-family: var(--lg-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace); font-size: 11.5px; }
 .pc-inv-table td.pc-inv-wrap { white-space: normal; overflow: visible; }
-.pc-inv-table .lg-chip { font-size: 10.5px; margin: 0 3px 2px 0; }
+.pc-inv-table td.pc-inv-tags { white-space: nowrap; overflow: visible; max-width: none; }
+.pc-inv-table .lg-chip { font-size: 10.5px; margin-right: 3px; }
 .pc-inv-ref { font: inherit; color: var(--lg-accent); background: none; border: 0; padding: 0; cursor: pointer; text-decoration: underline; }
 .pc-inv-ref + .pc-inv-ref::before { content: ", "; color: var(--lg-muted); text-decoration: none; display: inline-block; white-space: pre; }
 .pc-inv-row { cursor: pointer; }
@@ -8863,7 +9424,7 @@ footer.pc-foot { text-align: center; padding: var(--lg-space-s) 0 var(--lg-space
     if (c.type === 'num') td.className = 'pc-num';
     if (c.type === 'path') td.className = 'pc-path';
     if (c.type === 'flags') {
-      td.className = 'pc-inv-wrap';
+      td.className = 'pc-inv-tags';
       splitList(v).forEach(function (f) { var tone = flagTone(f); td.appendChild(el('span', 'lg-chip lg-plain' + (tone ? ' lg-' + tone : ''), flagText(f))); });
       return td;
     }
@@ -9704,7 +10265,8 @@ AUDIT_CHECKS=(
     check_user_password_hints_absent check_smb_guest_access_disabled check_guest_home_folder_absent
     # Domain 8: Network Firewall & Packet Filtering
     check_firewall_state check_firewall_stealth_mode check_firewall_block_all_incoming check_firewall_signed_app_auto_allow
-    check_firewall_per_app_exceptions check_etc_hosts_integrity
+    check_firewall_per_app_exceptions check_application_firewall_app_rules check_packet_filter_rules
+    check_network_content_filters check_network_exposure_map check_etc_hosts_integrity
     # Domain 9: Remote Access & Sharing Services
     check_screen_sharing_state check_remote_management_state check_file_sharing_state check_remote_login_toggle check_legacy_vnc_password
     check_airplay_receiver_disabled check_printer_sharing_disabled check_remote_apple_events_disabled
@@ -9734,7 +10296,7 @@ AUDIT_CHECKS=(
     # Domain 16: Privilege Escalation: File & Directory Permissions
     check_writable_launchd_directories check_writable_path_directories check_suid_sgid_binary_audit
     check_home_folders_secure check_world_writable_applications check_world_writable_system_folder
-    check_world_writable_library_folder
+    check_world_writable_library_folder check_privileged_process_binary_permissions
     # Domain 17: Dylib Hijacking & Code Injection
     check_dyld_insert_libraries_global_env check_writable_dylib_search_paths check_hardened_runtime_spotcheck check_electron_node_fuses check_library_validation_policy
     # Domain 18: Credential Exposure & Secret Leaks
@@ -9761,7 +10323,7 @@ AUDIT_CHECKS=(
     # Domain 25: Third-Party Software & Package Inventory
     check_installed_applications_inventory check_homebrew_prefix_permissions check_homebrew_package_inventory
     # Domain 26: System Services & Daemon Exposure
-    check_listening_ports_inventory check_nonapple_running_launchd_services check_network_exposed_listeners
+    check_process_inventory check_listening_ports_inventory check_nonapple_running_launchd_services check_network_exposed_listeners
     check_bonjour_advertising_disabled check_http_server_disabled check_nfs_server_disabled
     # Domain 27: Kernel & Boot Security
     check_boot_security_policy check_authenticated_root_status check_nvram_boot_args check_thirdparty_kext_inventory
