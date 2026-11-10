@@ -11,7 +11,7 @@ The project has no tagged releases yet, so changes are grouped by date. Entries 
   - CIS policy engine: about 290 settings no other check reads (security options, user rights,
     account policies, services, Administrative Templates), one finding per area. Level 1 is
     scored: unset = WARN; a weaker value is a FAIL only where it can only come from someone
-    configuring it (a value under a Policies key, reversible password storage, a privilege
+    configuring it (a value under HKLM\SOFTWARE\Policies, reversible password storage, a privilege
     granted to a broad group), otherwise a WARN, since it may be the Windows default. Level 2 is
     listed as INFO. Only recommendation
     numbers and registry names are used, no benchmark text.

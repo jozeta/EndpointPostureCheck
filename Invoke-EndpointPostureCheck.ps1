@@ -11243,7 +11243,7 @@ function Test-PolicySourceConflict {
 # deny (all SIDs present), disabled (service disabled or not installed).
 # Unset values are "not configured" (WARN), as the macOS edition scores unset profile keys. A
 # weaker value is a FAIL only where it can only come from someone configuring it (a value under
-# a \Policies\ key, reversible password storage, a privilege granted to a broad group); other
+# HKLM\SOFTWARE\Policies, reversible password storage, a privilege granted to a broad group); other
 # differences may be Windows defaults and are a WARN. Level 2 rows are one unscored INFO finding.
 # Only recommendation numbers and registry names are used here, never benchmark text.
 $Script:CisRows = @'
@@ -11656,9 +11656,9 @@ function Get-CisRowResult {
             if (-not $exists) { return @{ State = $(if ($op -eq 'empty') { 'OK' } else { 'UNSET' }); Shown = 'not set' } }
             $v = $key.GetValue($name, $null, 'DoNotExpandEnvironmentNames')
             $shown = if ($v -is [array]) { (@($v) | Where-Object { "$_" -ne '' }) -join ',' } else { [string]$v }
-            # A value under a \Policies\ key exists only when someone configured it (BAD); values
-            # elsewhere (Lsa, LanmanServer, Winlogon ...) may be Windows defaults (SOFT).
-            $miss = if ($source -match '\\Policies\\') { 'BAD' } else { 'SOFT' }
+            # A value under HKLM\SOFTWARE\Policies exists only when Group Policy or MDM set it (BAD);
+            # values elsewhere, CurrentVersion\Policies\System included, may be Windows defaults (SOFT).
+            $miss = if ($source -match '^HKLM\\SOFTWARE\\Policies\\') { 'BAD' } else { 'SOFT' }
             return @{ State = $(if (Test-CisValueMatch $op $expected $v) { 'OK' } else { $miss }); Shown = $shown }
         }
     }
