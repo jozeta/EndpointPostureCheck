@@ -1,5 +1,5 @@
 #!/usr/bin/env zsh
-# EndpointPostureCheck for macOS — built 2026-11-11 08:34:59 from src/*.zsh. Do not edit directly.
+# EndpointPostureCheck for macOS — built 2026-11-11 09:12:16 from src/*.zsh. Do not edit directly.
 
 # ---- 00-header.zsh ----
 #
@@ -185,6 +185,116 @@ typeset -ga AUDIT_EVIDENCE=()
 typeset -ga AUDIT_EXCEPTION=()
 typeset -ga AUDIT_ACCEPTED=()
 
+# ---- Automatic evidence (where a value was read) for findings that do not pass --evidence.
+# The read helpers note each source in a log file (a file, because most helpers run inside
+# $(...) subshells whose variables are lost), tagged with the check_* function on the stack.
+# A finding gets the sources noted since the previous finding of the same check, else all of
+# that check's sources; a check that read nothing through the helpers gets the system tools
+# and file paths named in its own code and in the helpers it calls (cached per check).
+typeset -g EV_LOG="" EV_READ_LINE=0
+typeset -gA EV_STATIC=() EV_ITEMS=() EV_PENDING=()
+typeset -ga EV_TOOLS
+EV_TOOLS=(defaults plutil PlistBuddy profiles system_profiler pmset sqlite3 launchctl csrutil spctl fdesetup socketfilterfw
+    pfctl systemsetup networksetup scutil sysctl nvram kmutil kextstat systemextensionsctl tmutil diskutil softwareupdate
+    dscl dseditgroup pwpolicy security codesign lsof sfltool mdmclient bputil firmwarepasswd sharing cupsctl
+    visudo stat find xattr mdls ioreg osascript sw_vers bioutil praudit pkgutil brew docker ps netstat ifconfig mount)
+EV_SEP=$'\x1e'
+
+evidence_log_init() {
+    evidence_log_cleanup
+    EV_LOG=$(mktemp "${TMPDIR:-/tmp}/epc-evidence.XXXXXXXX") || EV_LOG=""
+    EV_READ_LINE=0; EV_ITEMS=(); EV_PENDING=()
+}
+evidence_log_cleanup() {
+    [[ -n "$EV_LOG" && -f "$EV_LOG" ]] && command rm -f "$EV_LOG"
+    EV_LOG=""
+}
+
+# The check_* function currently running (REPLY), or empty.
+_ev_check_fn() {
+    local f
+    REPLY=""
+    for f in "${funcstack[@]}"; do [[ "$f" == check_* ]] && { REPLY="$f"; return; }; done
+}
+
+_ev_note() {
+    [[ -n "$EV_LOG" && -f "$EV_LOG" ]] || return 0
+    _ev_check_fn
+    [[ -n "$REPLY" ]] || return 0
+    local item="${1//[$'\n\r\t\x1e\x1f']/ }"
+    (( ${#item} > 140 )) && item="${item[1,140]}..."
+    print -r -- "$REPLY"$'\x1f'"$item" >> "$EV_LOG" 2>/dev/null
+    return 0
+}
+
+# Moves log lines not read yet into EV_ITEMS (all sources of a check, at most 40) and
+# EV_PENDING (sources since that check's previous finding). EV_READ_LINE is our own counter.
+_ev_ingest() {
+    [[ -n "$EV_LOG" && -f "$EV_LOG" ]] || return 0
+    local line="" fn="" item=""
+    while IFS= read -r line; do
+        EV_READ_LINE=$((EV_READ_LINE + 1))
+        fn="${line%%$'\x1f'*}"; item="${line#*$'\x1f'}"
+        [[ -n "$fn" && -n "$item" ]] || continue
+        if [[ "$EV_SEP${EV_ITEMS[$fn]:-}$EV_SEP" != *"$EV_SEP$item$EV_SEP"* ]]; then
+            [[ "${#${(ps:\x1e:)${EV_ITEMS[$fn]:-}}}" -lt 40 ]] && EV_ITEMS[$fn]="${EV_ITEMS[$fn]:+${EV_ITEMS[$fn]}$EV_SEP}$item"
+        fi
+        if [[ "$EV_SEP${EV_PENDING[$fn]:-}$EV_SEP" != *"$EV_SEP$item$EV_SEP"* ]]; then
+            EV_PENDING[$fn]="${EV_PENDING[$fn]:+${EV_PENDING[$fn]}$EV_SEP}$item"
+        fi
+    done < <(tail -n "+$((EV_READ_LINE + 1))" "$EV_LOG" 2>/dev/null)
+}
+
+_ev_join() {   # _ev_join <prefix> <item>... : first six unique items
+    local prefix="$1"; shift
+    local -a u=("${(@u)@}")
+    u=("${(@)u:#}")
+    (( ${#u} )) || { REPLY=""; return; }
+    REPLY="$prefix${(pj:; :)u[1,6]}"
+    (( ${#u} > 6 )) && REPLY+=" (+$(( ${#u} - 6 )) more)"
+}
+
+_ev_static() {
+    local fn="$1"
+    if [[ -n "${EV_STATIC[$fn]+x}" ]]; then REPLY="${EV_STATIC[$fn]}"; return; fi
+    local body="${functions[$fn]:-}" w="" extra=""
+    # One level into the script's own helpers (_name functions) the check calls.
+    for w in ${(u)${(M)${(z)body}:#_[a-z]*}}; do
+        [[ "$w" == _ev_* || "$w" == *[^a-z0-9_]* ]] && continue
+        [[ -n "${functions[$w]+x}" ]] && extra+=$'\n'"${functions[$w]}"
+    done
+    body=$'\n'"$body$extra"$'\n'
+    local -a tools=() files=()
+    local t
+    for t in "${EV_TOOLS[@]}"; do
+        [[ "$body" == *[[:space:]\(\$/\|\;]"$t"[[:space:]\)\;]* ]] && tools+=("$t")
+    done
+    files=(${(M)${(z)${body//[\"\'\(\)\;\`]/ }}:#/(Library|etc|private|System|usr|var|Applications|opt)/*})
+    files=(${(u)files:#*[^[:alnum:]._/-]*})
+    local a="" b=""
+    _ev_join 'Queried with: ' "${tools[@]}"; a="$REPLY"
+    _ev_join 'Files: ' "${files[@]}"; b="$REPLY"
+    REPLY="$a"
+    [[ -n "$b" ]] && REPLY="${REPLY:+$REPLY | }$b"
+    EV_STATIC[$fn]="$REPLY"
+}
+
+# Evidence text for the finding being added by the current check (REPLY).
+_ev_for_finding() {
+    _ev_check_fn
+    local fn="$REPLY"
+    REPLY=""
+    [[ -n "$fn" ]] || return 0
+    _ev_ingest
+    if [[ -n "${EV_PENDING[$fn]:-}" ]]; then
+        _ev_join 'Read: ' "${(@ps:\x1e:)EV_PENDING[$fn]}"; EV_PENDING[$fn]=""
+    elif [[ -n "${EV_ITEMS[$fn]:-}" ]]; then
+        _ev_join 'Read: ' "${(@ps:\x1e:)EV_ITEMS[$fn]}"
+    else
+        _ev_static "$fn"
+    fi
+}
+
 reset_audit_results() {
     AUDIT_IDS=() AUDIT_CATEGORY=() AUDIT_CONTROL=() AUDIT_STATUS=() AUDIT_SEVERITY=()
     AUDIT_CURRENT=() AUDIT_DETAILS=() AUDIT_RECOMMENDED=() AUDIT_CIS=() AUDIT_NIST=() AUDIT_MITRE=()
@@ -260,6 +370,7 @@ add_audit_result() {
     AUDIT_MSCP+=("$mscp")
     AUDIT_RECOMMENDATION+=("$recommendation")
     AUDIT_TIMESTAMP+=("$(date '+%Y-%m-%d %H:%M:%S')")
+    if [[ -z "$evidence" ]]; then _ev_for_finding; evidence="$REPLY"; fi
     AUDIT_EVIDENCE+=("$evidence")
     AUDIT_EXCEPTION+=("")
     AUDIT_ACCEPTED+=("")
@@ -276,6 +387,7 @@ add_audit_result() {
 }
 
 run_root() {
+    _ev_note "$*"
     ROOT_CMD_OUTPUT=$("$@" 2>&1)
     ROOT_CMD_STATUS=$?
     return 0
@@ -287,6 +399,7 @@ run_as_user() {
         RUN_AS_USER_STATUS=127
         return 0
     fi
+    _ev_note "$* (as the console user)"
     RUN_AS_USER_OUTPUT=$(sudo -u "$CONSOLE_USER" "$@" 2>&1)
     RUN_AS_USER_STATUS=$?
     return 0
@@ -333,6 +446,7 @@ _acl_write_grantees() {
 defaults_read_safe() {
     local domain="$1" key="$2" default_value="${3:-}"
     local value
+    _ev_note "defaults read $domain $key"
     value=$(defaults read "$domain" "$key" 2>/dev/null)
     if [[ $? -ne 0 || -z "$value" ]]; then
         printf '%s' "$default_value"
@@ -349,6 +463,7 @@ defaults_read_as_user_safe() {
         return 1
     fi
     local value
+    _ev_note "defaults read $domain $key (console user)"
     value=$(sudo -u "$CONSOLE_USER" defaults read "$domain" "$key" 2>/dev/null)
     if [[ $? -ne 0 || -z "$value" ]]; then
         printf '%s' "$default_value"
@@ -367,6 +482,7 @@ plist_value_safe() {
     # absolute path, but any bare-name command run downstream while this
     # function is still on the stack would silently fail).
     local plist_path="$1" keypath="$2" default_value="${3:-}"
+    _ev_note "$plist_path :$keypath"
     if [[ ! -f "$plist_path" ]]; then
         printf '%s' "$default_value"
         return 1
@@ -383,6 +499,7 @@ plist_value_safe() {
 
 sqlite_value_safe() {
     local db="$1" query="$2" default_value="${3:-}"
+    _ev_note "$db (sqlite)"
     if [[ ! -f "$db" ]]; then
         printf '%s' "$default_value"
         return 1
@@ -453,6 +570,7 @@ managed_pref_read_with_source() {
 
 managed_pref_read() {
     local suite="$1" key="$2" value
+    _ev_note "Preference $suite / $key"
     value=$(osascript -l JavaScript -e "var v = \$.NSUserDefaults.alloc.initWithSuiteName('$suite').objectForKey('$key'); v.isNil() ? '' : String(ObjC.deepUnwrap(v))" 2>/dev/null)
     if [[ $? -ne 0 ]]; then
         return 2
@@ -694,6 +812,7 @@ prefetch() {
 
 run_prefetched() {
     local name="$1"; shift
+    _ev_note "$*"
     local pid="${PREFETCH_PID[$name]:-}" waited=0
     if [[ -z "$pid" ]]; then
         run_root "$@"
@@ -8852,7 +8971,12 @@ function run(argv) {
     var sec = find(n, /^SupportedSecurityTypes$/, 0);
     if (sec === undefined) sec = find(n, /SecurityType|^Security$/i, 0);
     sec = Array.isArray(sec) ? sec.join(' ') : clean(sec);
-    var aj = find(n, /^AutoJoinDisabled$/, 0), hidden = find(n, /^Hidden$/, 0), pm = find(n, /PrivateMACAddressMode/, 0);
+    // Private Wi-Fi address: PrivateMACAddressModeUserSetting (static / rotating / off) where the
+    // user chose one for this network; newer releases may use other key spellings, so any
+    // key naming a private MAC address mode is accepted. Absent = the system default applies.
+    var aj = find(n, /^AutoJoinDisabled$/, 0), hidden = find(n, /^Hidden$/, 0), pm = find(n, /private.?mac.?address.?mode|privatemac.*mode/i, 0);
+    if (typeof pm === 'string') { var pml = pm.toLowerCase(); pm = pml === 'static' ? 'fixed' : pml === 'rotating' ? 'rotating' : pml === 'off' ? 'off' : pm; }
+    else if (pm !== undefined && pm !== null && typeof pm === 'object') pm = undefined;
     var last = newest(n, 0, null);
     if (!last) { var added = find(n, /^AddedAt$/, 0); if (added instanceof Date) last = added; }
     out.push([clean(ssid), clean(sec), (aj === true || aj === 1) ? 'off' : 'on', (hidden === true || hidden === 1) ? 'yes' : 'no',
@@ -9026,7 +9150,10 @@ check_known_wifi_networks() {
             --recommendation 'Informational only.'
         return
     fi
-    inventory_define wifi 'Known Wi-Fi networks' 'Networks this Mac remembers. An open network with auto-join on lets anyone who names a hotspot the same pull the Mac onto it.' \
+    local sysmode
+    sysmode=$(plist_value_safe "${AIRPORT_PREFS_PLIST:-/Library/Preferences/SystemConfiguration/com.apple.airport.preferences.plist}" PrivateMACAddressModeSystemSetting '')
+    [[ -n "$sysmode" && "$sysmode" != *[^[:alnum:]]* ]] || sysmode=''   # digits or a word only
+    inventory_define wifi 'Known Wi-Fi networks' "Networks this Mac remembers. An open network with auto-join on lets anyone who names a hotspot the same pull the Mac onto it. Private address \"system default\": the network has no setting of its own (PrivateMACAddressModeSystemSetting = ${sysmode:-not set})." \
         'SSID' 'Security' 'Auto-join' 'Hidden' 'Private address' 'Last joined' 'Days ago:num' 'Flags:flags'
     local line ssid sec aj hidden pm last days flag n=0
     local -a risky=() stale=() unknown=()
@@ -9034,6 +9161,7 @@ check_known_wifi_networks() {
         [[ -z "$line" ]] && continue
         IFS=$'\x1f' read -r ssid sec aj hidden pm last days <<< "$line"
         n=$((n + 1)); flag=""
+        [[ -z "$pm" ]] && pm="system default"
         if [[ -z "$sec" ]]; then
             unknown+=("$ssid")
         elif [[ "${sec:l}" == (*open*|*none*|*wep*) && "${sec:l}" != *owe* ]]; then
@@ -11241,8 +11369,10 @@ main() {
     prefetch bluetooth system_profiler SPBluetoothDataType -json
     prefetch xpr_log xpr_log_query
 
+    evidence_log_init
     _run_all_checks
     prefetch_cleanup
+    evidence_log_cleanup
 
     if [[ -n "${BASELINE_PATH:-}" ]]; then
         write_section_banner 'Baseline Comparison'

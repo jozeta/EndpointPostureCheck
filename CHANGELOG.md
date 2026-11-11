@@ -6,6 +6,12 @@ The project has no tagged releases yet, so changes are grouped by date. Entries 
 
 ## Unreleased
 
+- macOS evidence: every finding now names its source, as on Windows. The read helpers note what
+  each check reads (commands, preference keys, plist paths); a finding gets the reads since the
+  check's previous finding, or the tools and paths named in the check's code.
+- macOS known Wi-Fi networks: the private address column reads the per-network setting in any
+  key spelling (static is shown as "fixed") and says "system default" when the network has none,
+  with the system-wide setting in the table note.
 - Dashboard: the findings search moved into a bar pinned to the top of the page (`/` focuses
   it). Typing hides non-matching findings and empty domains and shows the match count; domain
   headings count only the findings on screen.
