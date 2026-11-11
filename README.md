@@ -7,6 +7,20 @@ This repository contains two independent tools sharing one design philosophy (fa
 - [`Invoke-EndpointPostureCheck.ps1`](#endpointposturecheck-for-windows) — Windows 11 Enterprise, 180 checks across 36 domains.
 - [`Invoke-MacPostureCheck.sh`](#endpointposturecheck-for-macos) — macOS 15 (Sequoia) / 26 (Tahoe), 221 checks across 32 domains.
 
+**Version 1.1.0** · [What's new](#whats-new) · [Changelog](CHANGELOG.md). Both scripts print their version in the console banner, the report header and the JSON export (`ToolVersion`).
+
+## What's new
+
+Version 1.1.0 (2026-11-11). Older versions: [CHANGELOG.md](CHANGELOG.md).
+
+- **Security fix:** a USB, Bluetooth or Wi-Fi name crafted to contain a report template token could add a script to the HTML report. Collected values can no longer open a token.
+- **Dashboard:** findings grouped under a heading per domain, the sidebar is an index that follows your scrolling and can be collapsed, and a search bar pinned to the top filters the findings.
+- **USB and Wi-Fi (both editions):** inventories of connected USB and Bluetooth devices and remembered Wi-Fi networks; Windows adds the current connection's security, Mobile Hotspot and removable storage restrictions; macOS adds open or stale known networks, unencrypted external volumes and accessory approval.
+- **Evidence everywhere:** every finding on both editions names what it read (commands, registry values, preference keys).
+- **Windows named pipes:** permissions are read without letting the pipe's server impersonate the auditor, and pipes writable by Everyone are listed for review.
+- **macOS CIS Intune benchmark:** 33 more MDM payload settings, plus Apple Intelligence restrictions.
+- **Fixes:** the Mobile Hotspot finding on Windows PowerShell 5.1, Wi-Fi checks that passed without data, stricter removable storage scoring, and macOS cleanup of temporary files when a run is interrupted. See the [changelog](CHANGELOG.md) for the full list.
+
 ---
 
 ## EndpointPostureCheck for Windows

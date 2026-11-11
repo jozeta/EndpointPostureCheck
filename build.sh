@@ -49,6 +49,19 @@ done
 } > "$OUT_FILE"
 
 chmod +x "$OUT_FILE"
+
+# One version number: VERSION is the source. Both scripts run standalone and can't read it at
+# run time, so it is stamped into the macOS build and the Windows script here (CI checks all three).
+APP_VERSION=$(tr -d '[:space:]' < VERSION)
+if [[ ! "$APP_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "VERSION must be MAJOR.MINOR.PATCH, got: $APP_VERSION" >&2
+    exit 1
+fi
+perl -pi -e 's/^SCRIPT_VERSION="[^"]*"/SCRIPT_VERSION="'"$APP_VERSION"'"/' "$OUT_FILE"
+if [[ $(grep -c "^SCRIPT_VERSION=\"$APP_VERSION\"$" "$OUT_FILE") -ne 1 ]]; then
+    echo "Could not stamp version $APP_VERSION into $OUT_FILE" >&2
+    exit 1
+fi
 module_count=$(find "$SRC_DIR" -maxdepth 1 -name '*.zsh' | wc -l | tr -d ' ')
 echo "Built $OUT_FILE from $module_count source file(s) (Låda Glass $(tr -d '[:space:]' < "$LADA_DIR/VERSION"))."
 
@@ -95,3 +108,11 @@ if [[ -f "$WIN_FILE" ]] && grep -qF "$BEGIN_MARK" "$WIN_FILE" && grep -qF "$END_
     fi
     echo "Synced Låda Glass assets into $WIN_FILE."
 fi
+if [[ -f "$WIN_FILE" ]]; then
+    perl -pi -e 's/^(\$Script:ScriptVersion\s*=\s*)\x27[^\x27]*\x27/${1}\x27'"$APP_VERSION"'\x27/' "$WIN_FILE"
+    if ! grep -q "^\$Script:ScriptVersion *= *'$APP_VERSION'" "$WIN_FILE"; then
+        echo "Could not stamp version $APP_VERSION into $WIN_FILE" >&2
+        exit 1
+    fi
+fi
+echo "Version $APP_VERSION."

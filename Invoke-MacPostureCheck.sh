@@ -1,5 +1,5 @@
 #!/usr/bin/env zsh
-# EndpointPostureCheck for macOS — built 2026-11-11 09:12:16 from src/*.zsh. Do not edit directly.
+# EndpointPostureCheck for macOS — built 2026-11-11 13:28:50 from src/*.zsh. Do not edit directly.
 
 # ---- 00-header.zsh ----
 #
@@ -22,7 +22,8 @@
 # development is exactly when you want it to be fatal.
 setopt PIPE_FAIL
 
-SCRIPT_VERSION="1.0.0"
+# Stamped from the VERSION file by build.sh (the built script is standalone, so it is not read at run time).
+SCRIPT_VERSION="1.1.0"
 SCRIPT_NAME="EndpointPostureCheck"
 START_TIME_EPOCH=$(date +%s)
 START_TIME_HUMAN=$(date '+%Y-%m-%d %H:%M:%S')
@@ -200,9 +201,19 @@ EV_TOOLS=(defaults plutil PlistBuddy profiles system_profiler pmset sqlite3 laun
     visudo stat find xattr mdls ioreg osascript sw_vers bioutil praudit pkgutil brew docker ps netstat ifconfig mount)
 EV_SEP=$'\x1e'
 
+# Folder for the audit's temporary files. As root, never $TMPDIR: under "sudo -E" or a sudoers
+# env_keep it can be a folder the invoking user owns, who could then swap a file root writes for
+# a symlink. /private/var/tmp is root-owned and sticky, and mktemp's random names are created
+# exclusively, so no one else can pre-plant or replace them there.
+_epc_tmp_base() {
+    if [[ "$EUID" == 0 ]]; then REPLY=/private/var/tmp; else REPLY="${TMPDIR:-/tmp}"; fi
+    REPLY="${REPLY%/}"
+}
+
 evidence_log_init() {
     evidence_log_cleanup
-    EV_LOG=$(mktemp "${TMPDIR:-/tmp}/epc-evidence.XXXXXXXX") || EV_LOG=""
+    _epc_tmp_base
+    EV_LOG=$(mktemp "$REPLY/epc-evidence.XXXXXXXX") || EV_LOG=""
     EV_READ_LINE=0; EV_ITEMS=(); EV_PENDING=()
 }
 evidence_log_cleanup() {
@@ -793,7 +804,8 @@ typeset -gA PREFETCH_PID
 prefetch() {
     local name="$1"; shift
     if [[ -z "$PREFETCH_DIR" ]]; then
-        PREFETCH_DIR=$(mktemp -d -t epc-prefetch) || return 0
+        _epc_tmp_base
+        PREFETCH_DIR=$(mktemp -d "$REPLY/epc-prefetch.XXXXXXXX") || return 0
     fi
     { "$@" > "$PREFETCH_DIR/$name.out" 2>&1; print -r -- $? > "$PREFETCH_DIR/$name.rc"; } &
     # Quoted on purpose: verified live that zsh leaves an unquoted $! in an
@@ -844,6 +856,16 @@ prefetch_cleanup() {
     PREFETCH_PID=()
     [[ -n "$PREFETCH_DIR" && -d "$PREFETCH_DIR" ]] && command rm -rf "$PREFETCH_DIR"
     PREFETCH_DIR=""
+}
+
+# Ctrl-C, a closed terminal or a kill must not leave the temporary files (copies of the
+# background-items, Wi-Fi and USB output) behind, nor the background queries running:
+# non-interactive zsh starts "&" jobs with SIGINT ignored, so they would outlive the audit.
+epc_cleanup_temp() { prefetch_cleanup; evidence_log_cleanup; }
+epc_install_cleanup_traps() {
+    trap 'epc_cleanup_temp; exit 130' INT
+    trap 'epc_cleanup_temp; exit 143' TERM
+    trap 'epc_cleanup_temp; exit 129' HUP
 }
 
 # ---- 02-inventory.zsh ----
@@ -8607,7 +8629,8 @@ _profile_payload_lines() {
     if [[ -z "$xml" ]]; then
         # mktemp: random name, created exclusively with mode 0600. A predictable name in a
         # shared temp folder would let a local user plant a symlink that root then writes through.
-        xml=$(mktemp "${TMPDIR:-/tmp}/epc-profiles.XXXXXXXX") || return 1
+        _epc_tmp_base
+        xml=$(mktemp "$REPLY/epc-profiles.XXXXXXXX") || return 1
         profiles show -output stdout-xml >| "$xml" 2>/dev/null || { command rm -f "$xml"; return 1; }
     fi
     osascript -l JavaScript - "$xml" <<'JXA' 2>/dev/null
@@ -9023,20 +9046,24 @@ check_usb_device_inventory() {
 check_external_volume_encryption() {
     write_section_banner 'Removable Media & Peripheral Control - External Volume Encryption'
     run_root mount
-    local line dev mp opts info loc proto fv enc n=0
+    local line dev mp opts info loc proto fv enc n=0 examined=0
     local -a plain=() ok=()
     inventory_define volumes 'External volumes' 'Mounted volumes on external or removable disks (disk images excluded).' \
         'Volume' 'File system' 'Protocol' 'Encrypted' 'Flags:flags'
     for line in "${(@f)ROOT_CMD_OUTPUT}"; do
         [[ "$line" == /dev/disk*' on /Volumes/'* ]] || continue
         dev="${line%% on *}"; mp="${line#* on }"; opts="${mp##* \(}"; mp="${mp% \(*}"
-        (( n >= 20 )) && break
-        n=$((n + 1))
+        # Two caps: 60 diskutil calls in all, 20 external volumes evaluated. Counting only
+        # externals matters: 20 mounted disk images listed first must not hide a USB drive.
+        (( examined >= 60 )) && break
+        examined=$((examined + 1))
         info=$(diskutil info "$dev" 2>/dev/null)
         loc=$(print -r -- "$info" | awk -F': *' '/Device Location:/{print $2; exit}')
         proto=$(print -r -- "$info" | awk -F': *' '/^ *Protocol:/{print $2; exit}')
         [[ "$proto" == "Disk Image" ]] && continue
         [[ "$loc" == External || "$info" == *"Removable Media:"*Removable* ]] || continue
+        (( n >= 20 )) && break
+        n=$((n + 1))
         fv=$(print -r -- "$info" | awk -F': *' '/FileVault:/{print $2; exit}')
         enc=$(print -r -- "$info" | awk -F': *' '/^ *Encrypted:/{print $2; exit}')
         local fs="${opts%%,*}" encrypted=no
@@ -9741,6 +9768,9 @@ html_escape() {
     s="${s//>/&gt;}"
     s="${s//\"/&quot;}"
     s="${s//\'/&#39;}"
+    # Braces too: the page is filled one {{TOKEN}} after another, so a collected value
+    # containing "{{INVENTORY_JSON}}" (a USB device or SSID name) must never be re-expanded.
+    s="${s//\{/&#123;}"
     print -r -- "$s"
 }
 
@@ -11363,6 +11393,9 @@ main() {
     # Slow, independent queries run in the background while the other
     # checks execute (measured: sfltool dumpbtm 3-23s, Wi-Fi ~8s, the
     # 7-day XProtect Remediator log a few seconds).
+    # Remove temp files and stop background queries on Ctrl-C, kill or any early return.
+    epc_install_cleanup_traps
+    trap 'epc_cleanup_temp' EXIT
     prefetch btm sfltool dumpbtm
     prefetch wifi system_profiler SPAirPortDataType
     prefetch usb system_profiler SPUSBHostDataType -json

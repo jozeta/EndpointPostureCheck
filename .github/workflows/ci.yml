@@ -77,6 +77,17 @@ jobs:
       - uses: actions/checkout@v7
       - name: ShellCheck the build script
         run: shellcheck -S warning build.sh
+      # One version number: VERSION, stamped into both scripts by build.sh, with a CHANGELOG
+      # section and the README line of its own.
+      - name: Version number agrees everywhere
+        run: |
+          v=$(tr -d '[:space:]' < VERSION)
+          fail=0
+          grep -qx "SCRIPT_VERSION=\"$v\"" Invoke-MacPostureCheck.sh || { echo "::error::Invoke-MacPostureCheck.sh is not version $v"; fail=1; }
+          grep -q "^[$]Script:ScriptVersion *= *'$v'" Invoke-EndpointPostureCheck.ps1 || { echo "::error::Invoke-EndpointPostureCheck.ps1 is not version $v"; fail=1; }
+          grep -q "^## $v " CHANGELOG.md || { echo "::error::CHANGELOG.md has no '## $v' section"; fail=1; }
+          grep -qF "**Version $v**" README.md || { echo "::error::README.md does not show **Version $v**"; fail=1; }
+          exit $fail
       - name: zsh syntax check of the macOS script (ShellCheck doesn't support zsh)
         run: |
           sudo apt-get install -y -qq zsh >/dev/null

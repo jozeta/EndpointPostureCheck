@@ -49,6 +49,12 @@ if ($report) {
     if ($findings.Count -and ($failedQueries.Count / $findings.Count) -gt 0.4) {
         $problems.Add("$($failedQueries.Count) of $($findings.Count) findings could not query the system (over 40%)")
     }
+    # A check's catch block repeating its control name usually means the first call threw (for
+    # example "Cannot bind parameter ... specified more than once" on Windows PowerShell 5.1).
+    $dupes = @($findings | Group-Object -Property { "$($_.Category)|$($_.Control)" } | Where-Object { $_.Count -gt 1 })
+    if ($dupes.Count) { $problems.Add("$($dupes.Count) control(s) reported more than once, e.g. '$($dupes[0].Name)'") }
+    $bindErrors = @($findings | Where-Object { "$($_.CurrentValue) $($_.Recommendation)" -match 'Cannot bind parameter|parameter cannot be found|specified more than once' })
+    if ($bindErrors.Count) { $problems.Add("$($bindErrors.Count) finding(s) carry a PowerShell parameter binding error, e.g. on '$($bindErrors[0].Control)'") }
     if ($ExpectBaseline -and -not "$($report.BaselineFile)") { $problems.Add('BaselineFile is empty although a baseline was passed') }
     if ($null -eq $report.ComplianceScore) { $problems.Add('ComplianceScore missing') }
     if ($ExpectExceptions) {

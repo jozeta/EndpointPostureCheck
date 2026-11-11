@@ -2,9 +2,41 @@
 
 All notable changes to EndpointPostureCheck are listed here, newest first.
 
-The project has no tagged releases yet, so changes are grouped by date. Entries before November 2026 were reconstructed from the commit history.
+Version numbers start with 1.1.0 (the `VERSION` file; both scripts reported 1.0.0 before). Older
+entries are grouped by date; those before November 2026 were reconstructed from the commit history.
 
 ## Unreleased
+
+## 1.1.0 (2026-11-11)
+
+- **Security fix (both editions):** a collected name (a USB or Bluetooth device, a Wi-Fi network)
+  containing the text `{{INVENTORY_JSON}}` pulled the raw inventory data into the report page,
+  where another collected name could add a script to it that ran when the report was opened.
+  The report now encodes `{` in every collected value, so no value can open a template token.
+- Windows PowerShell 5.1: the Mobile Hotspot finding was never produced (a parameter was passed
+  twice, which 5.1 rejects); the run showed a second, failed Wi-Fi finding instead.
+- Windows Wi-Fi: "Wi-Fi Profile Security" no longer passes when no profile list could be read
+  (Wi-Fi service off, no wireless interface, non-English display language); it says why. The
+  current-connection check reads each adapter separately, and says so when Windows 11 24H2 or
+  later hides the details because location access is off.
+- Windows removable storage: a PASS now needs a setting that blocks writing to removable disks
+  or portable devices (or blocks installing them, or Device Control denying by default). Read,
+  execute or CD/DVD-only restrictions are listed as a partial restriction (INFO).
+- Windows connected devices: USB 3 drives that use UAS are found through their disk's bus type;
+  built-in laptop keyboards are listed but not counted, and a keyboard with several collections
+  counts once.
+- Windows named pipes: listed natively, so one pipe name that .NET rejects no longer stops the
+  check; a failed native security query reports its own error code.
+- Windows evidence: a finding that read nothing new now names the tools and paths in its own
+  check's code instead of an earlier finding's registry values.
+- macOS: Ctrl-C, a closed terminal or a kill now removes the audit's temporary files and stops its
+  background queries. As root, temporary files go in `/private/var/tmp`, never `$TMPDIR`
+  (which `sudo -E` could point at a folder the invoking user owns).
+- macOS external volumes: the 20-volume limit counts external volumes only, so mounted disk
+  images listed first can't hide a USB drive.
+- CI: a control reported twice, or a finding carrying a PowerShell parameter-binding error, fails
+  the report validation; the version number must agree in `VERSION`, both scripts, CHANGELOG and
+  README.
 
 - macOS evidence: every finding now names its source, as on Windows. The read helpers note what
   each check reads (commands, preference keys, plist paths); a finding gets the reads since the

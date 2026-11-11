@@ -40,6 +40,12 @@ in the repo** (gitignored, waived in `.claude-standards`). When `src/` is presen
 modules there, run `./build.sh`, and run the zsh tests with `tests/run-tests.sh`. Commit the
 rebuilt `Invoke-MacPostureCheck.sh`.
 
+**Version:** `VERSION` is the one source (semver). `build.sh` stamps it into `SCRIPT_VERSION` in
+the macOS build and `$Script:ScriptVersion` in the `.ps1`; CI fails unless both scripts, a
+`## <version> (date)` CHANGELOG heading and the README's `**Version x.y.z**` line all agree.
+To release: edit `VERSION`, run `./build.sh`, move CHANGELOG's Unreleased entries under the new
+heading, and update the README version line and "What's new".
+
 Both dashboards use the vendored Låda Glass design (`vendor/lada-glass/<version>/`). `build.sh`
 also rewrites the `LADA-GLASS-ASSETS` region of `Invoke-EndpointPostureCheck.ps1` from it (never
 edit that region by hand). The Windows `Get-HtmlTemplate` is a port of the macOS template: change
@@ -102,11 +108,15 @@ none of the Mac's Claude memory or global `~/.claude/CLAUDE.md`. These rules car
   (CI verifies). Never force-push, never `--no-verify`, stage only the files you changed.
 - Bump the version on every push that changes a script (semver), and update CHANGELOG
   (newest first, "Unreleased") and the README's version and "What's new" in the same commit.
+  Without `build.sh` on Windows, edit `VERSION`, the `$Script:ScriptVersion` line in the `.ps1`
+  and the single `SCRIPT_VERSION="..."` line in `Invoke-MacPostureCheck.sh` by hand (the only
+  edit allowed in that file); CI checks they agree.
 - Keep the `.ps1` pure ASCII. Don't edit the `LADA-GLASS-ASSETS` region.
 - **Don't change the dashboard CSS/JS in `Get-HtmlTemplate` on Windows.** It must stay identical
   to `src/91-report-html.zsh`, which only exists on the Mac. If it really has to change, say so
   in the commit message ("needs Mac port") so the Mac session copies it back.
-- Don't edit `Invoke-MacPostureCheck.sh`: it is generated from `src/` on the Mac.
+- Don't edit `Invoke-MacPostureCheck.sh` (apart from that version line): it is generated from
+  `src/` on the Mac.
 - Reports from a real machine describe that machine's weaknesses: never commit, push or
   publish them (`*.html` / `*.json` are already gitignored).
 
@@ -135,8 +145,14 @@ Then read `C:\Reports\*.json` and review the HTML (open it in a browser).
 
 ### Next steps (handoff from the Mac, 2026-11-11)
 
-Everything up to `1c7c13c` is pushed and CI is green. Windows code has so far only run on CI
-(Windows Server 2025), so the job on this machine is **the first real Windows 11 run**:
+Version 1.1.0 is pushed. Windows code has so far only run on CI (Windows Server 2025), so the
+job on this machine is **the first real Windows 11 run**. 1.1.0 changed several Windows checks
+from reading code alone, so look at these first: the current Wi-Fi connection (now per adapter;
+with location services off on 24H2+ it should say location access is needed), Wi-Fi Profile
+Security (INFO, not PASS, when there's no profile list), removable storage (PASS only when writes
+are blocked; check what `Get-MpComputerStatus` reports as `DeviceControlDefaultEnforcement`),
+connected devices (USB 3 SSDs found through `Get-Disk`; built-in keyboard not counted) and the
+named-pipe list (now native `FindFirstFileW`; the pipe count should match `[System.IO.Directory]::GetFiles('\\.\pipe\').Count`).
 
 1. Run the audit as above (5.1, then `pwsh`). Check for checks that errored or report "could
    not query", false positives on normal Windows 11 defaults, and empty inventory tables.

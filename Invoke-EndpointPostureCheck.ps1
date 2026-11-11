@@ -95,7 +95,7 @@ param(
 # certain SKUs/hardware, and the audit must tolerate that gracefully rather than throw.
 $ProgressPreference = 'Continue'
 
-$Script:ScriptVersion   = '1.0.0'
+$Script:ScriptVersion   = '1.1.0'   # from the VERSION file (build.sh stamps it; CI checks they agree)
 $Script:StartTime       = Get-Date
 $Script:ComputerName    = $env:COMPUTERNAME
 $Script:AuditResults    = [System.Collections.Generic.List[PSObject]]::new()
@@ -222,7 +222,6 @@ function Add-AuditResult {
 # value it reads; a finding gets the reads made since the previous finding, or else every read since
 # the check's section banner. A check that reads no registry value through the helper gets the
 # commands, cmdlets and registry paths named in its own source (cached per function).
-$Script:EvidenceSection = [System.Collections.Generic.List[string]]::new()
 $Script:EvidencePending = [System.Collections.Generic.List[string]]::new()
 $Script:EvidenceByFunction = @{}
 $Script:EvidenceOwner = ''
@@ -233,7 +232,6 @@ function Add-EvidenceRead {
     param([string]$Item)
     if (-not $Item) { return }
     if (-not $Script:EvidencePending.Contains($Item)) { $Script:EvidencePending.Add($Item) }
-    if (-not $Script:EvidenceSection.Contains($Item)) { $Script:EvidenceSection.Add($Item) }
 }
 
 function Format-EvidenceList {
@@ -251,11 +249,11 @@ function Get-AutoEvidence {
         if (-not $stack.Count) { return '' }
         $fn = $stack[0]
         # Reads only belong to this finding when they were made inside the check that printed the
-        # current section banner (a check without a banner must not inherit the previous one's reads).
+        # current section banner (a check without a banner must not inherit the previous one's reads),
+        # and only the reads since the check's previous finding. A finding that read nothing new
+        # gets the tools and paths named in its check's code, never an earlier finding's reads.
         $items = @()
-        if ($Script:EvidenceOwner -and ($stack -contains $Script:EvidenceOwner)) {
-            $items = if ($Script:EvidencePending.Count) { @($Script:EvidencePending) } else { @($Script:EvidenceSection) }
-        }
+        if ($Script:EvidenceOwner -and ($stack -contains $Script:EvidenceOwner)) { $items = @($Script:EvidencePending) }
         $Script:EvidencePending.Clear()
         if ($items.Count) { return (Format-EvidenceList -Items $items -Prefix 'Registry: ') }
         if ($Script:EvidenceByFunction.ContainsKey($fn)) { return $Script:EvidenceByFunction[$fn] }
@@ -293,7 +291,6 @@ function Get-AutoEvidence {
 
 function Write-SectionBanner {
     param([Parameter(Mandatory = $true)][string]$Title)
-    $Script:EvidenceSection.Clear()
     $Script:EvidencePending.Clear()
     $Script:EvidenceOwner = @(Get-PSCallStack | Select-Object -Skip 1 -First 1 | ForEach-Object { $_.FunctionName -replace '<.*$', '' })[0]
     Write-Host ""
@@ -5301,6 +5298,18 @@ function Test-WifiProfileSecurity {
         }
         $profileNames = @($profileListOutput | Select-String -Pattern '^\s*All User Profile\s*:\s*(.+)$' | ForEach-Object { $_.Matches[0].Groups[1].Value.Trim() })
 
+        if ($profileNames.Count -eq 0 -and -not ($profileListOutput -match '^\s*User profiles\s*$')) {
+            # No profile list at all: WLAN service stopped, no wireless interface, a non-English
+            # display language (translated labels), or another message. Not a PASS.
+            $wlanSvc = Get-Service -Name 'WlanSvc' -ErrorAction SilentlyContinue
+            $why = if (-not $wlanSvc -or $wlanSvc.Status -ne 'Running') { 'WLAN AutoConfig service not running (no Wi-Fi in use)' }
+                   elseif ($profileListOutput -match '(?i)no wireless interface') { 'No wireless interface on this device' }
+                   else { 'netsh output not recognized (non-English display language?)' }
+            Add-AuditResult -Category 'Wireless & Network Interface Security' -Control 'Wi-Fi Profile Security' -Status 'INFO' -Severity 'Informational' `
+                -CurrentValue $why -Recommendation 'Not evaluated. Review saved networks in Settings > Network & internet > Wi-Fi > Manage known networks.'
+            return
+        }
+
         if ($profileNames.Count -eq 0) {
             Add-AuditResult -Category 'Wireless & Network Interface Security' -Control 'Wi-Fi Profile Security' -Status 'PASS' -Severity 'Medium' `
                 -CurrentValue 'No cached Wi-Fi profiles found' -RecommendedValue 'No weak-authentication or unrestricted auto-connect profiles' -CIS_Control 'CIS 4.7' -NIST_Control 'SC-8, AC-18' `
@@ -6757,23 +6766,35 @@ function Test-ConnectedPeripheralInventory {
     #>
     Write-SectionBanner 'Removable Media - Connected USB & Bluetooth Devices'
     $fwc = @{ Category = 'Removable Media & Device Control'; CIS_Control = 'CIS 1.1'; NIST_Control = 'CM-8, MP-7'; MITRE_Technique = 'T1200 (Hardware Additions)'
-        ISO27001_Control = 'A.5.9'; NIS2_Article = 'Art.21(2)(i)'; RecommendedValue = 'N/A'; Evidence = 'Get-PnpDevice -PresentOnly (USB, USBSTOR, BTH and HID instance IDs)' }
+        ISO27001_Control = 'A.5.9'; NIS2_Article = 'Art.21(2)(i)'; RecommendedValue = 'N/A'; Evidence = 'Get-PnpDevice -PresentOnly (USB, USBSTOR, BTH and HID instance IDs); Get-Disk (USB bus type)' }
     try {
-        $devices = @(Get-PnpDevice -PresentOnly -ErrorAction Stop | Where-Object { $_.InstanceId -match '^(USB|USBSTOR|BTHENUM|BTHLE|BTHLEDEVICE|HID|SCSI\\DISK&VEN_.*USB)\\' })
-        New-InventoryTable -Id 'peripherals' -Title 'USB and Bluetooth devices' -Note 'Devices present now. Keyboards and network adapters are flagged: a plugged-in device can pose as either.' `
+        # USB 3 drives using UAS appear as SCSI\Disk... with no "USB" in the ID; Get-Disk reports their
+        # bus as USB, and its Path is the device instance ID with '#' for '\'.
+        $usbDiskIds = @(Get-Disk -ErrorAction SilentlyContinue | Where-Object { [string]$_.BusType -eq 'USB' -and $_.Path } |
+            ForEach-Object { ((([string]$_.Path) -replace '^\\\\\?\\', '' -replace '#\{[^}]+\}$', '') -replace '#', '\').ToUpperInvariant() })
+        $devices = @(Get-PnpDevice -PresentOnly -ErrorAction Stop | Where-Object { $_.InstanceId -match '^(USB|USBSTOR|BTHENUM|BTHLE|BTHLEDEVICE|HID)\\' -or $usbDiskIds -contains ([string]$_.InstanceId).ToUpperInvariant() })
+        New-InventoryTable -Id 'peripherals' -Title 'USB and Bluetooth devices' -Note 'Devices present now (Bluetooth entries include paired devices that are not connected at the moment). Keyboards and network adapters are flagged: a plugged-in device can pose as either. Built-in keyboards are listed but not counted.' `
             -Columns @('Device', 'Class', 'Bus', 'Status', 'Instance ID', 'Flags:flags')
-        $kbd = 0; $storage = 0; $net = 0
+        $storage = 0; $net = 0
+        $keyboards = [System.Collections.Generic.HashSet[string]]::new()
         $listed = [System.Collections.Generic.List[string]]::new()
         foreach ($d in $devices) {
-            $bus = if ($d.InstanceId -match '^(BTHENUM|BTHLE|BTHLEDEVICE)\\') { 'Bluetooth' } elseif ($d.InstanceId -match '^HID\\') { 'HID' } else { 'USB' }
+            $id = [string]$d.InstanceId
+            $bus = if ($id -match '^(BTHENUM|BTHLE|BTHLEDEVICE)\\' -or $id -match '^HID\\\{0000(1124|1812)-') { 'Bluetooth' }
+                   elseif ($id -match '^HID\\VID_') { 'USB' } elseif ($id -match '^HID\\') { 'HID (built-in)' } else { 'USB' }
             $cls = [string]$d.Class
             $flags = @()
-            if ($cls -eq 'Keyboard') { $flags += 'keyboard?'; $kbd++ }
-            if ($cls -in @('DiskDrive', 'WPD') -or $d.InstanceId -match '^USBSTOR\\') { $flags += 'storage?'; $storage++ }
+            if ($cls -eq 'Keyboard' -and $bus -ne 'HID (built-in)') {
+                $flags += 'keyboard?'
+                # One physical keyboard exposes several collections (&COL01, &MI_00): count it once.
+                [void]$keyboards.Add(((($id -split '\\')[1]) -replace '&(MI|COL)_?[0-9A-F]+', '').ToUpperInvariant())
+            }
+            if ($cls -in @('DiskDrive', 'WPD') -or $id -match '^USBSTOR\\') { $flags += 'storage?'; $storage++ }
             if ($cls -eq 'Net') { $flags += 'network?'; $net++ }
-            Add-InventoryRow -Id 'peripherals' -Values @([string]$d.FriendlyName, $cls, $bus, [string]$d.Status, [string]$d.InstanceId, ($flags -join ','))
+            Add-InventoryRow -Id 'peripherals' -Values @([string]$d.FriendlyName, $cls, $bus, [string]$d.Status, $id, ($flags -join ','))
             if ($flags.Count) { $listed.Add("$($d.FriendlyName) [$cls, $bus]") }
         }
+        $kbd = $keyboards.Count
         Add-AuditResult @fwc -Control 'Connected USB & Bluetooth Devices' -Status 'INFO' -Severity 'Informational' `
             -CurrentValue "$($devices.Count) device node(s) present: $kbd keyboard(s), $storage storage, $net network adapter(s)" -Details ($listed -join "`n") `
             -Recommendation 'Informational only. More keyboards or network adapters than you plugged in deserve a look: keystroke-injection and rogue-network devices present themselves that way.'
@@ -6795,25 +6816,44 @@ function Test-RemovableStorageAccessPolicy {
         RecommendedValue = 'Write (or all) access to removable storage denied, or Defender Device Control enforcing a policy, where the device role allows it' }
     try {
         $base = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\RemovableStorageDevices'
-        $found = [System.Collections.Generic.List[string]]::new()
-        if ((Get-RegistryValueSafe -Path $base -Name 'Deny_All') -eq 1) { $found.Add('All removable storage classes: all access denied (Deny_All)') }
+        # $blocking: settings that stop data being written to removable media. $partial: other
+        # restrictions (read or execute only, CD/DVD only) that are listed but are not a PASS.
+        $blocking = [System.Collections.Generic.List[string]]::new()
+        $partial = [System.Collections.Generic.List[string]]::new()
+        if ((Get-RegistryValueSafe -Path $base -Name 'Deny_All') -eq 1) { $blocking.Add('All removable storage classes: all access denied (Deny_All)') }
         $classes = [ordered]@{ '{53f5630d-b6bf-11d0-94f2-00a0c91efb8b}' = 'Removable disks'; '{53f56308-b6bf-11d0-94f2-00a0c91efb8b}' = 'CD and DVD'
             '{6AC27878-A6FA-4155-BA85-F98F491D4F33}' = 'Portable devices (WPD)'; '{F33FDC04-D1AC-4E8E-9A30-19BBD4B108AE}' = 'Portable devices (WPD)' }
         foreach ($g in $classes.Keys) {
             foreach ($v in 'Deny_Read', 'Deny_Write', 'Deny_Execute') {
-                if ((Get-RegistryValueSafe -Path "$base\$g" -Name $v) -eq 1) { $found.Add("$($classes[$g]): $v") }
+                if ((Get-RegistryValueSafe -Path "$base\$g" -Name $v) -eq 1) {
+                    $item = "$($classes[$g]): $v"
+                    if ($v -eq 'Deny_Write' -and $classes[$g] -ne 'CD and DVD') { $blocking.Add($item) } else { $partial.Add($item) }
+                }
             }
         }
         $di = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeviceInstall\Restrictions'
-        if ((Get-RegistryValueSafe -Path $di -Name 'DenyRemovableDevices') -eq 1) { $found.Add('Device installation: removable devices denied (DenyRemovableDevices)') }
-        if ((Get-RegistryValueSafe -Path $di -Name 'DenyUnspecified') -eq 1) { $found.Add('Device installation: only allow-listed devices (DenyUnspecified)') }
-        $dc = $null
-        try { $st = Get-MpComputerStatus -ErrorAction Stop; if ($st.PSObject.Properties['DeviceControlState']) { $dc = [string]$st.DeviceControlState } } catch { $dc = $null }
-        if ($dc -and $dc -match '(?i)^enabled$') { $found.Add('Microsoft Defender Device Control: enabled') }
+        if ((Get-RegistryValueSafe -Path $di -Name 'DenyRemovableDevices') -eq 1) { $blocking.Add('Device installation: removable devices denied (DenyRemovableDevices)') }
+        if ((Get-RegistryValueSafe -Path $di -Name 'DenyUnspecified') -eq 1) { $blocking.Add('Device installation: only allow-listed devices (DenyUnspecified)') }
+        $dc = $null; $dcDefault = $null
+        try {
+            $st = Get-MpComputerStatus -ErrorAction Stop
+            if ($st.PSObject.Properties['DeviceControlState']) { $dc = [string]$st.DeviceControlState }
+            if ($st.PSObject.Properties['DeviceControlDefaultEnforcement']) { $dcDefault = [string]$st.DeviceControlDefaultEnforcement }
+        } catch { $dc = $null }
+        if ($dc -and $dc -match '(?i)^enabled$') {
+            # Enabled with a default of deny blocks unlisted devices; with a default of allow, only
+            # its rules (not readable here) restrict devices, so it is listed but not a PASS on its own.
+            if ($dcDefault -match '(?i)deny') { $blocking.Add("Microsoft Defender Device Control: enabled, default enforcement $dcDefault") }
+            else { $partial.Add("Microsoft Defender Device Control: enabled, default enforcement $(if ($dcDefault) { $dcDefault } else { 'not reported' }) (rules decide what is restricted)") }
+        }
         $dcText = if ($dc) { "Defender Device Control: $dc" } else { 'Defender Device Control state not reported' }
-        if ($found.Count) {
-            Add-AuditResult @fwc -Control 'Removable Storage Access Restriction' -Status 'PASS' -Severity 'Medium' -CurrentValue "$($found.Count) restriction(s) in place" `
-                -Details (@($found) + $dcText -join "`n") -Recommendation 'No action required.'
+        if ($blocking.Count) {
+            Add-AuditResult @fwc -Control 'Removable Storage Access Restriction' -Status 'PASS' -Severity 'Medium' -CurrentValue "$($blocking.Count) write-blocking restriction(s) in place" `
+                -Details (@($blocking) + @($partial) + $dcText -join "`n") -Recommendation 'No action required.'
+        } elseif ($partial.Count) {
+            Add-AuditResult @fwc -Control 'Removable Storage Access Restriction' -Status 'INFO' -Severity 'Informational' -CurrentValue "Partial restriction only: writing to removable storage is not blocked ($($partial.Count) setting(s))" `
+                -Details (@($partial) + $dcText -join "`n") `
+                -Recommendation 'Some removable storage settings are in place, but none blocks writing to USB disks or portable devices. Where data must not leave on USB media, add "Removable Disks: Deny write access" (Intune: Device restrictions or Defender Device Control with a deny default).'
         } else {
             Add-AuditResult @fwc -Control 'Removable Storage Access Restriction' -Status 'INFO' -Severity 'Informational' -CurrentValue "No removable storage restriction policy ($dcText)" `
                 -Recommendation 'Not configured is the Windows default. Where data must not leave on USB media, deny write access with the "Removable Disks: Deny write access" policy (Intune: Device restrictions or Defender Device Control) and allow-list approved devices.'
@@ -6839,30 +6879,52 @@ function Test-WifiCurrentConnection {
             Add-AuditResult @fwc -Control 'Wi-Fi Current Network Security' -Status 'INFO' -Severity 'Informational' -CurrentValue 'WLAN AutoConfig not running (no Wi-Fi adapter in use)' -Recommendation 'Not applicable.'
         } else {
             $out = @(& netsh.exe wlan show interfaces 2>$null)
-            $field = { param($n) $l = $out | Where-Object { $_ -match "^\s*$n\s*:" } | Select-Object -First 1; if ($l) { ($l -split ':', 2)[1].Trim() } else { '' } }
-            $state = & $field 'State'; $auth = & $field 'Authentication'; $cipher = & $field 'Cipher'; $ssid = & $field 'SSID'
-            if (-not $state) {
+            # One block per wireless adapter, each starting at its "Name" line; fields are read per
+            # adapter so a disconnected adapter's state never mixes with a connected one's security.
+            $blocks = [System.Collections.Generic.List[object]]::new(); $cur = $null
+            foreach ($line in $out) {
+                if ($line -match '^\s*Name\s*:') { $cur = [System.Collections.Generic.List[string]]::new(); $blocks.Add($cur) }
+                if ($null -ne $cur) { $cur.Add([string]$line) }
+            }
+            $field = { param($lines, $n) $l = $lines | Where-Object { $_ -match "^\s*$n\s*:" } | Select-Object -First 1; if ($l) { ($l -split ':', 2)[1].Trim() } else { '' } }
+            $adapters = @(foreach ($b in $blocks) {
+                [pscustomobject]@{ State = (& $field $b 'State'); Auth = (& $field $b 'Authentication'); Cipher = (& $field $b 'Cipher'); Ssid = (& $field $b 'SSID') }
+            })
+            $connected = @($adapters | Where-Object { $_.State -match '(?i)^connected' })
+            if (($out -join ' ') -match '(?i)location permission') {
+                # Windows 11 24H2 and later hide Wi-Fi connection details without location consent.
+                Add-AuditResult @fwc -Control 'Wi-Fi Current Network Security' -Status 'INFO' -Severity 'Informational' -CurrentValue 'Not readable: Windows requires location access to show Wi-Fi details (location services off or denied)' `
+                    -Recommendation 'Not evaluated. Check the connection security in Settings > Network & internet > Wi-Fi > (network) properties.'
+            } elseif (-not @($adapters | Where-Object { $_.State }).Count) {
                 Add-AuditResult @fwc -Control 'Wi-Fi Current Network Security' -Status 'INFO' -Severity 'Informational' -CurrentValue 'netsh output not recognized (non-English display language?)' `
                     -Recommendation 'Not evaluated. Check the connection security in Settings > Network & internet > Wi-Fi > (network) properties.'
-            } elseif ($state -notmatch '(?i)^connected') {
-                Add-AuditResult @fwc -Control 'Wi-Fi Current Network Security' -Status 'INFO' -Severity 'Informational' -CurrentValue "Not connected to Wi-Fi (state: $state)" -Recommendation 'Informational only.'
-            } elseif ($auth -match '(?i)^open$|WEP' -or $cipher -match '(?i)WEP|^none$') {
-                Add-AuditResult @fwc -Control 'Wi-Fi Current Network Security' -Status 'WARN' -Severity 'Medium' -CurrentValue "$ssid - $auth / $cipher" `
-                    -Recommendation 'This network gives no meaningful confidentiality. Use a VPN while on it, or avoid it.'
-            } elseif ($auth -match '(?i)WPA2|WPA3') {
-                Add-AuditResult @fwc -Control 'Wi-Fi Current Network Security' -Status 'PASS' -Severity 'Medium' -CurrentValue "$ssid - $auth / $cipher" -Recommendation 'No action required.'
+            } elseif (-not $connected.Count) {
+                Add-AuditResult @fwc -Control 'Wi-Fi Current Network Security' -Status 'INFO' -Severity 'Informational' -CurrentValue "Not connected to Wi-Fi (state: $((@($adapters | ForEach-Object { $_.State } | Where-Object { $_ }) | Select-Object -Unique) -join ', '))" -Recommendation 'Informational only.'
             } else {
-                Add-AuditResult @fwc -Control 'Wi-Fi Current Network Security' -Status 'WARN' -Severity 'Low' -CurrentValue "Unrecognized security: $auth / $cipher" `
-                    -Recommendation 'Unable to classify the connection security; verify with "netsh wlan show interfaces".'
+                $weak = @($connected | Where-Object { $_.Auth -match '(?i)^open$|WEP' -or $_.Cipher -match '(?i)WEP|^none$' })
+                $unknown = @($connected | Where-Object { $_.Auth -notmatch '(?i)^open$|WEP|WPA2|WPA3' -and $_.Cipher -notmatch '(?i)WEP|^none$' })
+                $desc = (@($connected | ForEach-Object { "$($_.Ssid) - $($_.Auth) / $($_.Cipher)" }) -join '; ')
+                if ($weak.Count) {
+                    Add-AuditResult @fwc -Control 'Wi-Fi Current Network Security' -Status 'WARN' -Severity 'Medium' -CurrentValue $desc `
+                        -Recommendation 'This network gives no meaningful confidentiality. Use a VPN while on it, or avoid it.'
+                } elseif ($unknown.Count) {
+                    Add-AuditResult @fwc -Control 'Wi-Fi Current Network Security' -Status 'WARN' -Severity 'Low' -CurrentValue "Unrecognized security: $desc" `
+                        -Recommendation 'Unable to classify the connection security; verify with "netsh wlan show interfaces".'
+                } else {
+                    Add-AuditResult @fwc -Control 'Wi-Fi Current Network Security' -Status 'PASS' -Severity 'Medium' -CurrentValue $desc -Recommendation 'No action required.'
+                }
             }
         }
+        # Own parameter set: splatting @fwc and also passing -RecommendedValue/-Evidence fails to
+        # bind on Windows PowerShell 5.1 ("specified more than once").
+        $hwc = $fwc.Clone(); $hwc['RecommendedValue'] = 'Not sharing the connection as a hotspot'; $hwc['Evidence'] = 'Get-Service icssvc'
         $hs = Get-Service -Name 'icssvc' -ErrorAction SilentlyContinue
         if ($hs -and $hs.Status -eq 'Running') {
-            Add-AuditResult @fwc -Control 'Mobile Hotspot Active' -Status 'WARN' -Severity 'Low' -CurrentValue 'Windows Mobile Hotspot service (icssvc) is running' -RecommendedValue 'Not sharing the connection as a hotspot' `
-                -Evidence 'Get-Service icssvc' -Recommendation 'The device is (or was just) acting as a Wi-Fi access point and bridging other devices onto its network. Turn Mobile hotspot off unless it is needed.'
+            Add-AuditResult @hwc -Control 'Mobile Hotspot Active' -Status 'WARN' -Severity 'Low' -CurrentValue 'Windows Mobile Hotspot service (icssvc) is running' `
+                -Recommendation 'The device is (or was just) acting as a Wi-Fi access point and bridging other devices onto its network. Turn Mobile hotspot off unless it is needed.'
         } else {
-            Add-AuditResult @fwc -Control 'Mobile Hotspot Active' -Status 'PASS' -Severity 'Low' -CurrentValue "Mobile Hotspot service not running$(if (-not $hs) { ' (not installed)' })" -RecommendedValue 'Not sharing the connection as a hotspot' `
-                -Evidence 'Get-Service icssvc' -Recommendation 'No action required.'
+            Add-AuditResult @hwc -Control 'Mobile Hotspot Active' -Status 'PASS' -Severity 'Low' -CurrentValue "Mobile Hotspot service not running$(if (-not $hs) { ' (not installed)' })" `
+                -Recommendation 'No action required.'
         }
     } catch {
         Add-AuditResult @fwc -Control 'Wi-Fi Current Network Security' -Status 'WARN' -Severity 'Low' -CurrentValue 'Query failed' -Recommendation "Unable to query the Wi-Fi connection: $($_.Exception.Message)"
@@ -9542,7 +9604,9 @@ textarea.lg-input { min-height: 72px; resize: vertical; }
 function Get-HtmlEncoded {
     param([Parameter(Mandatory = $false)][string]$Text)
     if ($null -eq $Text) { return '' }
-    return [System.Net.WebUtility]::HtmlEncode($Text)
+    # Braces too: the page is filled one {{TOKEN}} after another, so a collected value
+    # containing "{{INVENTORY_JSON}}" (a USB device or SSID name) must never be re-expanded.
+    return [System.Net.WebUtility]::HtmlEncode($Text).Replace('{', '&#123;')
 }
 
 function Get-ValueCellHtml {
@@ -11418,6 +11482,16 @@ function Get-PipeSecurityDescriptor {
         .NET fallback (File.GetAccessControl opens the pipe without these flags).
     #>
     param([string]$Path)
+    if (Initialize-EpcPipeSecurity) {
+        $err = 0
+        $sddl = [EpcPipeSecurity]::Read($Path, [ref]$err)
+        return @{ Sddl = $sddl; Error = $err }
+    }
+    return @{ Sddl = $null; Error = -1 }
+}
+
+function Initialize-EpcPipeSecurity {
+    # Loads the EpcPipeSecurity helper once; returns $true when it is available.
     if ($null -eq $Script:PipeSecurityType) {
         $Script:PipeSecurityType = $false
         try {
@@ -11435,6 +11509,27 @@ public static class EpcPipeSecurity {
     static extern uint GetSecurityInfo(IntPtr h, int type, uint info, IntPtr owner, IntPtr group, IntPtr dacl, IntPtr sacl, out IntPtr sd);
     [DllImport("ntdll.dll")]
     static extern int NtQuerySecurityObject(IntPtr h, uint info, IntPtr sd, uint length, out uint needed);
+    [DllImport("ntdll.dll")] static extern uint RtlNtStatusToDosError(int status);
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct FindData {
+        public uint Attributes; public uint CreatedLow, CreatedHigh, AccessedLow, AccessedHigh, WrittenLow, WrittenHigh; public uint SizeHigh; public uint SizeLow; public uint Reserved0; public uint Reserved1;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)] public string FileName;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 14)] public string AlternateName;
+    }
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern IntPtr FindFirstFileW(string pattern, out FindData data);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool FindNextFileW(IntPtr h, out FindData data);
+    [DllImport("kernel32.dll")] static extern bool FindClose(IntPtr h);
+    // Lists pipes natively: .NET's directory listing rejects names with characters that are
+    // invalid in paths (quotes, angle brackets, pipes), which pipe names may contain.
+    public static string[] List() {
+        var list = new System.Collections.Generic.List<string>();
+        FindData d;
+        IntPtr h = FindFirstFileW(@"\\.\pipe\*", out d);
+        if (h == new IntPtr(-1)) { return list.ToArray(); }
+        try { do { if (!String.IsNullOrEmpty(d.FileName)) { list.Add(@"\\.\pipe\" + d.FileName); } } while (FindNextFileW(h, out d)); }
+        finally { FindClose(h); }
+        return list.ToArray();
+    }
     [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     static extern bool ConvertSecurityDescriptorToStringSecurityDescriptorW(IntPtr sd, uint revision, uint info, out IntPtr text, out uint length);
     // SECURITY_SQOS_PRESENT | SECURITY_ANONYMOUS: the pipe server cannot impersonate (or even
@@ -11468,7 +11563,8 @@ public static class EpcPipeSecurity {
                         Marshal.FreeHGlobal(buf); size = needed; buf = Marshal.AllocHGlobal((int)size);
                         st = NtQuerySecurityObject(h, 4, buf, size, out needed);
                     }
-                    if (st != 0) { error = 1000000 + (int)rc; return null; }   // query step, not the open
+                    // Report the native query's own failure (as a Win32 code), not the earlier one.
+                    if (st != 0) { error = 1000000 + (int)RtlNtStatusToDosError(st); return null; }   // query step, not the open
                     IntPtr t2; uint l2;
                     if (!ConvertSecurityDescriptorToStringSecurityDescriptorW(buf, 1, 4, out t2, out l2)) { error = 2000000 + Marshal.GetLastWin32Error(); return null; }
                     string s2 = Marshal.PtrToStringUni(t2); LocalFree(t2); return s2;
@@ -11488,12 +11584,7 @@ public static class EpcPipeSecurity {
             $Script:PipeSecurityType = $true
         } catch { Write-Verbose "Pipe security helper unavailable: $($_.Exception.Message)" }
     }
-    if ($Script:PipeSecurityType) {
-        $err = 0
-        $sddl = [EpcPipeSecurity]::Read($Path, [ref]$err)
-        return @{ Sddl = $sddl; Error = $err }
-    }
-    return @{ Sddl = $null; Error = -1 }
+    return [bool]$Script:PipeSecurityType
 }
 
 function Test-NamedPipePermission {
@@ -11508,7 +11599,11 @@ function Test-NamedPipePermission {
         MITRE_Technique = 'T1559 (Inter-Process Communication), T1134.001 (Token Impersonation/Theft)'; ISO27001_Control = 'A.8.2'; NIS2_Article = 'Art.21(2)(i)'
         RecommendedValue = 'Non-default named pipes do not grant write access to Everyone or Anonymous' }
     try {
-        $pipes = @([System.IO.Directory]::GetFiles('\\.\pipe\'))
+        # Native listing first: .NET's directory listing throws on pipe names with characters that
+        # are invalid in paths. .NET and Get-ChildItem remain as fallbacks if the helper can't load.
+        $pipes = @()
+        if (Initialize-EpcPipeSecurity) { try { $pipes = @([EpcPipeSecurity]::List()) } catch { $pipes = @() } }
+        if (-not $pipes.Count) { try { $pipes = @([System.IO.Directory]::GetFiles('\\.\pipe\')) } catch { $pipes = @() } }
         if (-not $pipes.Count) { $pipes = @(Get-ChildItem -Path '\\.\pipe\' -Force -ErrorAction SilentlyContinue | ForEach-Object { '\\.\pipe\' + $_.Name }) }
         $pipes = @($pipes | Select-Object -First 600)
         New-InventoryTable -Id 'pipes' -Title 'Named pipes' -Note 'Named pipes and the broad groups that can write to them. Each pipe is opened with read-control access only to read its permissions; nothing is sent to the server.' `
