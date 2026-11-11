@@ -20,6 +20,10 @@ The project has no tagged releases yet, so changes are grouped by date. Entries 
 - Windows named pipes: permissions are read from a handle opened with read-control access only,
   busy pipes are waited on briefly, and unreadable pipes are counted by reason (busy, access
   denied, closed).
+- Security fix (Windows named pipes): the pipe check connected to every pipe with the default
+  impersonation level, so a pipe served by a low-privileged program could impersonate the
+  elevated audit process. Pipes are now opened with anonymous security quality of service, and
+  the .NET fallback that could not set it is gone.
 - macOS CIS Intune benchmark: 33 more payload settings in MDM Security Payloads (iCloud services,
   locked sharing settings, AirDrop, local user creation, XProtect upload, profile removal
   password; Level 2 listed but not scored), every line tagged with its recommendation number,

@@ -11246,9 +11246,11 @@ $Script:PipeSecurityType = $null
 function Get-PipeSecurityDescriptor {
     <#
         Returns @{ Sddl; Error } for one pipe. The pipe is opened with READ_CONTROL only (no read
-        or write access), which is what GetNamedSecurityInfo does too: the server sees a client
-        connect and disconnect, nothing is sent. A pipe whose instances are all busy is waited on
-        for 100 ms once. Errors are Win32 codes: 231 busy, 5 access denied, 2 gone.
+        or write access) and anonymous security quality of service, so the pipe server cannot
+        impersonate the elevated auditor: the server sees an anonymous client connect and
+        disconnect, nothing is sent. A pipe whose instances are all busy is waited on for 100 ms
+        once. Errors are Win32 codes: 231 busy, 5 access denied, 2 gone. There is deliberately no
+        .NET fallback (File.GetAccessControl opens the pipe without these flags).
     #>
     param([string]$Path)
     if ($null -eq $Script:PipeSecurityType) {
@@ -11268,7 +11270,10 @@ public static class EpcPipeSecurity {
     static extern uint GetSecurityInfo(IntPtr h, int type, uint info, IntPtr owner, IntPtr group, IntPtr dacl, IntPtr sacl, out IntPtr sd);
     [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     static extern bool ConvertSecurityDescriptorToStringSecurityDescriptorW(IntPtr sd, uint revision, uint info, out IntPtr text, out uint length);
-    static IntPtr Open(string path) { return CreateFileW(path, 0x00020000, 7, IntPtr.Zero, 3, 0, IntPtr.Zero); }
+    // SECURITY_SQOS_PRESENT | SECURITY_ANONYMOUS: the pipe server cannot impersonate (or even
+    // identify) the auditor. Without these flags a pipe client grants impersonation by default,
+    // and a low-privileged pipe server could act as the elevated audit process.
+    static IntPtr Open(string path) { return CreateFileW(path, 0x00020000, 7, IntPtr.Zero, 3, 0x00100000, IntPtr.Zero); }
     public static string Read(string path, out int error) {
         error = 0;
         IntPtr h = Open(path);
@@ -11302,11 +11307,7 @@ public static class EpcPipeSecurity {
         $sddl = [EpcPipeSecurity]::Read($Path, [ref]$err)
         return @{ Sddl = $sddl; Error = $err }
     }
-    try {
-        $acl = if ($PSVersionTable.PSVersion.Major -ge 6) { [System.IO.FileSystemAclExtensions]::GetAccessControl([System.IO.FileInfo]::new($Path)) }
-        else { [System.IO.File]::GetAccessControl($Path) }
-        return @{ Sddl = $acl.GetSecurityDescriptorSddlForm('Access'); Error = 0 }
-    } catch { return @{ Sddl = $null; Error = -1 } }
+    return @{ Sddl = $null; Error = -1 }
 }
 
 function Test-NamedPipePermission {
@@ -11336,7 +11337,7 @@ function Test-NamedPipePermission {
             $sd = Get-PipeSecurityDescriptor -Path $p
             if (-not $sd.Sddl) {
                 $unreadable++
-                $why = switch ($sd.Error) { 231 { 'busy (every instance in use)' } 5 { 'access denied to administrators' } 2 { 'closed during the scan' } default { "error $($sd.Error)" } }
+                $why = switch ($sd.Error) { 231 { 'busy (every instance in use)' } 5 { 'access denied to administrators' } 2 { 'closed during the scan' } -1 { 'not read (pipe security helper unavailable)' } default { "error $($sd.Error)" } }
                 $reasons[$why] = 1 + [int]$reasons[$why]
                 Add-InventoryRow -Id 'pipes' -Values @($name, '', "unreadable: $why")
                 continue
@@ -11357,7 +11358,7 @@ function Test-NamedPipePermission {
             Add-InventoryRow -Id 'pipes' -Values @($name, (@($grants | Select-Object -Unique) -join ', '), $flags)
         }
         $why = (@($reasons.Keys | Sort-Object | ForEach-Object { "$($reasons[$_]) $_" }) -join ', ')
-        $pipeEvidence = 'GetSecurityInfo on \\.\pipe\* opened with READ_CONTROL only'
+        $pipeEvidence = 'GetSecurityInfo on \\.\pipe\* opened with READ_CONTROL and anonymous impersonation level'
         if ($pipes.Count -and $unreadable -gt ($pipes.Count / 2)) {
             Add-AuditResult @fwc -Control 'Named Pipes Writable by Everyone' -Status 'WARN' -Severity 'Low' -CurrentValue "Could not read the ACL of $unreadable of $($pipes.Count) pipe(s) ($why)" -Evidence $pipeEvidence `
                 -Recommendation 'Not evaluated: most pipe security descriptors were unreadable. Review pipes with Sysinternals accesschk -p *.'
