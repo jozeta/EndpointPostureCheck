@@ -262,12 +262,25 @@ function Get-AutoEvidence {
         $text = ''
         $cmd = Get-Command -Name $fn -CommandType Function -ErrorAction SilentlyContinue
         if ($cmd -and $cmd.ScriptBlock) {
-            $ast = $cmd.ScriptBlock.Ast
-            $names = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true) |
-                ForEach-Object { $_.GetCommandName() } | Where-Object { $_ -and $_ -notmatch $Script:EvidenceOwnHelpers -and ($_ -match '^(Get|Test|Resolve)-' -or $_ -match '\.exe$' -or $_ -match '^(netsh|auditpol|secedit|bcdedit|manage-bde|reg|sc|wevtutil|powercfg|w32tm|klist|cmdkey)$') } |
-                Where-Object { $c = Get-Command -Name $_ -ErrorAction SilentlyContinue; -not ($c -and $c.CommandType -eq 'Function' -and $c.ScriptBlock.File -eq $Script:EvidenceSelfPath) } | Select-Object -Unique)
-            $paths = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.StringConstantExpressionAst] }, $true) |
-                ForEach-Object { $_.Value } | Where-Object { $_ -match '^(HKLM|HKCU|HKU|HKCR)[:\\]|^Registry::HKEY_' } | ForEach-Object { $_ -replace '^(HK[A-Z]+):', '$1' } | Select-Object -Unique)
+            # The check's own code, plus the script's helper functions it calls (one level: checks
+            # often read through a shared cache such as the Defender status helper).
+            $asts = [System.Collections.Generic.List[object]]::new(); $asts.Add($cmd.ScriptBlock.Ast)
+            $names = [System.Collections.Generic.List[string]]::new(); $paths = [System.Collections.Generic.List[string]]::new()
+            for ($ai = 0; $ai -lt $asts.Count -and $ai -lt 12; $ai++) {
+                $ast = $asts[$ai]
+                foreach ($cn in @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true) | ForEach-Object { $_.GetCommandName() } | Where-Object { $_ } | Select-Object -Unique)) {
+                    if ($cn -match $Script:EvidenceOwnHelpers) { continue }
+                    $c = Get-Command -Name $cn -ErrorAction SilentlyContinue
+                    if ($c -and $c.CommandType -eq 'Function' -and $c.ScriptBlock.File -eq $Script:EvidenceSelfPath) {
+                        if ($ai -eq 0 -and $c.ScriptBlock.Ast) { $asts.Add($c.ScriptBlock.Ast) }
+                        continue
+                    }
+                    if (($cn -match '^(Get|Test|Resolve|Confirm|Find|Search|Read)-' -or $cn -match '\.exe$' -or $cn -match '^(netsh|auditpol|secedit|bcdedit|manage-bde|reg|sc|wevtutil|powercfg|w32tm|klist|cmdkey)$') -and -not $names.Contains($cn)) { $names.Add($cn) }
+                }
+                foreach ($v in @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.StringConstantExpressionAst] }, $true) | ForEach-Object { $_.Value })) {
+                    if ($v -match '^(HKLM|HKCU|HKU|HKCR)[:\\]|^Registry::HKEY_') { $v = $v -replace '^(HK[A-Z]+):', '$1'; if (-not $paths.Contains($v)) { $paths.Add($v) } }
+                }
+            }
             $parts = @()
             if ($names.Count) { $parts += (Format-EvidenceList -Items $names -Prefix 'Queried with: ') }
             if ($paths.Count) { $parts += (Format-EvidenceList -Items $paths -Prefix 'Registry: ') }
@@ -11390,7 +11403,9 @@ public static class EpcPipeSecurity {
     // SECURITY_SQOS_PRESENT | SECURITY_ANONYMOUS: the pipe server cannot impersonate (or even
     // identify) the auditor. Without these flags a pipe client grants impersonation by default,
     // and a low-privileged pipe server could act as the elevated audit process.
-    static IntPtr Open(string path) { return CreateFileW(path, 0x00020000, 7, IntPtr.Zero, 3, 0x00100000, IntPtr.Zero); }
+    // Share read and write only: the named-pipe driver rejects FILE_SHARE_DELETE on duplex pipes
+    // (ERROR_INVALID_PARAMETER, seen on lsass, srvsvc and the PowerShell host pipes).
+    static IntPtr Open(string path) { return CreateFileW(path, 0x00020000, 3, IntPtr.Zero, 3, 0x00100000, IntPtr.Zero); }
     public static string Read(string path, out int error) {
         error = 0;
         IntPtr h = Open(path);
@@ -11454,7 +11469,7 @@ function Test-NamedPipePermission {
             $sd = Get-PipeSecurityDescriptor -Path $p
             if (-not $sd.Sddl) {
                 $unreadable++
-                $why = switch ($sd.Error) { 231 { 'busy (every instance in use)' } 5 { 'access denied to administrators' } 2 { 'closed during the scan' } -1 { 'not read (pipe security helper unavailable)' } default { "error $($sd.Error)" } }
+                $why = switch ($sd.Error) { 231 { 'busy (every instance in use)' } 5 { 'access denied to administrators' } 2 { 'closed during the scan' } 87 { 'rejected the open request' } -1 { 'not read (pipe security helper unavailable)' } default { "error $($sd.Error)" } }
                 $reasons[$why] = 1 + [int]$reasons[$why]
                 Add-InventoryRow -Id 'pipes' -Values @($name, '', "unreadable: $why")
                 continue
