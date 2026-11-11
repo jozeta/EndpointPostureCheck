@@ -11398,6 +11398,8 @@ public static class EpcPipeSecurity {
     [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr p);
     [DllImport("advapi32.dll")]
     static extern uint GetSecurityInfo(IntPtr h, int type, uint info, IntPtr owner, IntPtr group, IntPtr dacl, IntPtr sacl, out IntPtr sd);
+    [DllImport("ntdll.dll")]
+    static extern int NtQuerySecurityObject(IntPtr h, uint info, IntPtr sd, uint length, out uint needed);
     [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     static extern bool ConvertSecurityDescriptorToStringSecurityDescriptorW(IntPtr sd, uint revision, uint info, out IntPtr text, out uint length);
     // SECURITY_SQOS_PRESENT | SECURITY_ANONYMOUS: the pipe server cannot impersonate (or even
@@ -11417,9 +11419,26 @@ public static class EpcPipeSecurity {
             error = 0;
         }
         try {
+            // GetSecurityInfo as a file object first; some pipes (RPC endpoints, PowerShell host)
+            // answer ERROR_INVALID_PARAMETER there, so try a kernel object, then the native call.
             IntPtr sd;
             uint rc = GetSecurityInfo(h, 1, 4, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, out sd);
-            if (rc != 0) { error = 1000000 + (int)rc; return null; }   // query step, not the open
+            if (rc != 0) rc = GetSecurityInfo(h, 6, 4, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, out sd);
+            if (rc != 0) {
+                uint needed; IntPtr buf = IntPtr.Zero; uint size = 4096;
+                try {
+                    buf = Marshal.AllocHGlobal((int)size);
+                    int st = NtQuerySecurityObject(h, 4, buf, size, out needed);
+                    if (st == unchecked((int)0xC0000023) && needed > size && needed < 65536) {
+                        Marshal.FreeHGlobal(buf); size = needed; buf = Marshal.AllocHGlobal((int)size);
+                        st = NtQuerySecurityObject(h, 4, buf, size, out needed);
+                    }
+                    if (st != 0) { error = 1000000 + (int)rc; return null; }   // query step, not the open
+                    IntPtr t2; uint l2;
+                    if (!ConvertSecurityDescriptorToStringSecurityDescriptorW(buf, 1, 4, out t2, out l2)) { error = 2000000 + Marshal.GetLastWin32Error(); return null; }
+                    string s2 = Marshal.PtrToStringUni(t2); LocalFree(t2); return s2;
+                } finally { if (buf != IntPtr.Zero) Marshal.FreeHGlobal(buf); }
+            }
             try {
                 IntPtr text; uint len;
                 if (!ConvertSecurityDescriptorToStringSecurityDescriptorW(sd, 1, 4, out text, out len)) { error = 2000000 + Marshal.GetLastWin32Error(); return null; }
