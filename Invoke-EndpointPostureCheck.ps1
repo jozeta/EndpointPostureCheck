@@ -11419,10 +11419,10 @@ public static class EpcPipeSecurity {
         try {
             IntPtr sd;
             uint rc = GetSecurityInfo(h, 1, 4, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, out sd);
-            if (rc != 0) { error = (int)rc; return null; }
+            if (rc != 0) { error = 1000000 + (int)rc; return null; }   // query step, not the open
             try {
                 IntPtr text; uint len;
-                if (!ConvertSecurityDescriptorToStringSecurityDescriptorW(sd, 1, 4, out text, out len)) { error = Marshal.GetLastWin32Error(); return null; }
+                if (!ConvertSecurityDescriptorToStringSecurityDescriptorW(sd, 1, 4, out text, out len)) { error = 2000000 + Marshal.GetLastWin32Error(); return null; }
                 string s = Marshal.PtrToStringUni(text);
                 LocalFree(text);
                 return s;
@@ -11469,7 +11469,10 @@ function Test-NamedPipePermission {
             $sd = Get-PipeSecurityDescriptor -Path $p
             if (-not $sd.Sddl) {
                 $unreadable++
-                $why = switch ($sd.Error) { 231 { 'busy (every instance in use)' } 5 { 'access denied to administrators' } 2 { 'closed during the scan' } 87 { 'rejected the open request' } -1 { 'not read (pipe security helper unavailable)' } default { "error $($sd.Error)" } }
+                $why = switch ($sd.Error) { 231 { 'busy (every instance in use)' } 5 { 'access denied to administrators' } 2 { 'closed during the scan' } 87 { 'rejected the open request' } -1 { 'not read (pipe security helper unavailable)' }
+                    { $_ -ge 2000000 } { "descriptor conversion failed (error $($sd.Error - 2000000))"; break }
+                    { $_ -ge 1000000 } { "security query failed (error $($sd.Error - 1000000))"; break }
+                    default { "open failed (error $($sd.Error))" } }
                 $reasons[$why] = 1 + [int]$reasons[$why]
                 Add-InventoryRow -Id 'pipes' -Values @($name, '', "unreadable: $why")
                 continue
