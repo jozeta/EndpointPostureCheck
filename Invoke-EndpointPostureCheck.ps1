@@ -9888,6 +9888,39 @@ function Get-HtmlTemplate {
 .pc-filter-chip .lg-icon { width: 14px; height: 14px; }
 .pc-domains a { white-space: normal; line-height: 1.25; justify-content: space-between; font-size: var(--lg-fs-small); min-height: 24px; }
 .pc-domains .lg-chip { flex: none; }
+.pc-domains a.pc-nav-empty { opacity: .55; }
+/* Findings grouped under one heading per domain (built by the script, same names as the index) */
+.pc-group-head th { padding: var(--lg-space-l) 0 var(--lg-space-xs); border-bottom: 1px solid var(--lg-line-2); text-align: left;
+                    text-transform: none; letter-spacing: normal; font-weight: inherit; scroll-margin-top: var(--lg-space-m); }
+.pc-group-head { scroll-margin-top: var(--lg-space-m); }
+.pc-group:first-child .pc-group-head th { padding-top: var(--lg-space-xs); }
+.pc-group-title { display: inline; margin: 0 var(--lg-space-s) 0 0; font-size: var(--lg-fs-h3, 15px); font-weight: 650; color: var(--lg-text); }
+.pc-group-count { white-space: nowrap; }
+.pc-group td[data-label="Control"] > .pc-sub { display: none; }   /* the domain is the group heading */
+.pc-group-count .lg-chip { margin-left: 4px; }
+/* Collapsible index: the sidebar sits in a sticky wrapper that also holds the handle, so the
+   handle stays reachable when the sidebar has slid out. */
+@media (min-width: 761px) {
+  .lg-app.pc-nav-ready { transition: grid-template-columns .32s cubic-bezier(.4, 0, .2, 1); }
+  .pc-nav-wrap { position: sticky; top: var(--lg-space-m); align-self: start; min-width: 0; z-index: 2; }
+  .pc-nav-wrap > .lg-sidebar { position: relative; top: 0; width: 240px; box-sizing: border-box; }
+  .pc-nav-ready .pc-nav-wrap > .lg-sidebar { transition: transform .32s cubic-bezier(.4, 0, .2, 1), opacity .24s ease, visibility 0s linear 0s; }
+  .lg-app.pc-nav-collapsed { grid-template-columns: 0px minmax(0, 1fr); }
+  .pc-nav-collapsed .pc-nav-wrap > .lg-sidebar { transform: translateX(calc(-100% - var(--lg-space-m))); opacity: 0; visibility: hidden; }
+  .pc-nav-ready.pc-nav-collapsed .pc-nav-wrap > .lg-sidebar { transition: transform .32s cubic-bezier(.4, 0, .2, 1), opacity .24s ease, visibility 0s linear .32s; }
+  .pc-nav-handle { position: absolute; top: 50%; left: 100%; width: 14px; height: 56px; margin-left: calc(var(--lg-space-m) / 2 - 7px);
+                   transform: translateY(-50%); display: grid; place-items: center; padding: 0; cursor: pointer; color: var(--lg-muted);
+                   border: 1px solid var(--lg-line-2); border-radius: 999px; background: var(--lg-glass-strong); box-shadow: var(--lg-shadow); }
+  .pc-nav-handle:hover, .pc-nav-handle:focus-visible { color: var(--lg-text); border-color: color-mix(in srgb, var(--lg-accent) 55%, transparent); }
+  .pc-nav-handle .lg-icon { width: 12px; height: 12px; transform: rotate(180deg); }
+  .pc-nav-ready .pc-nav-handle .lg-icon { transition: transform .32s cubic-bezier(.4, 0, .2, 1); }
+  .pc-nav-collapsed .pc-nav-handle .lg-icon { transform: rotate(0deg); }
+}
+@media (min-width: 761px) and (prefers-reduced-motion: reduce) {
+  .lg-app.pc-nav-ready, .pc-nav-ready .pc-nav-wrap > .lg-sidebar, .pc-nav-ready.pc-nav-collapsed .pc-nav-wrap > .lg-sidebar,
+  .pc-nav-ready .pc-nav-handle .lg-icon { transition: none; }
+}
+@media (max-width: 760px) { .pc-nav-wrap { display: contents; } .pc-nav-handle { display: none; } }
 .lg-nav a[aria-current="location"] { background: color-mix(in srgb, var(--lg-accent) 16%, transparent); color: var(--lg-text); }
 .lg-nav a[aria-current="location"] .lg-icon { color: var(--lg-accent); }
 .pc-score { display: flex; align-items: center; gap: var(--lg-space-l); }
@@ -9968,9 +10001,12 @@ footer.pc-foot { text-align: center; padding: var(--lg-space-s) 0 var(--lg-space
   .pc-table td::before { content: attr(data-label); display: block; font-size: 10px; font-weight: 600; letter-spacing: .07em;
                          text-transform: uppercase; color: var(--lg-muted); }
   .pc-table td:first-child::before { display: none; }
+  .pc-group-head th { display: block; width: 100%; }
 }
 @media print {
-  .lg-sidebar, .pc-toolbar, .pc-theme, .pc-inv-flags, #invMore { display: none !important; }
+  .lg-sidebar, .pc-toolbar, .pc-theme, .pc-inv-flags, #invMore, .pc-nav-handle { display: none !important; }
+  .lg-app.pc-nav-collapsed { grid-template-columns: minmax(0, 1fr); }
+  .pc-group[hidden] { display: table-row-group !important; }
   .lg-app { grid-template-columns: minmax(0, 1fr); }
   .finding-row[hidden] { display: table-row !important; }
 }
@@ -10108,6 +10144,28 @@ footer.pc-foot { text-align: center; padding: var(--lg-space-s) 0 var(--lg-space
   var rows = all('.finding-row');
   var state = { status: 'all', category: '', search: '' };
 
+  // Group the findings under one heading per domain, in index order. Each group is its own
+  // <tbody> with a heading row; the index links point at the headings.
+  var findingsBody = doc.getElementById('findingsBody'), groups = [], groupOf = {};
+  all('.pc-domains a').forEach(function (a, n) {
+    var cat = a.getAttribute('data-category');
+    var g = { cat: cat, link: a, rows: [], el: doc.createElement('tbody'), head: doc.createElement('tr'), count: doc.createElement('span') };
+    g.el.className = 'pc-group'; g.head.className = 'pc-group-head'; g.head.id = 'domain-' + (n + 1);
+    var th = doc.createElement('th'), h = doc.createElement('h3');
+    th.colSpan = 6; th.scope = 'colgroup'; h.className = 'pc-group-title'; h.textContent = cat;
+    g.count.className = 'lg-muted lg-small pc-group-count';
+    th.appendChild(h); th.appendChild(g.count); g.head.appendChild(th); g.el.appendChild(g.head);
+    a.setAttribute('href', '#' + g.head.id);
+    groups.push(g); groupOf[cat] = g;
+  });
+  rows.forEach(function (r) { var g = groupOf[r.getAttribute('data-category')]; if (g) { g.rows.push(r); g.el.appendChild(r); } });
+  groups.forEach(function (g) {
+    findingsBody.parentNode.insertBefore(g.el, findingsBody);
+    g.fail = g.rows.filter(function (r) { return r.getAttribute('data-status') === 'FAIL'; }).length;
+    g.warn = g.rows.filter(function (r) { return r.getAttribute('data-status') === 'WARN'; }).length;
+  });
+  function chip(tone, n, word) { var c = doc.createElement('span'); c.className = 'lg-chip ' + tone; c.textContent = n + ' ' + word; return c; }
+
   function matches(row) {
     var s = row.getAttribute('data-status'), sev = row.getAttribute('data-severity');
     var ok = state.status === 'all' ||
@@ -10120,15 +10178,19 @@ footer.pc-foot { text-align: center; padding: var(--lg-space-s) 0 var(--lg-space
   function apply() {
     var shown = 0;
     rows.forEach(function (r) { var m = matches(r); r.hidden = !m; if (m) shown++; });
+    groups.forEach(function (g) {
+      var vis = g.rows.filter(function (r) { return !r.hidden; }).length, total = g.rows.length;
+      g.el.hidden = vis === 0;
+      g.link.classList.toggle('pc-nav-empty', vis === 0);
+      g.count.textContent = (vis === total ? total : vis + ' of ' + total) + (total === 1 ? ' control' : ' controls');
+      if (g.fail) g.count.appendChild(chip('lg-bad', g.fail, 'fail'));
+      if (g.warn) g.count.appendChild(chip('lg-warn', g.warn, 'warn'));
+    });
     doc.getElementById('emptyRow').hidden = shown !== 0;
     doc.getElementById('resultCount').textContent = shown + ' of ' + rows.length + ' controls';
     all('[data-filter]').forEach(function (b) {
       var on = b.getAttribute('data-filter') === state.status;
       b.setAttribute(b.classList.contains('pc-kpi') ? 'aria-pressed' : 'aria-selected', on ? 'true' : 'false');
-    });
-    all('.pc-domains a').forEach(function (a) {
-      if (a.getAttribute('data-category') === state.category && state.category) a.setAttribute('aria-current', 'page');
-      else a.removeAttribute('aria-current');
     });
     doc.getElementById('categoryFilter').value = state.category;
     doc.getElementById('domainChip').hidden = !state.category;
@@ -10146,12 +10208,16 @@ footer.pc-foot { text-align: center; padding: var(--lg-space-s) 0 var(--lg-space
       if (b.classList.contains('pc-kpi')) revealFindings();
     });
   });
-  all('.pc-domains a').forEach(function (a) {
-    a.addEventListener('click', function (e) {
-      e.preventDefault();   // no "#findings" jump: filter in place, scroll only if needed
-      var c = a.getAttribute('data-category');
-      state.category = state.category === c ? '' : c; apply();
-      if (state.category) revealFindings();
+  // The domain list is an index, not a filter: a click scrolls to the domain's heading. A domain
+  // hidden by the current filters is brought back by clearing them first.
+  var spyLockUntil = 0;
+  groups.forEach(function (g) {
+    g.link.addEventListener('click', function (e) {
+      e.preventDefault();
+      if (g.el.hidden) { state.status = 'all'; state.category = ''; state.search = ''; doc.getElementById('searchInput').value = ''; apply(); }
+      spyLockUntil = Date.now() + 900;   // keep the clicked link lit while the smooth scroll passes other domains
+      markDomain(g);
+      g.head.scrollIntoView({ block: 'start' });
     });
   });
   doc.getElementById('domainChip').addEventListener('click', function () { state.category = ''; apply(); });
@@ -10161,7 +10227,21 @@ footer.pc-foot { text-align: center; padding: var(--lg-space-s) 0 var(--lg-space
   // The current section is the last one whose top has scrolled up to the top
   // edge (the first section wins at the very top of the page).
   // Note: "sec-overview", not "overview", which is a sprite symbol id.
-  var sectionIds = ['sec-overview', 'system', 'findings', 'inventory'], spyQueued = false;
+  var sectionIds = ['sec-overview', 'system', 'findings', 'inventory'], spyQueued = false, activeGroup = null;
+  var sidebar = doc.querySelector('.lg-sidebar');
+  var reduceMotion = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  // Light the index link of the domain on screen and keep it visible in the sidebar, which
+  // scrolls on its own.
+  function markDomain(g) {
+    if (g === activeGroup) return;
+    activeGroup = g;
+    groups.forEach(function (x) { if (x === g) x.link.setAttribute('aria-current', 'location'); else x.link.removeAttribute('aria-current'); });
+    if (!g || !sidebar || sidebar.scrollHeight <= sidebar.clientHeight) return;
+    var lr = g.link.getBoundingClientRect(), sr = sidebar.getBoundingClientRect();
+    if (lr.top < sr.top + 48 || lr.bottom > sr.bottom - 48) {
+      sidebar.scrollTo({ top: sidebar.scrollTop + (lr.top - sr.top) - sr.height / 2 + lr.height / 2, behavior: reduceMotion ? 'auto' : 'smooth' });
+    }
+  }
   function spy() {
     spyQueued = false;
     var line = 80, current = sectionIds[0];
@@ -10169,6 +10249,15 @@ footer.pc-foot { text-align: center; padding: var(--lg-space-s) 0 var(--lg-space
     sectionLinks.forEach(function (l) {
       if (l.getAttribute('href') === '#' + current) l.setAttribute('aria-current', 'location'); else l.removeAttribute('aria-current');
     });
+    if (Date.now() < spyLockUntil) return;
+    // The current domain is the last visible heading above the reading line, while the findings
+    // table is on screen (none above the table or once the inventory has taken over).
+    var domainLine = window.innerHeight * 0.3, g = null;
+    if (current === 'findings') {
+      groups.forEach(function (x) { if (!x.el.hidden && x.head.getBoundingClientRect().top <= domainLine) g = x; });
+      if (!g) { for (var i = 0; i < groups.length; i++) if (!groups[i].el.hidden) { if (groups[i].head.getBoundingClientRect().top < window.innerHeight) g = groups[i]; break; } }
+    }
+    markDomain(g);
   }
   function queueSpy() { if (!spyQueued) { spyQueued = true; window.requestAnimationFrame(spy); } }
   window.addEventListener('scroll', queueSpy, { passive: true });
@@ -10177,6 +10266,34 @@ footer.pc-foot { text-align: center; padding: var(--lg-space-s) 0 var(--lg-space
   doc.getElementById('categoryFilter').addEventListener('change', function (e) { state.category = e.target.value; apply(); });
   doc.getElementById('searchInput').addEventListener('input', function (e) { state.search = e.target.value.toLowerCase().trim(); apply(); });
   doc.getElementById('printBtn').addEventListener('click', function () { window.print(); });
+
+  // Collapsible index: a handle at the middle of the sidebar's edge slides it out and back. The
+  // choice is remembered per browser when storage is available.
+  var app = doc.querySelector('.lg-app');
+  if (app && sidebar) {
+    var wrap = doc.createElement('div'), handle = doc.createElement('button');
+    wrap.className = 'pc-nav-wrap';
+    sidebar.parentNode.insertBefore(wrap, sidebar); wrap.appendChild(sidebar);
+    sidebar.id = sidebar.id || 'pcSidebar';
+    handle.type = 'button'; handle.className = 'pc-nav-handle'; handle.setAttribute('aria-controls', sidebar.id);
+    handle.innerHTML = '<svg class="lg-icon" aria-hidden="true"><use href="#chevron-right"/></svg>';   // static markup, no data
+    wrap.appendChild(handle);
+    var setNav = function (collapsed) {
+      app.classList.toggle('pc-nav-collapsed', collapsed);
+      handle.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+      handle.setAttribute('aria-label', collapsed ? 'Show the side panel' : 'Hide the side panel');
+      handle.title = handle.getAttribute('aria-label');
+    };
+    var navSaved = false;
+    try { navSaved = localStorage.getItem('pc-nav') === 'collapsed'; } catch (e) { navSaved = false; }
+    setNav(navSaved);
+    window.requestAnimationFrame(function () { window.requestAnimationFrame(function () { app.classList.add('pc-nav-ready'); }); });
+    handle.addEventListener('click', function () {
+      var collapsed = !app.classList.contains('pc-nav-collapsed');
+      setNav(collapsed);
+      try { localStorage.setItem('pc-nav', collapsed ? 'collapsed' : 'open'); } catch (e) { /* storage unavailable */ }
+    });
+  }
 
   // Theme: follows the system unless the viewer picks one (remembered when storage is available).
   function setTheme(t) {
