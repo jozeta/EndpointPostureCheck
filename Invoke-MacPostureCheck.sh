@@ -1,5 +1,5 @@
 #!/usr/bin/env zsh
-# EndpointPostureCheck for macOS — built 2026-11-10 22:33:07 from src/*.zsh. Do not edit directly.
+# EndpointPostureCheck for macOS — built 2026-11-11 07:26:51 from src/*.zsh. Do not edit directly.
 
 # ---- 00-header.zsh ----
 #
@@ -5463,28 +5463,6 @@ check_login_window_policy_banner() {
 #
 # Domain 20: Removable Media & Peripheral Control
 
-check_usb_restriction_profile_presence() {
-    write_section_banner 'Removable Media & Peripheral Control - USB Restriction Profile Presence'
-    run_root profiles list -type configuration
-
-    local lower="${ROOT_CMD_OUTPUT:l}"
-    if [[ "$lower" == *"usbrestrictedmode"* ]]; then
-        add_audit_result --category 'Removable Media & Peripheral Control' --control 'USB Restriction Profile Presence' \
-            --status INFO --severity Informational \
-            --current 'A configuration profile referencing USB restricted mode is installed' \
-            --recommended 'N/A' \
-            --cis 'CIS 4.8' --nist 'MP-7' --iso27001 'A.7.10' --nis2 'Art.21(2)(d)' --cis-macos 'N/A' --mscp 'N/A' \
-            --recommendation 'Informational only.'
-    else
-        add_audit_result --category 'Removable Media & Peripheral Control' --control 'USB Restriction Profile Presence' \
-            --status WARN --severity Medium \
-            --current 'No configuration profile appears to manage USB restricted mode' \
-            --recommended 'A configuration profile referencing USB restricted mode is installed' \
-            --cis 'CIS 4.8' --nist 'MP-7' --iso27001 'A.7.10' --nis2 'Art.21(2)(d)' --cis-macos 'N/A' --mscp 'N/A' \
-            --recommendation 'This is a best-effort text match against installed profile identifiers, not full profile-payload inspection — confirm manually via MDM console if USB device control is required by policy.'
-    fi
-}
-
 check_thunderbolt_security_level() {
     if is_apple_silicon; then
         add_audit_result --category 'Removable Media & Peripheral Control' --control 'Thunderbolt Security Level' \
@@ -7040,6 +7018,20 @@ check_on_device_dictation_enforced() {
         --recommendation 'Deploy a Restrictions profile with forceOnDeviceOnlyDictation=true so dictated audio is never sent to Apple servers.'
 }
 
+# CIS macOS 26 Tahoe Intune 2.14.2.x: further Apple Intelligence features.
+_ai_restriction() {
+    evaluate_managed_pref --category "$AI_CATEGORY" --control "$1" \
+        --severity Low --suite com.apple.applicationaccess --key "$2" --expect 0 \
+        --cis 'CIS 4.1, 4.8, 15.3' --nist 'AC-20' --iso27001 'A.5.14' --nis2 'Art.21(2)(d)' \
+        --cis-macos "CIS-macOS Intune $3" --mscp 'N/A' \
+        --recommendation "Deploy a Restrictions profile (or the Intune Intelligence declaration) with $2=false if organizational data must not be processed by this Apple Intelligence feature."
+}
+check_mail_smart_replies_disabled() { _ai_restriction 'Mail Smart Replies Disabled' allowMailSmartReplies 2.14.2.1.1.1; }
+check_safari_summary_disabled() { _ai_restriction 'Safari Summaries Disabled' allowSafariSummary 2.14.2.1.3.1; }
+check_image_playground_disabled() { _ai_restriction 'Image Playground Disabled' allowImagePlayground 2.14.2.3; }
+check_apple_intelligence_report_disabled() { _ai_restriction 'Apple Intelligence Report Disabled' allowAppleIntelligenceReport 2.14.2.4; }
+check_genmoji_disabled() { _ai_restriction 'Genmoji Disabled' allowGenmoji 2.14.2.6; }
+
 # ---- 41-power-management.zsh ----
 #
 # Domain 32: Power Management & Sleep
@@ -7157,9 +7149,15 @@ check_wake_for_network_access_disabled() {
         return 0
     fi
 
-    local womp_values
+    local womp_values ring_values
     womp_values=$(_pmset_values "$ROOT_CMD_OUTPUT" womp | tr '\n' ' ')
-    if [[ -z "${womp_values// /}" ]]; then
+    # Wake on modem ring (CIS macOS Intune 2.11.1.4): only reported on hardware that has it.
+    ring_values=$(_pmset_values "$ROOT_CMD_OUTPUT" ring | tr '\n' ' ')
+    if [[ " $ring_values" == *" 1 "* ]]; then
+        add_audit_result --category "$POWER_CATEGORY" --control 'Wake for Network Access Disabled' \
+            --status FAIL --severity Low --current "womp values: ${womp_values:-none}; ring values: $ring_values" "${fw[@]}" \
+            --recommendation 'Disable wake for network access and wake on modem ring: "sudo pmset -a womp 0 ring 0".'
+    elif [[ -z "${womp_values// /}" ]]; then
         # No womp line at all: hardware without Wake-on-LAN support.
         add_audit_result --category "$POWER_CATEGORY" --control 'Wake for Network Access Disabled' \
             --status PASS --severity Low --current 'No womp setting reported (not supported on this hardware)' "${fw[@]}" \
@@ -8426,6 +8424,7 @@ _mp_value_ok() {
         le) [[ "$value" == <-> && "$expected" == <-> ]] && (( value <= expected )) ;;
         ge) [[ "$value" == <-> && "$expected" == <-> ]] && (( value >= expected )) ;;
         list) [[ ",$value," == *",$expected,"* ]] ;;
+        absent) return 1 ;;   # any value present is a finding
         *) return 1 ;;
     esac
 }
@@ -8524,37 +8523,73 @@ JXA
 
 typeset -ga MP_PAYLOAD_ROWS
 MP_PAYLOAD_ROWS=(
-    'com.apple.MCX.FileVault2|ForceEnableInSetupAssistant|eq|1|FileVault forced in Setup Assistant'
-    'com.apple.MCX.FileVault2|DeferForceAtUserLoginMaxBypassAttempts|eq|0|no FileVault bypass at login'
-    'com.apple.MCX.FileVault2|ShowRecoveryKey|eq|0|recovery key not shown to the user'
-    'com.apple.MCX|dontAllowFDEDisable|eq|1|users cannot turn FileVault off'
-    'com.apple.MCX|DestroyFVKeyOnStandby|eq|1|FileVault key destroyed on standby'
-    '__profile__|ProfileRemovalDisallowed|eq|1|profiles cannot be removed by the user'
-    'com.apple.applicationaccess|allowPasswordSharing|eq|0|password sharing off'
-    'com.apple.applicationaccess|allowEraseContentAndSettings|eq|0|Erase All Content and Settings off'
-    'com.apple.applicationaccess|allowUIConfigurationProfileInstallation|eq|0|users cannot install profiles'
-    'com.apple.applicationaccess|allowPasswordProximityRequests|eq|0|password proximity requests off'
-    'com.apple.applicationaccess|allowAutoUnlock|eq|0|Apple Watch auto unlock off'
-    'com.apple.mobiledevice.passwordpolicy|minLength|ge|15|passcode at least 15 characters'
-    'com.apple.mobiledevice.passwordpolicy|requireAlphanumeric|eq|1|alphanumeric passcode'
-    'com.apple.mobiledevice.passwordpolicy|minComplexChars|ge|1|at least one complex character'
-    'com.apple.mobiledevice.passwordpolicy|maxInactivity|le|15|lock after at most 15 minutes'
-    'com.apple.mobiledevice.passwordpolicy|maxGracePeriod|eq|0|no passcode grace period'
-    'com.apple.mobiledevice.passwordpolicy|minutesUntilFailedLoginReset|ge|15|failed-login counter reset after at least 15 minutes'
-    'com.apple.systempolicy.managed|DisableOverride|eq|1|users cannot override Gatekeeper'
-    'com.apple.systempolicy.control|EnableAssessment|eq|1|Gatekeeper assessment on'
-    'com.apple.system-extension-policy|AllowUserOverrides|eq|0|users cannot approve system extensions'
+    'com.apple.MCX.FileVault2|ForceEnableInSetupAssistant|eq|1|2.3.1.5 FileVault forced in Setup Assistant'
+    'com.apple.MCX.FileVault2|DeferForceAtUserLoginMaxBypassAttempts|eq|0|2.3.1.3 no FileVault bypass at login'
+    'com.apple.MCX.FileVault2|ShowRecoveryKey|eq|0|2.3.1.4 recovery key not shown to the user'
+    'com.apple.MCX|dontAllowFDEDisable|eq|1|2.3.2.1 users cannot turn FileVault off'
+    'com.apple.MCX|DestroyFVKeyOnStandby|eq|1|2.11.1.5 FileVault key destroyed on standby'
+    '__profile__|ProfileRemovalDisallowed|eq|1|2.13.1 profiles cannot be removed by the user'
+    'com.apple.applicationaccess|allowPasswordSharing|eq|0|2.8.2 password sharing off'
+    'com.apple.applicationaccess|allowEraseContentAndSettings|eq|0|2.8.4 Erase All Content and Settings off'
+    'com.apple.applicationaccess|allowUIConfigurationProfileInstallation|eq|0|2.8.17 users cannot install profiles'
+    'com.apple.applicationaccess|allowPasswordProximityRequests|eq|0|2.8.32 password proximity requests off'
+    'com.apple.applicationaccess|allowAutoUnlock|eq|0|2.8.15 Apple Watch auto unlock off'
+    'com.apple.mobiledevice.passwordpolicy|minLength|ge|15|2.9.1.12 passcode at least 15 characters'
+    'com.apple.mobiledevice.passwordpolicy|requireAlphanumeric|eq|1|2.9.1.11 alphanumeric passcode'
+    'com.apple.mobiledevice.passwordpolicy|minComplexChars|ge|1|2.9.1.4 at least one complex character'
+    'com.apple.mobiledevice.passwordpolicy|maxInactivity|le|15|2.9.1.3 lock after at most 15 minutes'
+    'com.apple.mobiledevice.passwordpolicy|maxGracePeriod|eq|0|2.9.1.2 no passcode grace period'
+    'com.apple.mobiledevice.passwordpolicy|minutesUntilFailedLoginReset|ge|15|2.9.1.10 failed-login counter reset after at least 15 minutes'
+    'com.apple.systempolicy.managed|DisableOverride|eq|1|2.12.2.1 users cannot override Gatekeeper'
+    'com.apple.systempolicy.control|EnableAssessment|eq|1|2.12.1.2 Gatekeeper assessment on'
+    'com.apple.system-extension-policy|AllowUserOverrides|eq|0|2.11.3.1 users cannot approve system extensions'
+    # Further rows from the CIS macOS 26 Tahoe Intune benchmark (supervised devices). A sixth
+    # field "L2" marks Level 2 settings: listed in the details but never scored.
+    'com.apple.MCX.FileVault2|UserEntersMissingInfo|eq|1|2.3.1.1 user supplies missing FileVault info'
+    'com.apple.loginwindow|DisableLoginItemsSuppression|eq|1|2.4.2.1 login items cannot be suppressed'
+    '__profile__|RemovalPassword|absent||2.7.1 no profile removal password payload'
+    'com.apple.applicationaccess|allowBluetoothSharingModification|eq|0|2.8.1 Bluetooth Sharing setting locked'
+    'com.apple.applicationaccess|allowFileSharingModification|eq|0|2.8.3 File Sharing setting locked'
+    'com.apple.applicationaccess|allowCloudPhotoLibrary|eq|0|2.8.7 iCloud Photos off'
+    'com.apple.applicationaccess|allowCloudDocumentSync|eq|0|2.8.8 iCloud Drive off'
+    'com.apple.applicationaccess|allowCloudBookmarks|eq|0|2.8.10 iCloud Bookmarks off'
+    'com.apple.applicationaccess|allowCloudFreeform|eq|0|2.8.11 iCloud Freeform off'
+    'com.apple.applicationaccess|allowCloudCalendar|eq|0|2.8.12 iCloud Calendar off'
+    'com.apple.applicationaccess|allowARDRemoteManagementModification|eq|0|2.8.13 Remote Management setting locked'
+    'com.apple.applicationaccess|allowStartupDiskModification|eq|0|2.8.16 startup disk setting locked'
+    'com.apple.applicationaccess|allowDeviceNameModification|eq|0|2.8.18 device name locked'
+    'com.apple.applicationaccess|allowInternetSharingModification|eq|0|2.8.19 Internet Sharing setting locked'
+    'com.apple.applicationaccess|allowFindMyFriends|eq|0|2.8.21 Find My Friends off'
+    'com.apple.applicationaccess|allowAirDrop|eq|0|2.8.22 AirDrop off'
+    'com.apple.applicationaccess|allowCloudNotes|eq|0|2.8.24 iCloud Notes off'
+    'com.apple.applicationaccess|allowMultiplayerGaming|eq|0|2.8.25 multiplayer gaming off'
+    'com.apple.applicationaccess|allowLocalUserCreation|eq|0|2.8.26 users cannot add accounts'
+    'com.apple.applicationaccess|allowPrinterSharingModification|eq|0|2.8.28 Printer Sharing setting locked'
+    'com.apple.applicationaccess|allowCloudReminders|eq|0|2.8.31 iCloud Reminders off'
+    'com.apple.applicationaccess|allowiPhoneMirroring|eq|0|2.8.33 iPhone Mirroring off'
+    'com.apple.applicationaccess|allowCloudMail|eq|0|2.8.34 iCloud Mail off'
+    'com.apple.applicationaccess|allowUniversalControl|eq|0|2.8.35 Universal Control off'
+    'com.apple.applicationaccess|allowCloudAddressBook|eq|0|2.8.36 iCloud Contacts off'
+    'com.apple.applicationaccess|allowiTunesFileSharing|eq|0|2.8.38 Finder file transfer off'
+    'com.apple.applicationaccess|allowCloudKeychainSync|eq|0|2.8.39 iCloud Keychain sync off'
+    'com.apple.systempolicy.control|EnableXProtectMalwareUpload|eq|0|2.12.1.1 XProtect malware upload off'
+    'com.apple.appstore|restrict-store-softwareupdate-only|eq|1|2.2.1 App Store limited to software updates|L2'
+    'com.apple.AssetCache.managed|AutoActivation|eq|0|2.6.1.1 content caching auto-activation off|L2'
+    'com.apple.applicationaccess|allowGameCenter|eq|0|2.8.14 Game Center off|L2'
+    'com.apple.applicationaccess|allowPasswordAutoFill|eq|0|2.8.23 Password AutoFill off|L2'
+    'com.apple.systempolicy.control|AllowIdentifiedDevelopers|eq|0|2.12.1.3 Gatekeeper allows App Store apps only|L2'
 )
 
 check_mdm_security_payloads() {
     write_section_banner 'MDM, Profiles & Supervision - Security Payloads'
     local enrolled="" lines="" row="" type="" key="" op="" expected="" label="" value="" ok=0
-    local -a bad unset fw
+    local level=""
+    local -a bad unset fw l2
     local -A seen
     fw=(--category 'MDM, Profiles & Supervision' --control 'MDM Security Payloads'
         --recommended 'FileVault, passcode, restriction, Gatekeeper and profile-removal payloads as the CIS macOS Intune benchmark recommends'
         --cis 'CIS 4.1, 4.2' --nist 'CM-6, IA-5' --mitre 'T1562 (Impair Defenses)' --iso27001 'A.8.9' --nis2 'Art.21(2)(d)'
-        --cis-macos 'N/A' --mscp 'N/A' --evidence 'profiles show -output stdout-xml (payload settings of installed profiles)')
+        --cis-macos 'CIS-macOS Intune (number at the start of each line)' --mscp 'N/A' --evidence 'profiles show -output stdout-xml (payload settings of installed profiles)')
     enrolled=$(profiles status -type enrollment 2>/dev/null)
     if [[ "$enrolled" != *"MDM enrollment: Yes"* ]]; then
         add_audit_result "${fw[@]}" --status INFO --severity Informational --current 'Not enrolled in MDM: payload settings are not applicable' \
@@ -8567,15 +8602,21 @@ check_mdm_security_payloads() {
     for row in "${(@f)lines}"; do [[ -n "$row" ]] || continue; k="${row%|*}"; seen[$k]="${row##*|}"; done
     for row in "${MP_PAYLOAD_ROWS[@]}"; do
         type="${row%%|*}"; row="${row#*|}"; key="${row%%|*}"; row="${row#*|}"; op="${row%%|*}"; row="${row#*|}"; expected="${row%%|*}"; label="${row#*|}"
+        level=""; [[ "$label" == *'|L2' ]] && { level=L2; label="${label%|L2}"; }
         k="$type|$key"; value="${seen[$k]:-}"
         [[ "$value" == true ]] && value=1; [[ "$value" == false ]] && value=0
-        if [[ -z "$value" ]]; then unset+=("$label: $type $key not set (expected $expected)")
+        if [[ "$op" == absent ]]; then
+            if [[ -z "$value" ]]; then ok=$((ok + 1)); else bad+=("$label: $type $key present"); fi
+        elif [[ -n "$level" ]]; then
+            if [[ -n "$value" ]] && _mp_value_ok "$value" "$op" "$expected"; then l2+=("Level 2 (not scored), as recommended: $label")
+            else l2+=("Level 2 (not scored): $label: $type $key = ${value:-not set} (expected $expected)"); fi
+        elif [[ -z "$value" ]]; then unset+=("$label: $type $key not set (expected $expected)")
         elif _mp_value_ok "$value" "$op" "$expected"; then ok=$((ok + 1))
         else bad+=("$label: $type $key = $value (expected $expected)")
         fi
     done
     local -a all
-    all=("${bad[@]}" "${unset[@]}")
+    all=("${bad[@]}" "${unset[@]}" "${l2[@]}")
     if (( ${#bad[@]} )); then
         add_audit_result "${fw[@]}" --status FAIL --severity Medium --current "${#bad[@]} payload setting(s) weaker than recommended, ${#unset[@]} not set, $ok as recommended" \
             --details "${(F)all}" --recommendation 'Correct the listed settings in the MDM (Intune: Devices > macOS > Configuration). Each line names the payload type and key.'
@@ -8583,7 +8624,7 @@ check_mdm_security_payloads() {
         add_audit_result "${fw[@]}" --status WARN --severity Medium --current "${#unset[@]} recommended payload setting(s) not delivered by MDM, $ok as recommended" \
             --details "${(F)all}" --recommendation 'Add the listed settings to the MDM configuration profiles for this Mac.'
     else
-        add_audit_result "${fw[@]}" --status PASS --severity Medium --current "All $ok checked payload settings as recommended" --recommendation 'No action required.'
+        add_audit_result "${fw[@]}" --status PASS --severity Medium --current "All $ok checked payload settings as recommended" --details "${(F)l2}" --recommendation 'No action required.'
     fi
 }
 
@@ -8711,6 +8752,310 @@ check_filevault_standby_key_policy() {
             --recommendation 'sudo pmset -b standbydelaylow 900 standbydelayhigh 900 highstandbythreshold 90 hibernatemode 25 (destroys the FileVault key on standby; wake takes longer).'
     else
         add_audit_result "${fw[@]}" --status PASS --severity Low --current 'Standby destroys the FileVault key on battery' --recommendation 'No action required.'
+    fi
+}
+
+# ---- 45-peripherals-wireless.zsh ----
+#
+# Peripherals and wireless: connected USB devices, mounted external volumes, Bluetooth
+# devices and discoverability, known Wi-Fi networks, and accessory approval (USB restricted
+# mode). Device names, SSIDs and plist values are data: they are cleaned of control
+# characters in the JXA parsers and only compared as strings (day counts are digits-checked
+# before any arithmetic).
+
+# --- parsers (JXA reads JSON/plists; one line per item, fields separated by \x1f (read with IFS=\x1f: a tab IFS would merge empty fields)) ---
+
+# system_profiler SPUSBHostDataType / SPUSBDataType JSON on stdin. Every object inside an
+# "_items" array is a device (the top level holds the bus controllers).
+# Fields: name, vendor, vendor id, product id, speed, storage (yes/no).
+_usb_device_lines() {
+    osascript -l JavaScript -e '
+function run(argv) {
+  var raw = $.NSString.alloc.initWithDataEncoding($.NSFileHandle.fileHandleWithStandardInput.readDataToEndOfFile, $.NSUTF8StringEncoding).js;
+  var d; try { d = JSON.parse(raw); } catch (e) { return ""; }
+  var out = [];
+  function clean(s) { return s === undefined || s === null ? "" : String(s).replace(/[\x00-\x1f\x7f]/g, " ").slice(0, 100); }
+  function pick(o, keys) { for (var i = 0; i < keys.length; i++) if (o[keys[i]] !== undefined) return o[keys[i]]; return undefined; }
+  function walk(o, inItems) {
+    if (Array.isArray(o)) { o.forEach(function (x) { walk(x, inItems); }); return; }
+    if (!o || typeof o !== "object") return;
+    if (inItems && o._name !== undefined) {
+      var storage = (o.Media !== undefined || o.USBDeviceKeyMedia !== undefined || /storage|disk|card reader/i.test(o._name)) ? "yes" : "no";
+      out.push([clean(o._name), clean(pick(o, ["USBDeviceKeyVendorName", "manufacturer"])), clean(pick(o, ["USBDeviceKeyVendorID", "vendor_id"])),
+        clean(pick(o, ["USBDeviceKeyProductID", "product_id"])), clean(pick(o, ["USBDeviceKeyLinkSpeed", "device_speed"])), storage].join("\x1f"));
+    }
+    Object.keys(o).forEach(function (k) { if (o[k] && typeof o[k] === "object") walk(o[k], inItems || k === "_items"); });
+  }
+  Object.keys(d).forEach(function (k) { walk(d[k], false); });
+  return out.join("\n");
+}' 2>/dev/null
+}
+
+# system_profiler SPBluetoothDataType JSON on stdin. First line "controller<TAB>state<TAB>discoverable",
+# then one line per device: name, type, address, connected (yes/no), firmware.
+_bluetooth_lines() {
+    osascript -l JavaScript -e '
+function run(argv) {
+  var raw = $.NSString.alloc.initWithDataEncoding($.NSFileHandle.fileHandleWithStandardInput.readDataToEndOfFile, $.NSUTF8StringEncoding).js;
+  var d; try { d = JSON.parse(raw); } catch (e) { return ""; }
+  var top = (d.SPBluetoothDataType || [])[0] || {};
+  function clean(s) { return s === undefined || s === null ? "" : String(s).replace(/[\x00-\x1f\x7f]/g, " ").slice(0, 100); }
+  if (!top.controller_properties) return "";
+  var c = top.controller_properties;
+  var out = [["controller", clean(c.controller_state), clean(c.controller_discoverable)].join("\x1f")];
+  [["device_connected", "yes"], ["device_not_connected", "no"]].forEach(function (g) {
+    (top[g[0]] || []).forEach(function (entry) {
+      Object.keys(entry || {}).forEach(function (name) {
+        var p = entry[name] || {};
+        out.push([clean(name), clean(p.device_minorType || p.device_majorType), clean(p.device_address), g[1], clean(p.device_firmwareVersion)].join("\x1f"));
+      });
+    });
+  });
+  return out.join("\n");
+}' 2>/dev/null
+}
+
+# /Library/Preferences/com.apple.wifi.known-networks.plist (root-only). The layout is not
+# documented, so keys are searched by name at any depth: one line per network with
+# SSID, security, auto-join (on/off), hidden (yes/no), private address mode, last joined
+# (YYYY-MM-DD) and days since then.
+_known_wifi_lines() {
+    local plist="${KNOWN_WIFI_PLIST:-/Library/Preferences/com.apple.wifi.known-networks.plist}"
+    [[ -r "$plist" ]] || return 1
+    osascript -l JavaScript - "$plist" <<'JXA' 2>/dev/null
+ObjC.import('Foundation');
+function run(argv) {
+  var nd = $.NSDictionary.dictionaryWithContentsOfFile(argv[0]);
+  if (!nd || nd.isNil()) return '';
+  var o = ObjC.deepUnwrap(nd), out = [], now = Date.now();
+  function clean(s) { return s === undefined || s === null ? '' : String(s).replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 100); }
+  function isPlain(v) { return v && typeof v === 'object' && !(v instanceof Date) && !Array.isArray(v); }
+  function find(obj, re, depth) {
+    if (!isPlain(obj) || depth > 3) return undefined;
+    for (var k in obj) if (re.test(k)) return obj[k];
+    for (var k2 in obj) { var r = find(obj[k2], re, depth + 1); if (r !== undefined) return r; }
+    return undefined;
+  }
+  function newest(obj, depth, best) {
+    if (!isPlain(obj) || depth > 3) return best;
+    for (var k in obj) {
+      var v = obj[k];
+      if (v instanceof Date && /JoinedBy(User|System)At|LastJoined|LastConnected|LastAutoJoin/i.test(k) && (!best || v > best)) best = v;
+      else best = newest(v, depth + 1, best);
+    }
+    return best;
+  }
+  Object.keys(o).forEach(function (k) {
+    var n = o[k];
+    if (!isPlain(n) || !/^wifi\.network\./.test(k)) return;
+    var ssid = k.replace(/^wifi\.network\.(ssid\.)?/, '');
+    var sec = find(n, /^SupportedSecurityTypes$/, 0);
+    if (sec === undefined) sec = find(n, /SecurityType|^Security$/i, 0);
+    sec = Array.isArray(sec) ? sec.join(' ') : clean(sec);
+    var aj = find(n, /^AutoJoinDisabled$/, 0), hidden = find(n, /^Hidden$/, 0), pm = find(n, /PrivateMACAddressMode/, 0);
+    var last = newest(n, 0, null);
+    if (!last) { var added = find(n, /^AddedAt$/, 0); if (added instanceof Date) last = added; }
+    out.push([clean(ssid), clean(sec), (aj === true || aj === 1) ? 'off' : 'on', (hidden === true || hidden === 1) ? 'yes' : 'no',
+      pm === undefined ? '' : clean(pm), last ? last.toISOString().slice(0, 10) : '', last ? String(Math.floor((now - last) / 86400000)) : ''].join('\x1f'));
+  });
+  return out.join('\n');
+}
+JXA
+}
+
+# --- USB devices and external volumes ---
+
+check_usb_device_inventory() {
+    write_section_banner 'Removable Media & Peripheral Control - Connected USB Devices'
+    run_prefetched usb system_profiler SPUSBHostDataType -json
+    local json="$ROOT_CMD_OUTPUT"
+    if [[ "$json" != *_name* ]]; then
+        run_root system_profiler SPUSBDataType -json
+        json="$ROOT_CMD_OUTPUT"
+    fi
+    inventory_define usb 'USB devices' 'Devices connected over USB now (system_profiler). Storage devices are flagged; review any keyboard or network adapter nobody plugged in on purpose.' \
+        'Device' 'Vendor' 'Vendor ID' 'Product ID' 'Speed' 'Flags:flags'
+    local line name vendor vid pid speed storage count=0 storage_count=0 flag
+    local -a listed=()
+    for line in "${(@f)$(print -r -- "$json" | _usb_device_lines)}"; do
+        [[ -z "$line" ]] && continue
+        IFS=$'\x1f' read -r name vendor vid pid speed storage <<< "$line"
+        count=$((count + 1))
+        flag=""
+        if [[ "$storage" == yes ]]; then flag="storage?"; storage_count=$((storage_count + 1)); fi
+        [[ "${name:l}" == *keyboard* ]] && flag="${flag:+$flag,}keyboard?"
+        [[ "${name:l}" == *(ethernet|network|wlan|wi-fi)* ]] && flag="${flag:+$flag,}network?"
+        inventory_add_row usb "$name" "$vendor" "$vid" "$pid" "$speed" "$flag"
+        listed+=("$name${vendor:+ ($vendor)}")
+    done
+    add_audit_result --category 'Removable Media & Peripheral Control' --control 'Connected USB Devices' \
+        --status INFO --severity Informational --current "$count USB device(s) connected, $storage_count storage" \
+        --details "$(printf '%s\n' "${listed[@]}")" --evidence 'system_profiler SPUSBHostDataType -json' \
+        --recommended 'N/A' --cis 'CIS 1.1' --nist 'CM-8, MP-7' --mitre 'T1200 (Hardware Additions)' --iso27001 'A.5.9' \
+        --nis2 'Art.21(2)(i)' --cis-macos 'N/A' --mscp 'N/A' \
+        --recommendation 'Informational only. A USB device that presents itself as a keyboard or network adapter can type commands or redirect traffic; unplug anything unexpected.'
+}
+
+check_external_volume_encryption() {
+    write_section_banner 'Removable Media & Peripheral Control - External Volume Encryption'
+    run_root mount
+    local line dev mp opts info loc proto fv enc n=0
+    local -a plain=() ok=()
+    inventory_define volumes 'External volumes' 'Mounted volumes on external or removable disks (disk images excluded).' \
+        'Volume' 'File system' 'Protocol' 'Encrypted' 'Flags:flags'
+    for line in "${(@f)ROOT_CMD_OUTPUT}"; do
+        [[ "$line" == /dev/disk*' on /Volumes/'* ]] || continue
+        dev="${line%% on *}"; mp="${line#* on }"; opts="${mp##* \(}"; mp="${mp% \(*}"
+        (( n >= 20 )) && break
+        n=$((n + 1))
+        info=$(diskutil info "$dev" 2>/dev/null)
+        loc=$(print -r -- "$info" | awk -F': *' '/Device Location:/{print $2; exit}')
+        proto=$(print -r -- "$info" | awk -F': *' '/^ *Protocol:/{print $2; exit}')
+        [[ "$proto" == "Disk Image" ]] && continue
+        [[ "$loc" == External || "$info" == *"Removable Media:"*Removable* ]] || continue
+        fv=$(print -r -- "$info" | awk -F': *' '/FileVault:/{print $2; exit}')
+        enc=$(print -r -- "$info" | awk -F': *' '/^ *Encrypted:/{print $2; exit}')
+        local fs="${opts%%,*}" encrypted=no
+        [[ "$fv" == Yes* || "$enc" == Yes* ]] && encrypted=yes
+        if [[ "$encrypted" == yes ]]; then
+            ok+=("$mp")
+            inventory_add_row volumes "$mp" "$fs" "$proto" yes ""
+        elif [[ "$opts" == *read-only* ]]; then
+            ok+=("$mp (read-only)")
+            inventory_add_row volumes "$mp" "$fs" "$proto" no "read-only"
+        else
+            plain+=("$mp ($fs, $proto)")
+            inventory_add_row volumes "$mp" "$fs" "$proto" no "unencrypted?"
+        fi
+    done
+    local -a fw=(--category 'Removable Media & Peripheral Control' --control 'External Volumes Encrypted'
+        --recommended 'Writable external volumes are APFS encrypted' --cis 'CIS 3.11' --nist 'MP-5, SC-28'
+        --mitre 'T1052.001 (Exfiltration over USB)' --iso27001 'A.7.10' --nis2 'Art.21(2)(h)' --cis-macos 'N/A' --mscp 'N/A'
+        --evidence 'mount and diskutil info')
+    if (( ${#plain[@]} )); then
+        add_audit_result "${fw[@]}" --status WARN --severity Low --current "${#plain[@]} unencrypted writable external volume(s) mounted" \
+            --details "$(printf '%s\n' "${plain[@]}")" \
+            --recommendation 'Anything copied to these volumes is readable by whoever holds the disk. Use an encrypted APFS volume (Disk Utility > Erase > APFS (Encrypted)) for work data.'
+    elif (( ${#ok[@]} )); then
+        add_audit_result "${fw[@]}" --status PASS --severity Low --current "${#ok[@]} external volume(s) mounted, all encrypted or read-only" \
+            --details "$(printf '%s\n' "${ok[@]}")" --recommendation 'No action required.'
+    else
+        add_audit_result "${fw[@]}" --status INFO --severity Informational --current 'No external volume mounted' --recommendation 'Informational only.'
+    fi
+}
+
+# Apple silicon asks before a new USB/Thunderbolt accessory may talk to the Mac; an MDM
+# restriction (com.apple.applicationaccess allowUSBRestrictedMode = false) turns that off.
+check_accessory_connection_approval() {
+    write_section_banner 'Removable Media & Peripheral Control - Accessory Connection Approval'
+    local -a fw=(--category 'Removable Media & Peripheral Control' --control 'Accessory Connection Approval (USB Restricted Mode)'
+        --recommended 'Accessory approval not disabled by a profile (allowUSBRestrictedMode not false)'
+        --cis 'CIS 4.8' --nist 'MP-7, SC-41' --mitre 'T1200 (Hardware Additions)' --iso27001 'A.7.10' --nis2 'Art.21(2)(d)'
+        --cis-macos 'N/A' --mscp 'N/A' --evidence 'Managed preference com.apple.applicationaccess / allowUSBRestrictedMode')
+    if ! is_apple_silicon; then
+        add_audit_result "${fw[@]}" --status INFO --severity Informational --current 'Not applicable: Intel Mac (accessory approval exists on Apple silicon only)' \
+            --recommendation 'Informational only.'
+        return
+    fi
+    local v rc
+    v=$(managed_pref_read com.apple.applicationaccess allowUSBRestrictedMode); rc=$?
+    if [[ $rc -eq 2 ]]; then
+        add_audit_result "${fw[@]}" --status WARN --severity Low --current 'Query failed' --recommendation 'Unable to read the managed restriction; check installed profiles manually.'
+    elif [[ $rc -eq 0 && "$v" == 0 ]]; then
+        add_audit_result "${fw[@]}" --status FAIL --severity Medium --current 'A configuration profile sets allowUSBRestrictedMode = false: accessories connect without approval' \
+            --recommendation 'Remove the restriction unless this Mac is a kiosk or lab machine that needs it. Without approval, a malicious USB or Thunderbolt accessory can talk to an unlocked or locked Mac.'
+    elif [[ $rc -eq 0 ]]; then
+        add_audit_result "${fw[@]}" --status PASS --severity Medium --current "allowUSBRestrictedMode = $v (accessory approval kept)" --recommendation 'No action required.'
+    else
+        add_audit_result "${fw[@]}" --status INFO --severity Informational --current 'Not managed: the System Settings choice applies (Privacy & Security > Allow accessories to connect)' \
+            --recommendation 'Informational only. Keep "Ask for new accessories" (the default on laptops) or stricter.'
+    fi
+}
+
+# --- Bluetooth ---
+
+check_bluetooth_device_inventory() {
+    write_section_banner 'Wireless & Network Interface Security - Bluetooth Devices'
+    run_prefetched bluetooth system_profiler SPBluetoothDataType -json
+    local -a lines=("${(@f)$(print -r -- "$ROOT_CMD_OUTPUT" | _bluetooth_lines)}")
+    local -a fw=(--category 'Wireless & Network Interface Security' --cis 'CIS 4.8' --nist 'AC-18' --iso27001 'A.8.20'
+        --nis2 'Art.21(2)(h)' --cis-macos 'N/A' --mscp 'N/A' --evidence 'system_profiler SPBluetoothDataType -json')
+    if [[ "${lines[1]:-}" != controller* ]]; then
+        add_audit_result "${fw[@]}" --control 'Bluetooth Discoverable' --status INFO --severity Informational \
+            --current 'No Bluetooth controller reported' --recommended 'N/A' --recommendation 'Informational only.'
+        return
+    fi
+    local cstate cdisc _c
+    IFS=$'\x1f' read -r _c cstate cdisc <<< "${lines[1]}"
+    inventory_define bluetooth 'Bluetooth devices' 'Paired and nearby-known Bluetooth devices (system_profiler). Input devices are flagged: a paired keyboard can type into this Mac.' \
+        'Device' 'Type' 'Address' 'Connected' 'Firmware' 'Flags:flags'
+    local line name type addr conn fwv flag n=0 inputs=0
+    local -a input_list=()
+    for line in "${lines[@]:1}"; do
+        [[ -z "$line" ]] && continue
+        IFS=$'\x1f' read -r name type addr conn fwv <<< "$line"
+        n=$((n + 1)); flag=""
+        if [[ "${type:l}" == *(keyboard|mouse|trackpad|gamepad|joystick|hid)* ]]; then
+            flag="input?"; inputs=$((inputs + 1))
+            if [[ "$conn" == yes ]]; then input_list+=("$name ($type, connected)"); else input_list+=("$name ($type)"); fi
+        fi
+        inventory_add_row bluetooth "$name" "$type" "$addr" "$conn" "$fwv" "$flag"
+    done
+    if [[ "$cdisc" == attrib_on ]]; then
+        add_audit_result "${fw[@]}" --control 'Bluetooth Discoverable' --status WARN --severity Low \
+            --current 'The Bluetooth controller is discoverable now' --recommended 'Not discoverable outside of pairing' \
+            --recommendation 'macOS is discoverable while the Bluetooth settings pane is open; close it when you are not pairing a device.'
+    else
+        add_audit_result "${fw[@]}" --control 'Bluetooth Discoverable' --status PASS --severity Low \
+            --current "Not discoverable (controller ${cstate#attrib_}); $n known device(s), $inputs input device(s)" \
+            --details "$(printf '%s\n' "${input_list[@]}")" --recommended 'Not discoverable outside of pairing' --recommendation 'No action required.'
+    fi
+}
+
+# --- Wi-Fi known networks ---
+
+check_known_wifi_networks() {
+    write_section_banner 'Wireless & Network Interface Security - Known Wi-Fi Networks'
+    local -a fw=(--category 'Wireless & Network Interface Security' --control 'Known Wi-Fi Networks: Open or WEP with Auto-Join'
+        --recommended 'No open or WEP network is joined automatically' --cis 'CIS 12.6' --nist 'AC-18, SC-8'
+        --mitre 'T1557 (Adversary-in-the-Middle)' --iso27001 'A.8.20' --nis2 'Art.21(2)(h)' --cis-macos 'N/A' --mscp 'N/A'
+        --evidence '/Library/Preferences/com.apple.wifi.known-networks.plist')
+    local out
+    if ! out=$(_known_wifi_lines); then
+        add_audit_result "${fw[@]}" --status INFO --severity Informational --current 'Known-networks list not readable (no Wi-Fi, or not run as root)' \
+            --recommendation 'Informational only.'
+        return
+    fi
+    inventory_define wifi 'Known Wi-Fi networks' 'Networks this Mac remembers. An open network with auto-join on lets anyone who names a hotspot the same pull the Mac onto it.' \
+        'SSID' 'Security' 'Auto-join' 'Hidden' 'Private address' 'Last joined' 'Days ago:num' 'Flags:flags'
+    local line ssid sec aj hidden pm last days flag n=0
+    local -a risky=() stale=() unknown=()
+    for line in "${(@f)out}"; do
+        [[ -z "$line" ]] && continue
+        IFS=$'\x1f' read -r ssid sec aj hidden pm last days <<< "$line"
+        n=$((n + 1)); flag=""
+        if [[ -z "$sec" ]]; then
+            unknown+=("$ssid")
+        elif [[ "${sec:l}" == (*open*|*none*|*wep*) && "${sec:l}" != *owe* ]]; then
+            if [[ "$aj" == on ]]; then flag="open + auto-join!"; risky+=("$ssid ($sec)"); else flag="open?"; fi
+        fi
+        if [[ "$days" == <-> ]] && (( days > 365 )); then flag="${flag:+$flag,}stale?"; stale+=("$ssid (last $last)"); fi
+        inventory_add_row wifi "$ssid" "$sec" "$aj" "$hidden" "$pm" "$last" "$days" "$flag"
+    done
+    local extra=""
+    (( ${#stale[@]} )) && extra="; ${#stale[@]} not joined for over a year"
+    if (( ${#risky[@]} )); then
+        add_audit_result "${fw[@]}" --status WARN --severity Medium --current "${#risky[@]} open/WEP network(s) with auto-join on (of $n known)$extra" \
+            --details "$(printf '%s\n' "${risky[@]}" "${stale[@]}")" \
+            --recommendation 'In System Settings > Wi-Fi > (network) > Details, turn off "Auto-Join", or forget the network. Remove networks you no longer use.'
+    elif (( n == 0 )); then
+        add_audit_result "${fw[@]}" --status INFO --severity Informational --current 'No known Wi-Fi networks' --recommendation 'Informational only.'
+    elif (( ${#unknown[@]} == n )); then
+        add_audit_result "${fw[@]}" --status INFO --severity Informational --current "$n known network(s); security type not recorded in the plist" \
+            --recommendation 'Not evaluated: this macOS version does not store the security type where the audit looks. Review known networks in System Settings > Wi-Fi.'
+    else
+        add_audit_result "${fw[@]}" --status PASS --severity Medium --current "$n known network(s), none open or WEP with auto-join$extra" \
+            --details "$(printf '%s\n' "${stale[@]}")" --recommendation 'No action required.'
     fi
 }
 
@@ -10738,6 +11083,8 @@ main() {
     # 7-day XProtect Remediator log a few seconds).
     prefetch btm sfltool dumpbtm
     prefetch wifi system_profiler SPAirPortDataType
+    prefetch usb system_profiler SPUSBHostDataType -json
+    prefetch bluetooth system_profiler SPBluetoothDataType -json
     prefetch xpr_log xpr_log_query
 
     _run_all_checks
@@ -10855,9 +11202,10 @@ AUDIT_CHECKS=(
     check_screen_saver_corners_secure check_screensaver_idle_time check_login_window_custom_message
     check_login_window_password_hints_disabled check_login_window_policy_banner
     # Domain 20: Removable Media & Peripheral Control
-    check_usb_restriction_profile_presence check_thunderbolt_security_level
+    check_accessory_connection_approval check_thunderbolt_security_level check_usb_device_inventory check_external_volume_encryption
     # Domain 21: Wireless & Network Interface Security
-    check_wifi_current_network_security check_bluetooth_power_state check_airdrop_discovery_scope check_network_interface_inventory
+    check_wifi_current_network_security check_known_wifi_networks check_bluetooth_power_state check_bluetooth_device_inventory
+    check_airdrop_discovery_scope check_network_interface_inventory
     # Domain 22: iCloud & Cloud Sync Surface
     check_icloud_keychain_sync_indicator check_activation_lock_status check_icloud_drive_sync_indicator
     check_icloud_desktop_documents_sync_disabled
@@ -10888,6 +11236,8 @@ AUDIT_CHECKS=(
     check_siri_disabled check_improve_siri_dictation_disabled check_improve_assistive_voice_disabled
     check_share_with_app_developers_disabled check_limit_ad_tracking_enabled check_help_apple_improve_search_disabled
     check_on_device_dictation_enforced
+    check_mail_smart_replies_disabled check_safari_summary_disabled check_image_playground_disabled
+    check_apple_intelligence_report_disabled check_genmoji_disabled
     # Domain 32: Power Management & Sleep
     check_sleep_enabled_apple_silicon check_power_nap_disabled_intel check_wake_for_network_access_disabled
     check_filevault_standby_key_policy

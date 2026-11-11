@@ -6,6 +6,25 @@ The project has no tagged releases yet, so changes are grouped by date. Entries 
 
 ## Unreleased
 
+- USB and Wi-Fi (both editions): inventories of connected USB and Bluetooth devices
+  (keyboards, storage and network adapters flagged) and of remembered Wi-Fi networks. Windows:
+  security of the current Wi-Fi connection, Mobile Hotspot running, and removable storage
+  restrictions (Removable Storage Access, device installation restrictions, Defender Device
+  Control). macOS: open or WEP known networks with auto-join on, networks unused for a year,
+  unencrypted writable external volumes, Bluetooth discoverability, and accessory approval read
+  from the managed restriction (replaces a text match on profile names that warned on every
+  unmanaged Mac).
+- Windows evidence: every finding now names its source. Checks that do not pass one get the
+  registry values they read through the registry helper, or else the commands and registry paths
+  in their own code.
+- Windows named pipes: permissions are read from a handle opened with read-control access only,
+  busy pipes are waited on briefly, and unreadable pipes are counted by reason (busy, access
+  denied, closed).
+- macOS CIS Intune benchmark: 33 more payload settings in MDM Security Payloads (iCloud services,
+  locked sharing settings, AirDrop, local user creation, XProtect upload, profile removal
+  password; Level 2 listed but not scored), every line tagged with its recommendation number,
+  five more Apple Intelligence restrictions, and wake on modem ring.
+
 - Windows (177 checks, 36 domains), from a gap analysis against the CIS Windows 11 Enterprise
   v5.0.1 benchmark and a real CIS-CAT scan:
   - CIS policy engine: about 290 settings no other check reads (security options, user rights,
