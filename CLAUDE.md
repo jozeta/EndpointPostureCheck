@@ -91,3 +91,63 @@ Windows PowerShell 5.1 and PowerShell 7 on `windows-latest`, `sudo` on `macos-la
 output and lists every check that could not query the runner in the job summary; the reports are
 uploaded as build artifacts.
 
+
+## Working on a Windows machine
+
+A Windows clone has only the published files: no `src/` and no `tests/` (both gitignored), and
+none of the Mac's Claude memory or global `~/.claude/CLAUDE.md`. These rules carry over:
+
+- Don't push, change repo settings or publish releases unless the user asks. Once a plan is
+  agreed, build every step, then commit and push to `main` without asking between steps
+  (CI verifies). Never force-push, never `--no-verify`, stage only the files you changed.
+- Bump the version on every push that changes a script (semver), and update CHANGELOG
+  (newest first, "Unreleased") and the README's version and "What's new" in the same commit.
+- Keep the `.ps1` pure ASCII. Don't edit the `LADA-GLASS-ASSETS` region.
+- **Don't change the dashboard CSS/JS in `Get-HtmlTemplate` on Windows.** It must stay identical
+  to `src/91-report-html.zsh`, which only exists on the Mac. If it really has to change, say so
+  in the commit message ("needs Mac port") so the Mac session copies it back.
+- Don't edit `Invoke-MacPostureCheck.sh`: it is generated from `src/` on the Mac.
+- Reports from a real machine describe that machine's weaknesses: never commit, push or
+  publish them (`*.html` / `*.json` are already gitignored).
+
+**Setup (once):**
+
+```powershell
+winget install --id Git.Git -e; winget install --id GitHub.cli -e; winget install --id Microsoft.PowerShell -e
+gh auth login
+git clone https://github.com/jozeta/EndpointPostureCheck.git; cd EndpointPostureCheck
+Install-Module Pester -MinimumVersion 5.0 -Scope CurrentUser -Force -SkipPublisherCheck
+Install-Module PSScriptAnalyzer -Scope CurrentUser -Force
+```
+
+The Pester tests are in the iCloud backup, if iCloud for Windows is installed:
+`Copy-Item -Recurse "$env:USERPROFILE\iCloudDrive\Backups\EndpointPostureCheck-dev\latest\tests" .`
+(gitignored, so they stay local). Without them, verify with PSScriptAnalyzer and CI.
+
+**Running the audit:** Claude can't elevate. The user runs it in an elevated PowerShell
+(Windows PowerShell 5.1 and `pwsh` both work):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Invoke-EndpointPostureCheck.ps1 -ReportPath C:\Reports -ExportJson
+```
+
+Then read `C:\Reports\*.json` and review the HTML (open it in a browser).
+
+### Next steps (handoff from the Mac, 2026-11-11)
+
+Everything up to `1c7c13c` is pushed and CI is green. Windows code has so far only run on CI
+(Windows Server 2025), so the job on this machine is **the first real Windows 11 run**:
+
+1. Run the audit as above (5.1, then `pwsh`). Check for checks that errored or report "could
+   not query", false positives on normal Windows 11 defaults, and empty inventory tables.
+   Check especially the parts CI can't test: Wi-Fi (`Test-WifiProfileSecurity`,
+   `Test-WifiCurrentConnection`), USB/peripherals (`Test-ConnectedPeripheralInventory`,
+   `Test-RemovableStorageAccessPolicy`), Office and Windows 11 policies, and the named-pipe
+   ACL check (`Get-PipeSecurityDescriptor`).
+2. Check that every finding has an Evidence value (CI: 382 of 382).
+3. Compare the CIS results with the user's June CIS-CAT scan of this machine, if it's available.
+4. Fix what turns up, push, read the CI job summary (`gh run list`, `gh run view <id>`).
+
+Still open afterwards (not urgent): a non-English Windows run (`netsh wlan` parsing is
+English-only and reports "not recognized" otherwise); CSV/SARIF export of the whole report;
+Pester in CI; a fleet roll-up of JSON exports. Remove this handoff section once it's done.

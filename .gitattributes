@@ -1,0 +1,3 @@
+# Keep LF line endings on every platform (a Windows checkout must not turn the
+# macOS script into CRLF; PowerShell reads LF scripts fine).
+* text=auto eol=lf
