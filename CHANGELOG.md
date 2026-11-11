@@ -22,9 +22,11 @@ The project has no tagged releases yet, so changes are grouped by date. Entries 
 - Windows evidence: every finding now names its source. Checks that do not pass one get the
   registry values they read through the registry helper, or else the commands and registry paths
   in their own code.
-- Windows named pipes: permissions are read from a handle opened with read-control access only,
-  busy pipes are waited on briefly, and unreadable pipes are counted by reason (busy, access
-  denied, closed).
+- Windows named pipes: permissions are read from a handle opened with read-control access only
+  (GetSecurityInfo as a file object, then as a kernel object, then NtQuerySecurityObject: RPC and
+  PowerShell host pipes answered "invalid parameter" to the first), busy pipes are waited on
+  briefly, and unreadable pipes are counted by reason. On the CI runner 34 of 40 pipes are now
+  read, up from 12 of 41.
 - Security fix (Windows named pipes): the pipe check connected to every pipe with the default
   impersonation level, so a pipe served by a low-privileged program could impersonate the
   elevated audit process. Pipes are now opened with anonymous security quality of service, and
