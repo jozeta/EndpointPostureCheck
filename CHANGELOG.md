@@ -6,6 +6,9 @@ The project has no tagged releases yet, so changes are grouped by date. Entries 
 
 ## Unreleased
 
+- Dashboard: the findings search moved into a bar pinned to the top of the page (`/` focuses
+  it). Typing hides non-matching findings and empty domains and shows the match count; domain
+  headings count only the findings on screen.
 - Dashboard (both editions): findings are grouped under a heading per domain, with its count of
   controls, failures and warnings. The sidebar domain list is now an index instead of a filter:
   a click scrolls to the heading, and the domain on screen is highlighted while scrolling (the

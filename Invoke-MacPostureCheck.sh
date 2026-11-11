@@ -1,5 +1,5 @@
 #!/usr/bin/env zsh
-# EndpointPostureCheck for macOS — built 2026-11-11 07:38:42 from src/*.zsh. Do not edit directly.
+# EndpointPostureCheck for macOS — built 2026-11-11 08:34:59 from src/*.zsh. Do not edit directly.
 
 # ---- 00-header.zsh ----
 #
@@ -9860,6 +9860,16 @@ get_html_template() {
 .pc-domains a { white-space: normal; line-height: 1.25; justify-content: space-between; font-size: var(--lg-fs-small); min-height: 24px; }
 .pc-domains .lg-chip { flex: none; }
 .pc-domains a.pc-nav-empty { opacity: .55; }
+/* Search bar pinned to the top of the page (the script moves the findings search box into it) */
+.pc-topsearch { position: sticky; top: var(--lg-space-s); z-index: 5; display: flex; align-items: center; gap: var(--lg-space-s);
+                padding: var(--lg-space-s); background: var(--lg-glass-strong); }
+.pc-topsearch .pc-grow { flex: 1 1 auto; position: relative; min-width: 0; }
+.pc-topsearch .pc-grow .lg-icon { position: absolute; left: 11px; top: 50%; transform: translateY(-50%); color: var(--lg-muted); pointer-events: none; }
+.pc-topsearch .lg-input { width: 100%; padding-left: 34px; }
+.pc-topsearch-count { white-space: nowrap; }
+.pc-topsearch-key { font: inherit; font-size: 11px; color: var(--lg-muted); border: 1px solid var(--lg-line-2); border-radius: 5px; padding: 0 5px; }
+#sec-overview, #system, #findings, #inventory, .pc-group-head { scroll-margin-top: var(--pc-top-offset, var(--lg-space-m)) !important; }
+@media (max-width: 560px) { .pc-topsearch-key { display: none; } }
 /* Findings grouped under one heading per domain (built by the script, same names as the index) */
 .pc-group-head th { padding: var(--lg-space-l) 0 var(--lg-space-xs); border-bottom: 1px solid var(--lg-line-2); text-align: left;
                     text-transform: none; letter-spacing: normal; font-weight: inherit; scroll-margin-top: var(--lg-space-m); }
@@ -9975,7 +9985,7 @@ footer.pc-foot { text-align: center; padding: var(--lg-space-s) 0 var(--lg-space
   .pc-group-head th { display: block; width: 100%; }
 }
 @media print {
-  .lg-sidebar, .pc-toolbar, .pc-theme, .pc-inv-flags, #invMore, .pc-nav-handle { display: none !important; }
+  .lg-sidebar, .pc-toolbar, .pc-theme, .pc-inv-flags, #invMore, .pc-nav-handle, .pc-topsearch { display: none !important; }
   .lg-app.pc-nav-collapsed { grid-template-columns: minmax(0, 1fr); }
   .pc-group[hidden] { display: table-row-group !important; }
   .lg-app { grid-template-columns: minmax(0, 1fr); }
@@ -10114,6 +10124,27 @@ footer.pc-foot { text-align: center; padding: var(--lg-space-s) 0 var(--lg-space
   var rows = all('.finding-row');
   var state = { status: 'all', category: '', search: '' };
 
+  // Search bar pinned to the top: the findings search box moves into it, so there is one search.
+  // Matching findings stay, the rest (and domains left empty) are hidden.
+  var searchInput = doc.getElementById('searchInput'), topCount = null, topBar = null;
+  var searchLabel = searchInput ? searchInput.parentNode : null, mainEl = doc.querySelector('.lg-main');
+  if (searchLabel && mainEl) {
+    topBar = doc.createElement('div'); topBar.className = 'lg-glass pc-topsearch'; topBar.setAttribute('role', 'search');
+    topCount = doc.createElement('span'); topCount.className = 'lg-muted lg-small pc-topsearch-count'; topCount.setAttribute('aria-live', 'polite');
+    var key = doc.createElement('kbd'); key.className = 'pc-topsearch-key'; key.textContent = '/'; key.title = 'Press / to search';
+    searchInput.placeholder = 'Search findings: controls, values, frameworks, remediation';
+    topBar.appendChild(searchLabel); topBar.appendChild(topCount); topBar.appendChild(key);
+    mainEl.insertBefore(topBar, mainEl.firstChild);
+    var setOffset = function () { root.style.setProperty('--pc-top-offset', (topBar.offsetHeight + 24) + 'px'); };
+    setOffset(); window.addEventListener('resize', setOffset);
+    doc.addEventListener('keydown', function (e) {
+      var t = e.target, tag = t && t.tagName;
+      if (e.key === '/' && !e.metaKey && !e.ctrlKey && !e.altKey && tag !== 'INPUT' && tag !== 'TEXTAREA' && tag !== 'SELECT' && !(t && t.isContentEditable)) {
+        e.preventDefault(); searchInput.focus(); searchInput.select();
+      }
+    });
+  }
+
   // Group the findings under one heading per domain, in index order. Each group is its own
   // <tbody> with a heading row; the index links point at the headings.
   var findingsBody = doc.getElementById('findingsBody'), groups = [], groupOf = {};
@@ -10129,11 +10160,7 @@ footer.pc-foot { text-align: center; padding: var(--lg-space-s) 0 var(--lg-space
     groups.push(g); groupOf[cat] = g;
   });
   rows.forEach(function (r) { var g = groupOf[r.getAttribute('data-category')]; if (g) { g.rows.push(r); g.el.appendChild(r); } });
-  groups.forEach(function (g) {
-    findingsBody.parentNode.insertBefore(g.el, findingsBody);
-    g.fail = g.rows.filter(function (r) { return r.getAttribute('data-status') === 'FAIL'; }).length;
-    g.warn = g.rows.filter(function (r) { return r.getAttribute('data-status') === 'WARN'; }).length;
-  });
+  groups.forEach(function (g) { findingsBody.parentNode.insertBefore(g.el, findingsBody); });
   function chip(tone, n, word) { var c = doc.createElement('span'); c.className = 'lg-chip ' + tone; c.textContent = n + ' ' + word; return c; }
 
   function matches(row) {
@@ -10153,11 +10180,15 @@ footer.pc-foot { text-align: center; padding: var(--lg-space-s) 0 var(--lg-space
       g.el.hidden = vis === 0;
       g.link.classList.toggle('pc-nav-empty', vis === 0);
       g.count.textContent = (vis === total ? total : vis + ' of ' + total) + (total === 1 ? ' control' : ' controls');
-      if (g.fail) g.count.appendChild(chip('lg-bad', g.fail, 'fail'));
-      if (g.warn) g.count.appendChild(chip('lg-warn', g.warn, 'warn'));
+      // Badges count the findings on screen, so they agree with "n of m" while filtering.
+      var vf = g.rows.filter(function (r) { return !r.hidden && r.getAttribute('data-status') === 'FAIL'; }).length;
+      var vw = g.rows.filter(function (r) { return !r.hidden && r.getAttribute('data-status') === 'WARN'; }).length;
+      if (vf) g.count.appendChild(chip('lg-bad', vf, 'fail'));
+      if (vw) g.count.appendChild(chip('lg-warn', vw, 'warn'));
     });
     doc.getElementById('emptyRow').hidden = shown !== 0;
     doc.getElementById('resultCount').textContent = shown + ' of ' + rows.length + ' controls';
+    if (topCount) topCount.textContent = state.search ? (shown === 0 ? 'No matches' : shown + ' of ' + rows.length + ' controls') : '';
     all('[data-filter]').forEach(function (b) {
       var on = b.getAttribute('data-filter') === state.status;
       b.setAttribute(b.classList.contains('pc-kpi') ? 'aria-pressed' : 'aria-selected', on ? 'true' : 'false');
@@ -10214,7 +10245,7 @@ footer.pc-foot { text-align: center; padding: var(--lg-space-s) 0 var(--lg-space
   }
   function spy() {
     spyQueued = false;
-    var line = 80, current = sectionIds[0];
+    var line = (topBar ? topBar.offsetHeight : 0) + 80, current = sectionIds[0];
     sectionIds.forEach(function (id) { var e = doc.getElementById(id); if (e && !e.hidden && e.getBoundingClientRect().top <= line) current = id; });
     sectionLinks.forEach(function (l) {
       if (l.getAttribute('href') === '#' + current) l.setAttribute('aria-current', 'location'); else l.removeAttribute('aria-current');
@@ -10234,7 +10265,11 @@ footer.pc-foot { text-align: center; padding: var(--lg-space-s) 0 var(--lg-space
   window.addEventListener('resize', queueSpy);
   spy();
   doc.getElementById('categoryFilter').addEventListener('change', function (e) { state.category = e.target.value; apply(); });
-  doc.getElementById('searchInput').addEventListener('input', function (e) { state.search = e.target.value.toLowerCase().trim(); apply(); });
+  doc.getElementById('searchInput').addEventListener('input', function (e) {
+    var had = state.search;
+    state.search = e.target.value.toLowerCase().trim(); apply();
+    if (state.search && !had) revealFindings();   // first keystroke brings the results into view
+  });
   doc.getElementById('printBtn').addEventListener('click', function () { window.print(); });
 
   // Collapsible index: a handle at the middle of the sidebar's edge slides it out and back. The
